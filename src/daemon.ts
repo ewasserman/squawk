@@ -27,6 +27,7 @@ import {
 	type RpcConnection,
 	RpcError,
 	RpcErrorCode,
+	type RpcHandler,
 	RpcServer,
 } from "./rpc.ts";
 import {
@@ -347,6 +348,15 @@ export class Daemon {
 	/** Peers seen on the network. Empty until discovery is added. */
 	peers(): Peer[] {
 		return this.transport.peers?.() ?? [];
+	}
+
+	/**
+	 * Adds a JSON-RPC method to the local socket. Transports call this from
+	 * `start` to offer their own methods (pairing, for example).
+	 */
+	handle(method: string, handler: RpcHandler): void {
+		if (!this.#server) throw new Error("the service is not started");
+		this.#server.handle(method, handler);
 	}
 
 	status(): StatusResult {

@@ -75,6 +75,8 @@ export function authMessage(
 export class PeerLink {
 	readonly ws: WebSocket;
 	readonly outgoing: boolean;
+	/** The other side's IP address, for incoming connections. */
+	readonly remoteAddress: string | undefined;
 	/** The other side's key id, once it has proved it holds that key. */
 	peerKey: string | undefined;
 	authorization: Authorization = false;
@@ -87,15 +89,29 @@ export class PeerLink {
 	private gotOk = false;
 	private readonly frameListeners = new Set<(frame: Frame) => void>();
 	private readonly self: Identity;
+	private readonly onReady: ((link: PeerLink) => void) | undefined;
+	private isReady = false;
 	private readonly authorize: (key: string, link: PeerLink) => Authorization;
 
 	constructor(
 		ws: WebSocket,
 		self: Identity,
 		authorize: (key: string, link: PeerLink) => Authorization,
-		options: { outgoing: boolean; expectKey?: string; timeoutMs?: number },
+		options: {
+			outgoing: boolean;
+			expectKey?: string;
+			timeoutMs?: number;
+			remoteAddress?: string;
+			/**
+			 * Called as soon as the handshake completes, before any later frame
+			 * is processed, so frame listeners added here miss nothing.
+			 */
+			onReady?: (link: PeerLink) => void;
+		},
 	) {
 		this.ws = ws;
+		this.remoteAddress = options.remoteAddress;
+		this.onReady = options.onReady;
 		this.self = self;
 		this.authorize = authorize;
 		this.outgoing = options.outgoing;
@@ -256,8 +272,11 @@ export class PeerLink {
 			this.sentAuth &&
 			this.gotAuth &&
 			this.gotOk &&
-			this.peerKey !== undefined
+			this.peerKey !== undefined &&
+			!this.isReady
 		) {
+			this.isReady = true;
+			this.onReady?.(this);
 			this.resolveReady(this.peerKey);
 		}
 	}
@@ -325,7 +344,12 @@ export class NetworkTransport implements Transport {
 			res.writeHead(426).end("squawk speaks WebSocket\n");
 		});
 		this.wss = new WebSocketServer({ server: this.http, maxPayload: 1 << 20 });
-		this.wss.on("connection", (ws) => this.acceptIncoming(ws));
+		this.wss.on("connection", (ws, req) =>
+			this.acceptIncoming(
+				ws,
+				req.socket.remoteAddress?.replace(/^::ffff:/, ""),
+			),
+		);
 		await new Promise<void>((resolve, reject) => {
 			this.http?.once("error", reject);
 			this.http?.listen(this.options.port ?? 0, this.options.host, () =>
@@ -386,6 +410,14 @@ export class NetworkTransport implements Transport {
 			port: p.port,
 			paired: store?.getContact(p.keyId)?.trust === "paired",
 		}));
+	}
+
+	/** Closes every connection with this key (used when a contact is blocked). */
+	disconnect(keyId: string): void {
+		for (const link of [...this.links.values(), ...this.incomingLinks]) {
+			if (link.peerKey === keyId) link.close(4001, "blocked");
+		}
+		this.links.delete(keyId);
 	}
 
 	/** A discovered peer by name or key id, for pairing. */
@@ -567,7 +599,7 @@ export class NetworkTransport implements Transport {
 		return this.unpairedPolicy?.(key, link) ?? false;
 	}
 
-	private acceptIncoming(ws: WebSocket): void {
+	private acceptIncoming(ws: WebSocket, remoteAddress?: string): void {
 		const daemon = this.requireDaemon();
 		const link = new PeerLink(
 			ws,
@@ -576,19 +608,18 @@ export class NetworkTransport implements Transport {
 			{
 				outgoing: false,
 				timeoutMs: this.options.handshakeTimeoutMs ?? 10_000,
+				...(remoteAddress !== undefined ? { remoteAddress } : {}),
+				onReady: (ready) => {
+					ready.onFrame((frame) => {
+						if (frame.t === "msg") this.receive(ready, frame);
+					});
+					this.onLink?.(ready);
+				},
 			},
 		);
 		this.incomingLinks.add(link);
 		ws.on("close", () => this.incomingLinks.delete(link));
-		link.ready.then(
-			() => {
-				link.onFrame((frame) => {
-					if (frame.t === "msg") this.receive(link, frame);
-				});
-				this.onLink?.(link);
-			},
-			() => ws.terminate(),
-		);
+		link.ready.catch(() => ws.terminate());
 	}
 
 	private receive(link: PeerLink, frame: Frame): void {
@@ -615,7 +646,7 @@ export class NetworkTransport implements Transport {
 				return;
 			}
 			daemon.deliverIncoming(envelope, {
-				remoteAddress: link.ws.url ?? "",
+				remoteAddress: link.remoteAddress ?? "",
 			});
 			link.send({ t: "ack", id });
 		} catch (err) {

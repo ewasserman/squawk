@@ -6,6 +6,7 @@
 import { squawkHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
 import { NetworkTransport } from "./network.ts";
+import { Pairing } from "./pairing.ts";
 
 /** Runs the service in this process until it stops. */
 export async function runDaemon(home: string = squawkHome()): Promise<void> {
@@ -15,6 +16,8 @@ export async function runDaemon(home: string = squawkHome()): Promise<void> {
 	});
 	const daemon = new Daemon({ home, transport });
 	await daemon.start();
+	const pairing = new Pairing(daemon, transport);
+	pairing.start();
 	const shutdown = () => void daemon.stop();
 	process.once("SIGTERM", shutdown);
 	process.once("SIGINT", shutdown);
@@ -22,6 +25,7 @@ export async function runDaemon(home: string = squawkHome()): Promise<void> {
 		`${new Date().toISOString()} squawkd ${process.pid} listening on ${daemon.socketPath} and port ${transport.port}`,
 	);
 	await daemon.whenStopped();
+	pairing.stop();
 	process.off("SIGTERM", shutdown);
 	process.off("SIGINT", shutdown);
 	console.log(`${new Date().toISOString()} squawkd ${process.pid} stopped`);

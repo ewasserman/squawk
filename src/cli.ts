@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
+import { contactCommands } from "./cli-contacts.ts";
 import { squawkHome } from "./config.ts";
 import { DaemonRunningError, type StatusResult } from "./daemon.ts";
 import {
@@ -36,6 +37,7 @@ interface Command {
  * here; `main` finds it by name and `help` lists it.
  */
 const commands: Record<string, Command> = {
+	...contactCommands,
 	init: {
 		summary: "create this machine's key pair (--name <display name>)",
 		async run(args, io) {
