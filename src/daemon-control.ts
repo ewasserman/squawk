@@ -18,7 +18,12 @@ export class DaemonControlError extends Error {
 	}
 }
 
-const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url));
+// In development Node runs the .ts sources directly; an installed copy runs the
+// compiled .js files. Use whichever extension this file has.
+const OWN_EXTENSION = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
+const DAEMON_MAIN = fileURLToPath(
+	new URL(`./daemon-main${OWN_EXTENSION}`, import.meta.url),
+);
 
 /** Connects to the running service, or resolves undefined if none answers. */
 export async function connectToDaemon(
