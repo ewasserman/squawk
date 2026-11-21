@@ -68,6 +68,12 @@ export function authMessage(
 	return utf8ToBytes(`${AUTH_PREFIX}\n${challenge}\n${signerKey}\n${otherKey}`);
 }
 
+/** WebSocket close code used when one side refuses the other during the handshake. */
+const REFUSED_CODE = 4001;
+
+/** The reason given when a key is neither a paired contact nor being paired with. */
+export const NOT_PAIRED = "not a paired contact";
+
 /**
  * One WebSocket connection to another squawk service, with the handshake
  * described at the top of this file.
@@ -127,7 +133,13 @@ export class PeerLink {
 		this.ready.finally(() => clearTimeout(timer)).catch(() => {});
 
 		ws.on("message", (data) => this.handle(data, options.expectKey));
-		ws.on("close", () => this.fail("connection closed"));
+		ws.on("close", (code, reason) =>
+			this.fail(
+				code === REFUSED_CODE && reason.length > 0
+					? `the other side refused the connection: ${reason.toString()}`
+					: "connection closed",
+			),
+		);
 		ws.on("error", (err) => this.fail(err.message));
 		const sendHello = () =>
 			this.sendRaw({
@@ -171,7 +183,7 @@ export class PeerLink {
 
 	private refuse(reason: string): void {
 		this.fail(reason);
-		this.ws.close(4001, reason.slice(0, 100));
+		this.ws.close(REFUSED_CODE, reason.slice(0, 100));
 	}
 
 	private handle(data: RawData, expectKey: string | undefined): void {
@@ -242,7 +254,7 @@ export class PeerLink {
 			}
 			const authorization = this.authorize(peerKey, this);
 			if (!authorization) {
-				this.refuse("not a paired contact");
+				this.refuse(NOT_PAIRED);
 				return;
 			}
 			this.authorization = authorization;

@@ -38,6 +38,7 @@ import {
 	addressSettingKey,
 	type Frame,
 	type NetworkTransport,
+	NOT_PAIRED,
 	type PeerLink,
 } from "./network.ts";
 import { RpcError, RpcErrorCode } from "./rpc.ts";
@@ -259,9 +260,13 @@ export class Pairing {
 		try {
 			link = await this.transport.dial(address, expectKey);
 		} catch (err) {
-			throw new PairingError(
-				`could not connect to ${peer}: ${err instanceof Error ? err.message : String(err)}`,
-			);
+			const reason = err instanceof Error ? err.message : String(err);
+			if (reason.endsWith(NOT_PAIRED)) {
+				throw new PairingError(
+					`${peer} is not waiting to pair. Ask them to run \`squawk pair --accept\` (it waits for 2 minutes), then try again.`,
+				);
+			}
+			throw new PairingError(`could not connect to ${peer}: ${reason}`);
 		} finally {
 			this.dialling = false;
 		}

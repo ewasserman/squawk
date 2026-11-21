@@ -185,7 +185,7 @@ describe("pairing between two services", () => {
 		const alice = await startNode("alice");
 		const bob = await startNode("bob");
 		await expect(alice.pairing.initiate(bob.address)).rejects.toThrow(
-			/could not connect/,
+			/is not waiting to pair\. Ask them to run `squawk pair --accept`/,
 		);
 	});
 
