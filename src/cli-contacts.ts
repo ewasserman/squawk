@@ -203,6 +203,59 @@ export const contactCommands: Record<string, ContactsCommand> = {
 			});
 		},
 	},
+	policy: {
+		summary:
+			"decide what your Claude does with a contact's messages: `policy <contact> show-first|auto-answer|default`, or `policy --default show-first|auto-answer`",
+		async run(args, io) {
+			const { values, positionals } = parseArgs({
+				args,
+				options: { default: { type: "string" } },
+				allowPositionals: true,
+				strict: true,
+			});
+			const toPolicy = (v: string | undefined) =>
+				v === "show-first"
+					? "show_first"
+					: v === "auto-answer"
+						? "auto_answer"
+						: undefined;
+			const explain = (policy: string) =>
+				policy === "auto_answer"
+					? "Claude may answer their messages directly (replies are still confirmed with you unless auto-send is on)."
+					: "Claude will show you their messages and take no action without your approval.";
+			if (values.default !== undefined) {
+				const policy = toPolicy(values.default);
+				if (!policy || positionals.length > 0) {
+					io.stderr("Usage: squawk policy --default show-first|auto-answer\n");
+					return 2;
+				}
+				return withService(io, async (rpc) => {
+					await rpc.call("set_default_policy", { policy });
+					io.stdout(
+						`Default for contacts without their own setting: ${values.default}. ${explain(policy)}\n`,
+					);
+					return 0;
+				});
+			}
+			const [contact, setting] = positionals;
+			const policy = setting === "default" ? null : toPolicy(setting);
+			if (!contact || policy === undefined || positionals.length > 2) {
+				io.stderr(
+					"Usage: squawk policy <contact> show-first|auto-answer|default\n",
+				);
+				return 2;
+			}
+			return withService(io, async (rpc) => {
+				const { contact: c } = await rpc.call<{
+					contact: { name: string; inbound_policy: string };
+				}>("update_contact", { contact, inbound_policy: policy });
+				io.stdout(
+					`"${c.name}": ${c.inbound_policy.replace("_", "-")}${policy === null ? " (the default)" : ""}. ${explain(c.inbound_policy)}\n`,
+				);
+				return 0;
+			});
+		},
+	},
 	block: {
 		summary: "refuse all connections and messages from a contact",
 		async run(args, io) {
