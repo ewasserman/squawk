@@ -93,6 +93,12 @@ export interface McpServerOptions {
 	confirm?: ConfirmFn;
 	/** Where to report errors that cannot go to the client (default: standard error). */
 	log?: (text: string) => void;
+	/**
+	 * How long `send` and `reply` wait for the recipient's service to
+	 * acknowledge the message before reporting it as still queued, in
+	 * milliseconds. Default 3 seconds.
+	 */
+	ackWaitMs?: number;
 }
 
 const MAX_META_LENGTH = 64;
@@ -301,6 +307,25 @@ export function createMcpServer(options: McpServerOptions): Server {
 		{ capabilities: SERVER_CAPABILITIES, instructions: SERVER_INSTRUCTIONS },
 	);
 	const confirm = options.confirm ?? elicitationConfirm(server);
+	const ackWaitMs = options.ackWaitMs ?? 3000;
+
+	/** Waits up to `ackWaitMs` for the recipient to acknowledge a sent message. */
+	async function waitForAck(id: string): Promise<boolean> {
+		const deadline = Date.now() + ackWaitMs;
+		for (;;) {
+			try {
+				const { message } = await daemon.call<{ message: MessageInfo }>(
+					"get_message",
+					{ id },
+				);
+				if (message.state === "acked") return true;
+			} catch {
+				return false;
+			}
+			if (Date.now() >= deadline) return false;
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	}
 
 	let initialized = false;
 	const waiting: MessageNotification[] = [];
@@ -356,13 +381,18 @@ export function createMcpServer(options: McpServerOptions): Server {
 		if (draft.thread_id !== undefined) params.thread_id = draft.thread_id;
 		if (draft.in_reply_to !== undefined) params.in_reply_to = draft.in_reply_to;
 		const result = await daemon.call<SendResult>("send", params);
+		const delivered = await waitForAck(result.id);
+		const name = draft.to_name ?? draft.to;
+		const status = delivered
+			? `Sent to ${name} and delivered to their squawk service (they have not necessarily read it yet).`
+			: `Sent to ${name}: queued, not yet delivered (their service has not answered). Squawk keeps retrying for up to 7 days; you do not need to resend it.`;
 		const edited =
 			decision.text === draft.text
 				? ""
 				: " Your user edited the text before sending; what was sent is:\n" +
 					decision.text;
 		return textResult(
-			`Sent to ${draft.to_name ?? draft.to} (queued for delivery). msg_id=${result.id} thread=${result.thread_id}.${edited}`,
+			`${status} msg_id=${result.id} thread=${result.thread_id}.${edited}`,
 		);
 	}
 

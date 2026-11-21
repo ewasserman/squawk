@@ -70,6 +70,7 @@ async function connect(confirm?: ConfirmFn): Promise<void> {
 	server = createMcpServer({
 		daemon: link,
 		log: () => {},
+		ackWaitMs: 0,
 		confirm: async (draft) => {
 			drafts.push(draft);
 			return confirm === undefined
@@ -238,7 +239,7 @@ describe("squawk mcp server", () => {
 			arguments: { to: "alice", text: "hello", kind: "question", session: "s" },
 		});
 		expect(result.isError).toBeFalsy();
-		expect(text(result)).toMatch(/^Sent to alice \(queued for delivery\)/);
+		expect(text(result)).toMatch(/^Sent to alice: queued, not yet delivered/);
 		expect(drafts).toEqual([
 			{
 				to: "alice",
@@ -426,7 +427,7 @@ describe("confirmation through MCP elicitation", () => {
 			log: () => {},
 		});
 		expect(await link.open()).toBe(true);
-		server = createMcpServer({ daemon: link, log: () => {} });
+		server = createMcpServer({ daemon: link, log: () => {}, ackWaitMs: 0 });
 		const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
 		client = new Client(
 			{ name: "fake-claude", version: "0.0.0" },

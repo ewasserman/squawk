@@ -181,6 +181,40 @@ describe("pairing between two services", () => {
 		).toBeUndefined();
 	});
 
+	it("leaves a paired contact's message connection alone while waiting to pair", async () => {
+		const alice = await startNode("alice");
+		const bob = await startNode("bob");
+		for (const [a, b] of [
+			[alice, bob],
+			[bob, alice],
+		] as const) {
+			a.daemon.store.upsertContact({
+				publicKey: b.daemon.identity.id,
+				name: b.daemon.identity.name,
+				trust: "paired",
+			});
+			a.daemon.store.setSetting(`address:${b.daemon.identity.id}`, b.address);
+		}
+		const waiting = bob.pairing.accept();
+		let settled = false;
+		waiting.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		const sent = await alice.daemon.send({ to: "bob", body: "just a message" });
+		await waitFor(() => bob.daemon.store.getMessage(sent.id));
+		// Alice's service restarts, closing its connection to Bob.
+		await alice.daemon.stop();
+		await new Promise((r) => setTimeout(r, 100));
+		expect(settled).toBe(false);
+		bob.pairing.stop();
+		await waiting.catch(() => {});
+	});
+
 	it("refuses an unpaired key when nobody is waiting to pair", async () => {
 		const alice = await startNode("alice");
 		const bob = await startNode("bob");

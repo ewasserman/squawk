@@ -2,7 +2,7 @@
  * Starting, stopping and querying the background service from the CLI.
  */
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { logPath, pidPath, runDir, socketPath } from "./config.ts";
@@ -116,9 +116,10 @@ function isAlive(pid: number): boolean {
 }
 
 /**
- * Asks the service to stop over the socket, falling back to SIGTERM via the
- * pid file. Waits up to `timeoutMs` for it to exit. Resolves false if it
- * was not running.
+ * Asks the service to stop over the socket. If it answers on the socket but
+ * the stop call fails, sends SIGTERM to the pid in the pid file. Waits up to
+ * `timeoutMs` for it to exit. Resolves false if it was not running (and then
+ * removes any pid file left behind, without signalling that pid).
  */
 export async function stopDaemon(
 	home: string,
@@ -136,6 +137,13 @@ export async function stopDaemon(
 		} finally {
 			await client.close();
 		}
+	}
+	if (client === undefined) {
+		// No service answers on the socket, so a pid file is left over from
+		// one that died. Its pid may now belong to an unrelated process, so
+		// remove the file rather than send a signal.
+		rmSync(pidPath(home), { force: true });
+		return false;
 	}
 	if (pid === undefined || !isAlive(pid)) {
 		return asked;

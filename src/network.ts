@@ -320,6 +320,15 @@ export interface NetworkOptions {
 /** Default for `NetworkOptions.maxQueueAgeMs`: 7 days. */
 export const DEFAULT_MAX_QUEUE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * False for addresses squawk cannot put in a WebSocket URL: IPv6 link-local
+ * addresses (fe80::/10), whether or not they carry a "%interface" zone.
+ * URLs cannot express the zone, and without one the address cannot be routed.
+ */
+export function dialable(host: string): boolean {
+	return !(host.includes("%") || /^fe[89ab][0-9a-f]:/i.test(host));
+}
+
 /** The settings key under which a contact's last known address is kept. */
 export function addressSettingKey(keyId: string): string {
 	return `address:${keyId}`;
@@ -337,10 +346,10 @@ export class NetworkTransport implements Transport {
 	private timer: NodeJS.Timeout | undefined;
 	private guard: ReplayGuard | undefined;
 	private readonly links = new Map<string, PeerLink>();
-	private readonly inFlight = new Set<string>();
+	/** Deliveries in progress, by recipient key. */
+	private readonly delivering = new Map<string, Promise<void>>();
+	private stopped = false;
 	private readonly incomingLinks = new Set<PeerLink>();
-	private flushing: Promise<void> | undefined;
-	private flushAgain = false;
 	private listenPort = 0;
 	/** Decides on keys that are not paired contacts (pairing sets this). */
 	unpairedPolicy: ((key: string, link: PeerLink) => Authorization) | undefined;
@@ -403,6 +412,7 @@ export class NetworkTransport implements Transport {
 	}
 
 	async stop(): Promise<void> {
+		this.stopped = true;
 		if (this.timer) clearInterval(this.timer);
 		await this.discovery?.stop();
 		for (const link of [...this.links.values(), ...this.incomingLinks]) {
@@ -411,9 +421,13 @@ export class NetworkTransport implements Transport {
 		this.links.clear();
 		this.incomingLinks.clear();
 		for (const client of this.wss?.clients ?? []) client.terminate();
-		await new Promise<void>((resolve) => this.wss?.close(() => resolve()));
-		await new Promise<void>((resolve) => this.http?.close(() => resolve()));
-		await this.flushing;
+		const wss = this.wss;
+		const http = this.http;
+		if (wss) await new Promise<void>((resolve) => wss.close(() => resolve()));
+		if (http?.listening) {
+			await new Promise<void>((resolve) => http.close(() => resolve()));
+		}
+		await Promise.allSettled(this.delivering.values());
 	}
 
 	kick(): void {
@@ -450,18 +464,41 @@ export class NetworkTransport implements Transport {
 		);
 	}
 
-	/** Where to reach a key: the test resolver, then mDNS, then the last address that worked. */
+	/** Where to reach a key: the first of `candidates`. */
 	resolve(keyId: string): Address | undefined {
-		const fromOption = this.options.resolve?.(keyId);
-		if (fromOption) return fromOption;
+		return this.candidates(keyId)[0];
+	}
+
+	/**
+	 * Every address worth trying for a key, best first: the test resolver,
+	 * then what mDNS advertises, then the last address that worked. mDNS
+	 * advertisements are not authenticated, so the saved address is always
+	 * kept as a fallback: another host advertising this key cannot stop
+	 * delivery. Addresses that cannot be dialled are left out.
+	 */
+	candidates(keyId: string): Address[] {
+		const list: Address[] = [];
+		const add = (address: Address | undefined) => {
+			if (
+				address &&
+				dialable(address.host) &&
+				!list.some((a) => a.host === address.host && a.port === address.port)
+			) {
+				list.push(address);
+			}
+		};
+		add(this.options.resolve?.(keyId));
 		const seen = this.discovery?.peer(keyId);
-		if (seen) return { host: seen.addresses[0] ?? seen.host, port: seen.port };
+		if (seen) {
+			for (const host of seen.addresses) add({ host, port: seen.port });
+			add({ host: seen.host, port: seen.port });
+		}
 		const saved = this.daemon?.store.getSetting(addressSettingKey(keyId));
 		if (saved) {
 			const at = saved.lastIndexOf(":");
-			return { host: saved.slice(0, at), port: Number(saved.slice(at + 1)) };
+			add({ host: saved.slice(0, at), port: Number(saved.slice(at + 1)) });
 		}
-		return undefined;
+		return list;
 	}
 
 	/** Opens and authenticates a connection to `address`, expecting `expectKey` if given. */
@@ -494,28 +531,16 @@ export class NetworkTransport implements Transport {
 		return link;
 	}
 
-	/** Sends every due message, one connection per recipient. Safe to call often. */
+	/**
+	 * Starts delivering every due message, one connection per recipient.
+	 * Recipients are handled independently: a recipient whose delivery is
+	 * still in progress (for example a slow dial) is skipped this time and
+	 * does not hold up the others. Safe to call often. Resolves when the
+	 * deliveries in progress have finished.
+	 */
 	flush(): Promise<void> {
-		if (this.flushing) {
-			this.flushAgain = true;
-			return this.flushing;
-		}
-		this.flushing = (async () => {
-			try {
-				do {
-					this.flushAgain = false;
-					await this.flushOnce();
-				} while (this.flushAgain);
-			} finally {
-				this.flushing = undefined;
-			}
-		})();
-		return this.flushing;
-	}
-
-	private async flushOnce(): Promise<void> {
 		const daemon = this.daemon;
-		if (!daemon) return;
+		if (!daemon || this.stopped) return Promise.resolve();
 		daemon.store.failExpired(
 			this.options.maxQueueAgeMs ?? DEFAULT_MAX_QUEUE_AGE_MS,
 		);
@@ -525,16 +550,20 @@ export class NetworkTransport implements Transport {
 			ReturnType<typeof daemon.store.dueOutbound>
 		>();
 		for (const item of daemon.store.dueOutbound()) {
-			if (this.inFlight.has(item.messageId)) continue;
+			if (this.delivering.has(item.recipient)) continue;
 			const list = byRecipient.get(item.recipient) ?? [];
 			list.push(item);
 			byRecipient.set(item.recipient, list);
 		}
-		await Promise.all(
-			[...byRecipient].map(([recipient, items]) =>
-				this.deliverTo(recipient, items),
-			),
-		);
+		for (const [recipient, items] of byRecipient) {
+			const delivery = this.deliverTo(recipient, items).finally(() => {
+				this.delivering.delete(recipient);
+				// Pick up anything queued for this recipient meanwhile.
+				void this.flush();
+			});
+			this.delivering.set(recipient, delivery);
+		}
+		return Promise.allSettled(this.delivering.values()).then(() => {});
 	}
 
 	private async deliverTo(
@@ -542,7 +571,6 @@ export class NetworkTransport implements Transport {
 		items: ReturnType<Daemon["store"]["dueOutbound"]>,
 	): Promise<void> {
 		const store = this.requireDaemon().store;
-		for (const item of items) this.inFlight.add(item.messageId);
 		try {
 			if (store.getContact(recipient)?.trust !== "paired") {
 				throw new Error("recipient is not a paired contact");
@@ -556,17 +584,29 @@ export class NetworkTransport implements Transport {
 					store.recordAttempt(item.messageId, { error });
 				}
 			}
-		} finally {
-			for (const item of items) this.inFlight.delete(item.messageId);
 		}
 	}
 
 	private async linkTo(recipient: string): Promise<PeerLink> {
 		const existing = this.links.get(recipient);
 		if (existing?.open) return existing;
-		const address = this.resolve(recipient);
-		if (!address) throw new Error("recipient is not on the network");
-		const link = await this.dial(address, recipient);
+		const addresses = this.candidates(recipient);
+		if (addresses.length === 0) {
+			throw new Error("recipient is not on the network");
+		}
+		let link: PeerLink | undefined;
+		let address: Address | undefined;
+		let lastError: unknown;
+		for (const candidate of addresses) {
+			try {
+				link = await this.dial(candidate, recipient);
+				address = candidate;
+				break;
+			} catch (err) {
+				lastError = err;
+			}
+		}
+		if (!link || !address) throw lastError;
 		if (link.authorization !== "paired") {
 			link.close();
 			throw new Error("recipient is not a paired contact");

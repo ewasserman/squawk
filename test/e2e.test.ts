@@ -153,7 +153,7 @@ describe("end to end on one machine", () => {
 				kind: "question",
 			},
 		});
-		expect(textOf(sent)).toMatch(/^Sent to bob/);
+		expect(textOf(sent)).toMatch(/^Sent to bob and delivered/);
 		expect(alice.forms).toHaveLength(1);
 		expect(alice.forms[0]).toContain("to bob");
 

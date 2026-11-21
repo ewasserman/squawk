@@ -1,4 +1,5 @@
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
@@ -308,6 +309,32 @@ describe("Daemon methods", () => {
 		});
 	});
 
+	it("refuses to send to a blocked contact", async () => {
+		daemon.store.updateContact(alice.id, { trust: "blocked" });
+		await expect(daemon.send({ to: "alice", body: "hi" })).rejects.toThrow(
+			/is blocked/,
+		);
+		expect(daemon.store.countOutbound()).toBe(0);
+	});
+
+	it("shuts down instead of running half-started when the transport fails", async () => {
+		await daemon.stop();
+		const failing = new Daemon({
+			home,
+			transport: {
+				kick() {},
+				async start() {
+					throw new Error("port in use");
+				},
+			},
+		});
+		await expect(failing.start()).rejects.toThrow(/port in use/);
+		expect(existsSync(socketPath(home))).toBe(false);
+		expect(existsSync(pidPath(home))).toBe(false);
+		daemon = new Daemon({ home });
+		await daemon.start();
+	});
+
 	it("contacts lists contacts with their fingerprint and policy", async () => {
 		const client = await RpcClient.connect(socketPath(home));
 		clients.push(client);
@@ -322,6 +349,7 @@ describe("Daemon methods", () => {
 				trust: "paired",
 				auto_send: false,
 				inbound_policy: "auto_answer",
+				policy_is_default: false,
 			},
 		]);
 	});

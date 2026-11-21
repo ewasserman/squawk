@@ -36,6 +36,7 @@ import { fingerprint } from "./identity.ts";
 import {
 	type Address,
 	addressSettingKey,
+	dialable,
 	type Frame,
 	type NetworkTransport,
 	NOT_PAIRED,
@@ -156,8 +157,8 @@ export class Pairing {
 	/** Set while `pair --accept` is waiting for someone to pair with us. */
 	private accepting: Deferred<PairingOffer> | undefined;
 	private acceptTimer: NodeJS.Timeout | undefined;
-	/** Set while we are dialling someone to pair with them. */
-	private dialling = false;
+	/** How many pairing dials are in their handshake right now. */
+	private dialling = 0;
 
 	constructor(
 		daemon: Daemon,
@@ -172,11 +173,19 @@ export class Pairing {
 	/** Hooks into the transport and adds the RPC methods. Call after the daemon has started. */
 	start(): void {
 		this.transport.unpairedPolicy = (_key, link) => {
-			if (link.outgoing) return this.dialling ? "pairing" : false;
+			if (link.outgoing) return this.dialling > 0 ? "pairing" : false;
 			return this.accepting ? "pairing" : false;
 		};
 		this.transport.onLink = (link) => {
-			if (!link.outgoing && this.accepting) this.respond(link);
+			// Only links admitted for pairing: a paired contact connecting to
+			// deliver a message while we wait must be left alone.
+			if (
+				!link.outgoing &&
+				this.accepting &&
+				link.authorization === "pairing"
+			) {
+				this.respond(link);
+			}
 		};
 		this.daemon.handle("pair_start", (params) => {
 			const p = (params ?? {}) as { peer?: unknown };
@@ -243,7 +252,10 @@ export class Pairing {
 		let expectKey: string | undefined;
 		const found = this.transport.findPeer(peer);
 		if (found) {
-			address = { host: found.addresses[0] ?? found.host, port: found.port };
+			address = {
+				host: found.addresses.find(dialable) ?? found.host,
+				port: found.port,
+			};
 			expectKey = found.keyId;
 		} else {
 			const m = /^\[?([^\]]+?)\]?:(\d+)$/.exec(peer);
@@ -256,7 +268,7 @@ export class Pairing {
 		}
 
 		let link: PeerLink;
-		this.dialling = true;
+		this.dialling++;
 		try {
 			link = await this.transport.dial(address, expectKey);
 		} catch (err) {
@@ -268,7 +280,7 @@ export class Pairing {
 			}
 			throw new PairingError(`could not connect to ${peer}: ${reason}`);
 		} finally {
-			this.dialling = false;
+			this.dialling--;
 		}
 		const session = this.newSession("initiator", link, address);
 		const nonce = randomBytes(32);
@@ -362,7 +374,13 @@ export class Pairing {
 					session.peerName = nameField(frame);
 					const port = Number(frame.port);
 					const host = link.remoteAddress;
-					if (host && Number.isInteger(port) && port > 0 && port < 65536) {
+					if (
+						host &&
+						dialable(host) &&
+						Number.isInteger(port) &&
+						port > 0 &&
+						port < 65536
+					) {
 						session.peerAddress = { host, port };
 					}
 					link.send({

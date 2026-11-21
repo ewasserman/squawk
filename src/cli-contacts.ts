@@ -148,7 +148,8 @@ export const contactCommands: Record<string, ContactsCommand> = {
 						fingerprint: string;
 						trust: string;
 						auto_send: boolean;
-						inbound_policy: string | null;
+						inbound_policy: string;
+						policy_is_default: boolean;
 					}>;
 				}>("contacts");
 				if (values.json) {
@@ -163,7 +164,7 @@ export const contactCommands: Record<string, ContactsCommand> = {
 				}
 				for (const c of contacts) {
 					io.stdout(
-						`${c.name}  ${c.trust}  ${c.fingerprint}  policy=${c.inbound_policy ?? "default"}  auto_send=${c.auto_send ? "on" : "off"}\n`,
+						`${c.name}  ${c.trust}  ${c.fingerprint}  policy=${c.inbound_policy}${c.policy_is_default ? " (default)" : ""}  auto_send=${c.auto_send ? "on" : "off"}\n`,
 					);
 				}
 				return 0;

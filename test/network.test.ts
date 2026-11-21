@@ -1,4 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import type { AddressInfo } from "node:net";
+import { createServer } from "node:net";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
@@ -14,7 +16,12 @@ import {
 	identityFromSecretKey,
 	initIdentity,
 } from "../src/identity.ts";
-import { type Address, NetworkTransport, PeerLink } from "../src/network.ts";
+import {
+	type Address,
+	dialable,
+	NetworkTransport,
+	PeerLink,
+} from "../src/network.ts";
 
 /** One service with its own home directory, on loopback, without mDNS. */
 interface Node {
@@ -155,6 +162,51 @@ describe("sending between hosts", () => {
 		);
 		expect(bob.daemon.store.getMessage(fromAlice.id)?.body).toBe("from alice");
 		expect(carol.daemon.store.ackedAt(fromAlice.id)).toBeUndefined();
+	});
+
+	it("falls back to the saved address when the advertised one is someone else", async () => {
+		book = new Map();
+		const alice = await startNode(await makeHome("alice"));
+		const bob = await startNode(await makeHome("bob"));
+		const mallory = await startNode(await makeHome("mallory"));
+		pair(alice, bob);
+		const bobAddress = book.get(bob.daemon.identity.id);
+		alice.daemon.store.setSetting(
+			`address:${bob.daemon.identity.id}`,
+			`127.0.0.1:${bobAddress?.port}`,
+		);
+		// Mallory advertises Bob's key with her own address.
+		book.set(bob.daemon.identity.id, {
+			host: "127.0.0.1",
+			port: mallory.port,
+		});
+		const sent = await alice.daemon.send({ to: "bob", body: "for bob" });
+		await waitFor(() => bob.daemon.store.getMessage(sent.id));
+	});
+
+	it("does not hold up other recipients while one is slow to answer", async () => {
+		book = new Map();
+		const alice = await startNode(await makeHome("alice"));
+		const bob = await startNode(await makeHome("bob"));
+		const carol = await startNode(await makeHome("carol"));
+		pair(alice, bob);
+		pair(alice, carol);
+		// Carol's address accepts connections but never answers.
+		const silent = createServer(() => {});
+		await new Promise<void>((r) => silent.listen(0, "127.0.0.1", () => r()));
+		const silentPort = (silent.address() as AddressInfo).port;
+		book.set(carol.daemon.identity.id, { host: "127.0.0.1", port: silentPort });
+		try {
+			await alice.daemon.send({ to: "carol", body: "for carol" });
+			await new Promise((r) => setTimeout(r, 100));
+			const start = Date.now();
+			const sent = await alice.daemon.send({ to: "bob", body: "for bob" });
+			await waitFor(() => bob.daemon.store.getMessage(sent.id));
+			// Well under the 2 s handshake timeout Carol's dial is stuck in.
+			expect(Date.now() - start).toBeLessThan(1500);
+		} finally {
+			silent.close();
+		}
 	});
 
 	it("retries after the receiver restarts", async () => {
@@ -323,5 +375,15 @@ describe("peers", () => {
 			port: 4002,
 		});
 		expect(daemon.status().port).toBe(transport.port);
+	});
+});
+
+describe("dialable", () => {
+	it("refuses IPv6 link-local addresses, which cannot go in a URL", () => {
+		expect(dialable("192.168.1.9")).toBe(true);
+		expect(dialable("hal.local")).toBe(true);
+		expect(dialable("2001:db8::1")).toBe(true);
+		expect(dialable("fe80::1c2b:3d4e")).toBe(false);
+		expect(dialable("FE80::1%en0")).toBe(false);
 	});
 });

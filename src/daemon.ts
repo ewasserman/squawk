@@ -149,6 +149,8 @@ export interface ContactInfo {
 	auto_send: boolean;
 	/** The policy that applies to this contact's messages (their own or the default). */
 	inbound_policy: InboundPolicy;
+	/** True when the contact has no policy of its own and follows the default. */
+	policy_is_default: boolean;
 }
 
 export interface StatusResult {
@@ -282,7 +284,14 @@ export class Daemon {
 		chmodSync(this.socketPath, 0o600);
 		this.#server = server;
 		writeFileSync(pidPath(this.home), `${process.pid}\n`, { mode: 0o600 });
-		await this.transport.start?.(this);
+		try {
+			await this.transport.start?.(this);
+		} catch (err) {
+			// Do not keep running half-started (answering on the socket with no
+			// network): shut down and report the failure.
+			await this.stop();
+			throw err;
+		}
 	}
 
 	/** Stops listening, closes every connection and the store. Safe to call twice. */
@@ -332,10 +341,17 @@ export class Daemon {
 
 	/**
 	 * Creates, saves and queues a message to a contact, then tells the
-	 * transport. Throws `RpcError` if `to` is not a known contact.
+	 * transport. Throws `RpcError` if `to` is not a known contact, or is a
+	 * blocked one (such a message could never be delivered).
 	 */
 	async send(params: SendParams): Promise<SendResult> {
 		const contact = this.resolveContact(params.to);
+		if (contact.trust !== "paired") {
+			throw new RpcError(
+				RpcErrorCode.ApplicationError,
+				`"${contact.name}" is blocked; run \`squawk unblock ${contact.name}\` before sending to them`,
+			);
+		}
 		const input: Parameters<typeof createEnvelope>[0] = {
 			from: this.identity.id,
 			to: contact.publicKey,
@@ -411,6 +427,7 @@ export class Daemon {
 				trust: c.trust,
 				auto_send: c.autoSend,
 				inbound_policy: this.store.inboundPolicyFor(c.publicKey),
+				policy_is_default: c.inboundPolicy === null,
 			}))
 			.sort((a, b) => a.name.localeCompare(b.name));
 	}

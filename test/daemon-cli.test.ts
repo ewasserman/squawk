@@ -1,7 +1,15 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { pidPath, runDir } from "../src/config.ts";
+import { stopDaemon } from "../src/daemon-control.ts";
 
 const CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 
@@ -62,6 +70,20 @@ describe("squawk daemon (end to end)", () => {
 
 		const after = await squawk("daemon", "status");
 		expect(after.code).toBe(1);
+	});
+
+	it("stop removes a pid file left by a dead service without signalling that pid", async () => {
+		const stale = mkdtempSync("/tmp/sq-");
+		try {
+			mkdirSync(runDir(stale), { recursive: true });
+			// This test process's own pid stands in for an unrelated process
+			// that reused the dead service's pid.
+			writeFileSync(pidPath(stale), `${process.pid}\n`);
+			expect(await stopDaemon(stale)).toBe(false);
+			expect(existsSync(pidPath(stale))).toBe(false);
+		} finally {
+			rmSync(stale, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects an unknown action", async () => {
