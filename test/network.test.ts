@@ -8,6 +8,7 @@ import {
 	type MdnsBackend,
 	type RawService,
 } from "../src/discovery.ts";
+import { createEnvelope } from "../src/envelope.ts";
 import {
 	fingerprint,
 	identityFromSecretKey,
@@ -102,6 +103,58 @@ describe("sending between hosts", () => {
 		expect(received.direction).toBe("in");
 		await waitFor(() => alice.daemon.store.ackedAt(sent.id));
 		expect(alice.daemon.store.getOutbound(sent.id)).toBeUndefined();
+	});
+
+	it("delivers a message that waited in the queue longer than the 5-minute freshness window", async () => {
+		book = new Map();
+		const alice = await startNode(await makeHome("alice"));
+		const bob = await startNode(await makeHome("bob"));
+		pair(alice, bob);
+		// Written an hour ago while Bob was away; still queued.
+		const old = createEnvelope({
+			from: alice.daemon.identity.id,
+			to: bob.daemon.identity.id,
+			body: "written an hour ago",
+			created_at: new Date(Date.now() - 60 * 60_000),
+		});
+		alice.daemon.store.queueOutgoing(old);
+		alice.transport.kick();
+
+		const received = await waitFor(() => bob.daemon.store.getMessage(old.id));
+		expect(received.body).toBe("written an hour ago");
+		expect(received.createdAt).toBe(old.created_at);
+		await waitFor(() => alice.daemon.store.ackedAt(old.id));
+	});
+
+	it("refuses an incoming id that belongs to a message from someone else", async () => {
+		book = new Map();
+		const alice = await startNode(await makeHome("alice"));
+		const bob = await startNode(await makeHome("bob"));
+		const carol = await startNode(await makeHome("carol"));
+		pair(alice, bob);
+		pair(carol, bob);
+
+		const fromAlice = await alice.daemon.send({
+			to: "bob",
+			body: "from alice",
+		});
+		await waitFor(() => alice.daemon.store.ackedAt(fromAlice.id));
+		// Carol reuses the id of Alice's message.
+		const reused = createEnvelope({
+			from: carol.daemon.identity.id,
+			to: bob.daemon.identity.id,
+			body: "from carol",
+		});
+		const clash = { ...reused, id: fromAlice.id, thread_id: fromAlice.id };
+		carol.daemon.store.queueOutgoing(clash);
+		carol.transport.kick();
+		await waitFor(() =>
+			carol.daemon.store
+				.getOutbound(fromAlice.id)
+				?.lastError?.includes("message id already in use"),
+		);
+		expect(bob.daemon.store.getMessage(fromAlice.id)?.body).toBe("from alice");
+		expect(carol.daemon.store.ackedAt(fromAlice.id)).toBeUndefined();
 	});
 
 	it("retries after the receiver restarts", async () => {

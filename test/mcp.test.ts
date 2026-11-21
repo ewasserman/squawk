@@ -11,7 +11,7 @@ import { z } from "zod";
 import { Daemon, type Transport } from "../src/daemon.ts";
 import { stopDaemon } from "../src/daemon-control.ts";
 import { DaemonLink } from "../src/daemon-link.ts";
-import { createEnvelope, open, type Sealed } from "../src/envelope.ts";
+import { createEnvelope, type Envelope } from "../src/envelope.ts";
 import {
 	type Identity,
 	identityFromSecretKey,
@@ -42,7 +42,7 @@ type ChannelNotification = z.infer<typeof ChannelNotificationSchema>;
 let home: string;
 let me: Identity;
 let daemon: Daemon;
-let kicked: Sealed[];
+let kicked: Envelope[];
 let link: DaemonLink;
 let server: Server;
 let client: Client;
@@ -51,8 +51,8 @@ let drafts: Draft[];
 
 function makeTransport(): Transport {
 	return {
-		kick(sealed) {
-			kicked.push(sealed);
+		kick(envelope) {
+			kicked.push(envelope);
 		},
 	};
 }
@@ -249,7 +249,7 @@ describe("squawk mcp server", () => {
 			},
 		]);
 		expect(kicked).toHaveLength(1);
-		expect(open(kicked[0], alice)).toMatchObject({
+		expect(kicked[0]).toMatchObject({
 			body: "hello",
 			kind: "question",
 			session: "s",
@@ -272,7 +272,7 @@ describe("squawk mcp server", () => {
 			arguments: { to: "alice", text: "draft" },
 		});
 		expect(text(sent)).toContain("edited the text");
-		expect(open(kicked[0], alice).body).toBe("edited");
+		expect(kicked[0]?.body).toBe("edited");
 	});
 
 	it("send reports errors from the service and bad arguments as tool errors", async () => {
@@ -306,7 +306,7 @@ describe("squawk mcp server", () => {
 			thread_id: question.thread_id,
 			in_reply_to: question.id,
 		});
-		expect(open(kicked[0], alice)).toMatchObject({
+		expect(kicked[0]).toMatchObject({
 			to: alice.id,
 			body: "Yes",
 			kind: "answer",
@@ -320,7 +320,7 @@ describe("squawk mcp server", () => {
 			name: "reply",
 			arguments: { msg_id: statement.id, text: "thanks" },
 		});
-		expect(open(kicked[1], alice).kind).toBe("text");
+		expect(kicked[1]?.kind).toBe("text");
 
 		const missing = await client.callTool({
 			name: "reply",
@@ -469,7 +469,7 @@ describe("confirmation through MCP elicitation", () => {
 		expect(asked[0]?.default).toBe("Is the build green?");
 		expect(text(result)).toMatch(/^Sent to alice/);
 		expect(kicked).toHaveLength(1);
-		expect(open(kicked[0], alice).body).toBe("Is the build green?");
+		expect(kicked[0]?.body).toBe("Is the build green?");
 	});
 
 	it("sends the text as the human edited it", async () => {
@@ -483,7 +483,7 @@ describe("confirmation through MCP elicitation", () => {
 			arguments: { to: "alice", text: "Original" },
 		});
 		expect(text(result)).toContain("edited the text");
-		expect(open(kicked[0], alice).body).toBe("Edited by me");
+		expect(kicked[0]?.body).toBe("Edited by me");
 	});
 
 	it.each([

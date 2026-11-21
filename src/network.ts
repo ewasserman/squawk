@@ -36,11 +36,12 @@ import type { Daemon, Peer, Transport } from "./daemon.ts";
 import { type DiscoveredPeer, Discovery } from "./discovery.ts";
 import { fromBase64Url, isKeyId, keyFromId, toBase64Url } from "./encoding.ts";
 import {
+	type Envelope,
 	EnvelopeError,
 	open,
 	ReplayGuard,
-	type Sealed,
 	SealedSchema,
+	seal,
 } from "./envelope.ts";
 import { fingerprint, type Identity } from "./identity.ts";
 
@@ -309,7 +310,15 @@ export interface NetworkOptions {
 	ackTimeoutMs?: number;
 	/** How long the connection handshake may take, in milliseconds. */
 	handshakeTimeoutMs?: number;
+	/**
+	 * How long a message may wait in the outbound queue before squawk gives up
+	 * and marks it failed, in milliseconds. Default 7 days.
+	 */
+	maxQueueAgeMs?: number;
 }
+
+/** Default for `NetworkOptions.maxQueueAgeMs`: 7 days. */
+export const DEFAULT_MAX_QUEUE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** The settings key under which a contact's last known address is kept. */
 export function addressSettingKey(keyId: string): string {
@@ -507,6 +516,10 @@ export class NetworkTransport implements Transport {
 	private async flushOnce(): Promise<void> {
 		const daemon = this.daemon;
 		if (!daemon) return;
+		daemon.store.failExpired(
+			this.options.maxQueueAgeMs ?? DEFAULT_MAX_QUEUE_AGE_MS,
+		);
+		this.guard?.prune();
 		const byRecipient = new Map<
 			string,
 			ReturnType<typeof daemon.store.dueOutbound>
@@ -571,9 +584,16 @@ export class NetworkTransport implements Transport {
 
 	private sendOne(
 		link: PeerLink,
-		item: { messageId: string; sealed: Sealed },
+		item: { messageId: string; envelope: Envelope },
 	): Promise<void> {
-		const store = this.requireDaemon().store;
+		const daemon = this.requireDaemon();
+		const store = daemon.store;
+		// Sealed afresh with the current time, so a message that waited in the
+		// queue is still within the receiver's freshness window.
+		const sealed = seal(
+			{ ...item.envelope, sent_at: new Date().toISOString() },
+			daemon.identity,
+		);
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				off();
@@ -600,7 +620,7 @@ export class NetworkTransport implements Transport {
 				link.ws.off("close", onClose);
 			};
 			link.ws.on("close", onClose);
-			link.send({ t: "msg", id: item.messageId, sealed: item.sealed });
+			link.send({ t: "msg", id: item.messageId, sealed });
 		});
 	}
 
@@ -651,23 +671,35 @@ export class NetworkTransport implements Transport {
 			nack("sender does not match the connection");
 			return;
 		}
+		const guard = this.requireGuard();
 		try {
-			const envelope = open(parsed.data, daemon.identity, this.guard);
+			// Checks freshness and that the id is new, without recording it.
+			const envelope = open(parsed.data, daemon.identity, guard);
 			if (envelope.id !== id) {
 				nack("id does not match the message");
+				return;
+			}
+			const conflict = daemon.store.incomingConflict(envelope);
+			if (conflict !== undefined) {
+				nack(conflict);
 				return;
 			}
 			daemon.deliverIncoming(envelope, {
 				remoteAddress: link.remoteAddress ?? "",
 			});
+			// Recorded only once stored: if storing failed, the sender's retry
+			// must not be refused as a replay.
+			guard.record(envelope);
 			link.send({ t: "ack", id });
 		} catch (err) {
-			// A repeat of a message we already stored: the sender missed our
-			// ack, so acknowledge again to stop it retrying.
+			// A repeat of a message we already stored from this sender: it
+			// missed our ack, so acknowledge again to stop it retrying.
+			const stored = daemon.store.getMessage(id);
 			if (
 				err instanceof EnvelopeError &&
 				err.code === "replay" &&
-				daemon.store.getMessage(id)
+				stored?.direction === "in" &&
+				stored.peer === link.peerKey
 			) {
 				link.send({ t: "ack", id });
 				return;
@@ -680,6 +712,11 @@ export class NetworkTransport implements Transport {
 		if (this.daemon?.store.getContact(peer.keyId)?.trust === "paired") {
 			void this.flush();
 		}
+	}
+
+	private requireGuard(): ReplayGuard {
+		if (!this.guard) throw new Error("transport is not started");
+		return this.guard;
 	}
 
 	private requireDaemon(): Daemon {

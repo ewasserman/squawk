@@ -49,6 +49,66 @@ describe("Store", () => {
 		expect((await stat(path)).mode & 0o777).toBe(0o600);
 	});
 
+	it("creates SQLite's companion files with mode 0600 too", async () => {
+		store.upsertContact({ publicKey: bob.id, name: "bob" });
+		for (const suffix of ["-wal", "-shm"]) {
+			expect((await stat(path + suffix)).mode & 0o777).toBe(0o600);
+		}
+	});
+
+	it("skips a migration that another process applied first", () => {
+		// This process read version 1 before another process finished
+		// migrating, so its first read is out of date. Applying migration 2
+		// again would fail with "duplicate column name".
+		const actual = store.schemaVersion.bind(store);
+		let first = true;
+		store.schemaVersion = () => {
+			if (first) {
+				first = false;
+				return 1;
+			}
+			return actual();
+		};
+		expect(() => store.migrate()).not.toThrow();
+		expect(actual()).toBe(MIGRATIONS.length);
+	});
+
+	it("marks messages failed when they have waited too long", () => {
+		const env = outgoing();
+		store.queueOutgoing(env);
+		expect(store.failExpired(60_000)).toEqual([]);
+		now += 60_001;
+		expect(store.failExpired(60_000)).toEqual([env.id]);
+		expect(store.getOutbound(env.id)).toBeUndefined();
+		expect(store.getMessage(env.id)?.state).toBe("failed");
+	});
+
+	it("reports incoming ids and threads that belong to someone else", () => {
+		const carol = identityFromSecretKey(
+			"carol",
+			ed25519.utils.randomSecretKey(),
+		);
+		const mine = createEnvelope({ from: bob.id, to: alice.id, body: "hi" });
+		store.saveIncoming(mine);
+		// The same message again from the same sender is not a conflict.
+		expect(store.incomingConflict(mine)).toBeUndefined();
+		expect(store.incomingConflict({ ...mine, from: carol.id })).toBe(
+			"message id already in use",
+		);
+		const intoThread = createEnvelope({
+			from: carol.id,
+			to: alice.id,
+			body: "me too",
+			thread_id: mine.thread_id,
+		});
+		expect(store.incomingConflict(intoThread)).toBe("thread id already in use");
+		const sent = outgoing();
+		store.saveOutgoing(sent);
+		expect(store.incomingConflict({ ...sent, from: bob.id })).toBe(
+			"message id already in use",
+		);
+	});
+
 	it("applies migrations once and is unchanged on reopen", () => {
 		expect(store.schemaVersion()).toBe(MIGRATIONS.length);
 		store.upsertContact({ publicKey: bob.id, name: "bob" });
@@ -62,7 +122,7 @@ describe("Store", () => {
 
 	it("queues a message and returns it when due", () => {
 		const env = outgoing();
-		store.queueOutgoing(env, seal(env, alice));
+		store.queueOutgoing(env);
 
 		const due = store.dueOutbound();
 		expect(due).toHaveLength(1);
@@ -70,14 +130,13 @@ describe("Store", () => {
 		expect(item?.messageId).toBe(env.id);
 		expect(item?.recipient).toBe(bob.id);
 		expect(item?.attempts).toBe(0);
-		// The stored sealed payload opens on the recipient's side.
-		expect(open(item?.sealed, bob).body).toBe("Hello Bob");
+		expect(item?.envelope).toEqual(env);
 		expect(store.getMessage(env.id)?.state).toBe("queued");
 	});
 
 	it("backs off after a failed attempt", () => {
 		const env = outgoing();
-		store.queueOutgoing(env, seal(env, alice));
+		store.queueOutgoing(env);
 
 		const first = store.recordAttempt(env.id, { error: "ECONNREFUSED" });
 		expect(first).toBe(now + 2_000);
@@ -96,7 +155,7 @@ describe("Store", () => {
 
 	it("marking a message acknowledged removes it from the queue", () => {
 		const env = outgoing();
-		store.queueOutgoing(env, seal(env, alice));
+		store.queueOutgoing(env);
 
 		expect(store.markAcknowledged(env.id)).toBe(true);
 		expect(store.dueOutbound()).toHaveLength(0);
@@ -205,7 +264,7 @@ describe("Store", () => {
 		});
 		const sealed = seal(env, alice);
 		const guard = new ReplayGuard({ seen: store.seenIds(), now: () => now });
-		open(sealed, bob, guard);
+		guard.record(open(sealed, bob, guard));
 
 		store.close();
 		store = Store.open(path, { now: () => now });
@@ -213,6 +272,6 @@ describe("Store", () => {
 		expect(() => open(sealed, bob, guard2)).toThrow(EnvelopeError);
 
 		expect(store.seenIds().prune(now + 1)).toBe(1);
-		expect(store.seenIds().has(env.id)).toBe(false);
+		expect(guard2.seen.has(`${alice.id} ${env.id}`)).toBe(false);
 	});
 });

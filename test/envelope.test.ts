@@ -126,14 +126,14 @@ describe("ReplayGuard", () => {
 	it("rejects a replayed message id", () => {
 		const guard = new ReplayGuard({ now: clock });
 		const sealed = seal(message(), alice);
-		open(sealed, bob, guard);
+		guard.record(open(sealed, bob, guard));
 		expectCode(() => open(sealed, bob, guard), "replay");
 	});
 
 	it("rejects a different message reusing an id", () => {
 		const guard = new ReplayGuard({ now: clock });
 		const first = message();
-		open(seal(first, alice), bob, guard);
+		guard.record(open(seal(first, alice), bob, guard));
 		const second: Envelope = { ...message(), id: first.id };
 		expectCode(() => open(seal(second, alice), bob, guard), "replay");
 	});
@@ -156,6 +156,47 @@ describe("ReplayGuard", () => {
 		const guard = new ReplayGuard({ now: clock });
 		const old = message({ created_at: new Date(NOW - 60 * 60_000) });
 		expectCode(() => open(seal(old, alice), bob, guard), "stale");
-		expect(guard.seen.has(old.id)).toBe(false);
+		expect(guard.seen.has(`${alice.id} ${old.id}`)).toBe(false);
+	});
+
+	it("uses sent_at, when present, for freshness", () => {
+		const guard = new ReplayGuard({ now: clock });
+		// Written an hour ago, but sealed again just now for a retry.
+		const queued = message({ created_at: new Date(NOW - 60 * 60_000) });
+		const resent = { ...queued, sent_at: new Date(NOW).toISOString() };
+		expect(open(seal(resent, alice), bob, guard).created_at).toBe(
+			queued.created_at,
+		);
+		const staleResend = {
+			...queued,
+			sent_at: new Date(NOW - 6 * 60_000).toISOString(),
+		};
+		expectCode(() => open(seal(staleResend, alice), bob, guard), "stale");
+	});
+
+	it("keeps ids per sender, so one sender cannot block another's message", () => {
+		const guard = new ReplayGuard({ now: clock });
+		const fromAlice = message();
+		guard.record(open(seal(fromAlice, alice), bob, guard));
+		const fromCarol: Envelope = { ...fromAlice, from: carol.id };
+		expect(open(seal(fromCarol, carol), bob, guard).id).toBe(fromAlice.id);
+	});
+
+	it("does not record an id until told to", () => {
+		const guard = new ReplayGuard({ now: clock });
+		const sealed = seal(message(), alice);
+		open(sealed, bob, guard);
+		// Storing failed, so the caller did not record it: the retry is accepted.
+		expect(open(sealed, bob, guard).body).toContain("Hello");
+	});
+
+	it("forgets ids once they are too old to be replayed", () => {
+		let now = NOW;
+		const guard = new ReplayGuard({ now: () => now });
+		const env = message();
+		guard.accept(env);
+		now += 10 * 60_000 + 1;
+		guard.prune();
+		expect(guard.seen.has(`${alice.id} ${env.id}`)).toBe(false);
 	});
 });

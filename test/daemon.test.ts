@@ -14,7 +14,7 @@ import {
 	type MessageNotification,
 	type Transport,
 } from "../src/daemon.ts";
-import { createEnvelope, open, type Sealed } from "../src/envelope.ts";
+import { createEnvelope, type Envelope } from "../src/envelope.ts";
 import {
 	type Identity,
 	identityFromSecretKey,
@@ -27,7 +27,7 @@ const alice = identityFromSecretKey("alice", ed25519.utils.randomSecretKey());
 let home: string;
 let me: Identity;
 let daemon: Daemon;
-let kicked: Sealed[];
+let kicked: Envelope[];
 const clients: RpcClient[] = [];
 
 beforeEach(async () => {
@@ -36,8 +36,8 @@ beforeEach(async () => {
 	me = await initIdentity(home, "me");
 	kicked = [];
 	const transport: Transport = {
-		kick(sealed) {
-			kicked.push(sealed);
+		kick(envelope) {
+			kicked.push(envelope);
 		},
 	};
 	daemon = new Daemon({ home, transport });
@@ -200,7 +200,7 @@ describe("Daemon routing", () => {
 });
 
 describe("Daemon methods", () => {
-	it("send queues a sealed message for a contact by name and kicks the transport", async () => {
+	it("send queues a message for a contact by name and kicks the transport", async () => {
 		const client = await RpcClient.connect(socketPath(home));
 		clients.push(client);
 		const result = await client.call<{
@@ -212,8 +212,7 @@ describe("Daemon methods", () => {
 		expect(result.thread_id).toBe(result.id);
 		const item = daemon.store.getOutbound(result.id);
 		expect(item?.recipient).toBe(alice.id);
-		const opened = open(item?.sealed, alice);
-		expect(opened).toMatchObject({
+		expect(item?.envelope).toMatchObject({
 			id: result.id,
 			from: me.id,
 			to: alice.id,
@@ -221,7 +220,7 @@ describe("Daemon methods", () => {
 			kind: "question",
 			session: "x",
 		});
-		expect(kicked).toEqual([item?.sealed]);
+		expect(kicked).toEqual([item?.envelope]);
 		expect(daemon.store.getMessage(result.id)?.state).toBe("queued");
 		expect(daemon.status().queued_outbound).toBe(1);
 

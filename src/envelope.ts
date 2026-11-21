@@ -31,7 +31,7 @@ import type { Identity } from "./identity.ts";
 /** Wire format version written into every sealed message. */
 export const WIRE_VERSION = 1;
 
-/** Messages whose created_at is further than this from the local clock are rejected. */
+/** Messages whose sent_at (or created_at) is further than this from the local clock are rejected. */
 export const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const SIGNATURE_PREFIX = "squawk envelope v1\n";
@@ -55,6 +55,13 @@ export const EnvelopeSchema = z
 		thread_id: z.string().min(1).max(128),
 		in_reply_to: z.string().min(1).max(128).optional(),
 		created_at: z.iso.datetime({ offset: true }),
+		/**
+		 * When this copy was sealed for sending. A message waiting in the
+		 * outbound queue is sealed again at each attempt with a new sent_at, so
+		 * it stays within the receiver's freshness window however long it
+		 * waited. Absent means the same as created_at.
+		 */
+		sent_at: z.iso.datetime({ offset: true }).optional(),
 		kind: MessageKindSchema,
 		/** Markdown text. */
 		body: z.string(),
@@ -109,7 +116,7 @@ export type EnvelopeErrorCode =
 	| "sender_mismatch"
 	/** This message id has been accepted before. */
 	| "replay"
-	/** created_at is too far from the local clock. */
+	/** sent_at (or created_at) is too far from the local clock. */
 	| "stale";
 
 /** Raised when a message cannot be sealed or opened, with a `code` saying why. */
@@ -222,8 +229,10 @@ export function seal(envelope: Envelope, sender: Identity): Sealed {
  * Checks, in order: wire shape, outer recipient, decryption, envelope shape,
  * signature by the claimed sender, that the signed `from`/`to` match the
  * outer sender and the opener, and finally (when a guard is given) the
- * timestamp and that the id is new. The id is recorded in the guard only
- * after every other check passes. Throws `EnvelopeError` on any failure.
+ * timestamp and that the id is new. It does not record the id: the caller
+ * calls `guard.record(envelope)` once the message is safely stored, so a
+ * message that failed to store can be accepted when the sender retries.
+ * Throws `EnvelopeError` on any failure.
  */
 export function open(
 	sealed: unknown,
@@ -303,15 +312,17 @@ export function open(
 		);
 	}
 
-	guard?.accept(envelope);
+	guard?.check(envelope);
 	return envelope;
 }
 
 /** Storage for message ids that have already been accepted. */
 export interface SeenIdStore {
 	has(id: string): boolean;
-	/** Records `id`; `createdAtMs` lets the store forget ids too old to be replayed. */
-	add(id: string, createdAtMs: number): void;
+	/** Records `id` at time `atMs`, so the store can later forget ids too old to be replayed. */
+	add(id: string, atMs: number): void;
+	/** Forgets ids recorded with a time before `cutoffMs`. */
+	prune(cutoffMs: number): void;
 }
 
 /** A `SeenIdStore` kept in memory. Contents are lost when the process exits. */
@@ -323,7 +334,7 @@ export class MemorySeenIds implements SeenIdStore {
 	add(id: string, createdAtMs: number): void {
 		this.#ids.set(id, createdAtMs);
 	}
-	/** Forgets ids whose created_at is before `cutoffMs`. */
+	/** Forgets ids recorded before `cutoffMs`. */
 	prune(cutoffMs: number): void {
 		for (const [id, at] of this.#ids) {
 			if (at < cutoffMs) this.#ids.delete(id);
@@ -339,10 +350,16 @@ export interface ReplayGuardOptions {
 }
 
 /**
- * Rejects messages whose id was accepted before (`replay`) or whose
- * created_at is more than `maxSkewMs` (default 5 minutes) away from the local
- * clock in either direction (`stale`). Because old messages are refused on
- * time, the seen-id store only needs to keep ids from the last few minutes.
+ * Rejects messages whose id was accepted before from the same sender
+ * (`replay`) or whose sent_at (or created_at, when there is no sent_at) is
+ * more than `maxSkewMs` (default 5 minutes) away from the local clock in
+ * either direction (`stale`). Because old messages are refused on time, the
+ * seen-id store only needs to keep ids from the last few minutes; `prune`
+ * forgets the rest.
+ *
+ * Ids are recorded per sender, because each sender chooses its own ids: one
+ * contact reusing an id must not make another contact's message look like a
+ * replay.
  */
 export class ReplayGuard {
 	readonly seen: SeenIdStore;
@@ -356,18 +373,18 @@ export class ReplayGuard {
 	}
 
 	/** Throws `stale` or `replay` if the envelope must be refused. Does not record it. */
-	check(envelope: Pick<Envelope, "id" | "created_at">): void {
-		const created = Date.parse(envelope.created_at);
-		if (
-			Number.isNaN(created) ||
-			Math.abs(this.#now() - created) > this.#maxSkewMs
-		) {
+	check(
+		envelope: Pick<Envelope, "id" | "from" | "created_at" | "sent_at">,
+	): void {
+		const time = envelope.sent_at ?? envelope.created_at;
+		const sent = Date.parse(time);
+		if (Number.isNaN(sent) || Math.abs(this.#now() - sent) > this.#maxSkewMs) {
 			throw new EnvelopeError(
 				"stale",
-				`created_at ${envelope.created_at} is more than ${this.#maxSkewMs / 1000}s from the local clock`,
+				`sent at ${time}, more than ${this.#maxSkewMs / 1000}s from the local clock`,
 			);
 		}
-		if (this.seen.has(envelope.id)) {
+		if (this.seen.has(seenKey(envelope))) {
 			throw new EnvelopeError(
 				"replay",
 				`message ${envelope.id} was already received`,
@@ -375,9 +392,26 @@ export class ReplayGuard {
 		}
 	}
 
-	/** Checks the envelope and, if it passes, records its id as seen. */
-	accept(envelope: Pick<Envelope, "id" | "created_at">): void {
-		this.check(envelope);
-		this.seen.add(envelope.id, Date.parse(envelope.created_at));
+	/** Records the envelope's id as seen. Call after the message is stored. */
+	record(envelope: Pick<Envelope, "id" | "from">): void {
+		this.seen.add(seenKey(envelope), this.#now());
 	}
+
+	/** Checks the envelope and, if it passes, records its id as seen. */
+	accept(
+		envelope: Pick<Envelope, "id" | "from" | "created_at" | "sent_at">,
+	): void {
+		this.check(envelope);
+		this.record(envelope);
+	}
+
+	/** Forgets ids recorded more than twice the allowed clock difference ago. */
+	prune(): void {
+		this.seen.prune(this.#now() - 2 * this.#maxSkewMs);
+	}
+}
+
+/** The seen-id key: the sender's key and the message id. */
+function seenKey(envelope: Pick<Envelope, "id" | "from">): string {
+	return `${envelope.from} ${envelope.id}`;
 }

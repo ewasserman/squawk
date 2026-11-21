@@ -79,8 +79,9 @@ export function identityFromSecretKey(
 
 /**
  * Creates a new key pair and writes it, with the display name, to the
- * identity file under `home`. The directory gets mode 0700 and the file
- * mode 0600. Throws `IdentityExistsError` if the file is already there.
+ * identity file under `home`. The file gets mode 0600, and the directory
+ * mode 0700 if this call creates it (an existing directory's permissions are
+ * left alone). Throws `IdentityExistsError` if the file is already there.
  */
 export async function initIdentity(
 	home: string,
@@ -90,8 +91,11 @@ export async function initIdentity(
 	if (trimmed === "") {
 		throw new Error("display name must not be empty");
 	}
-	await mkdir(home, { recursive: true, mode: 0o700 });
-	await chmod(home, 0o700);
+	// mkdir's mode is applied before the umask, so set it again on a directory
+	// this call created (mkdir returns the first directory it made).
+	if ((await mkdir(home, { recursive: true, mode: 0o700 })) !== undefined) {
+		await chmod(home, 0o700);
+	}
 
 	const secretKey = ed25519.utils.randomSecretKey();
 	const identity = identityFromSecretKey(trimmed, secretKey);
@@ -131,12 +135,20 @@ export async function loadIdentity(home: string): Promise<Identity> {
 		}
 		throw err;
 	}
-	const file = JSON.parse(text) as Partial<IdentityFile>;
+	let file: Partial<IdentityFile>;
+	try {
+		file = JSON.parse(text) as Partial<IdentityFile>;
+	} catch {
+		file = {};
+	}
 	if (
+		typeof file !== "object" ||
+		file === null ||
 		file.version !== 1 ||
 		typeof file.name !== "string" ||
 		typeof file.secretKey !== "string" ||
-		typeof file.publicKey !== "string"
+		typeof file.publicKey !== "string" ||
+		!/^[A-Za-z0-9_-]{43}$/.test(file.secretKey)
 	) {
 		throw new Error(
 			`identity file ${path} is not in a format squawk understands`,

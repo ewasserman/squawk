@@ -163,7 +163,9 @@ impersonates the user to their contacts.
 **Mitigations.**
 
 - The identity lives in `$SQUAWK_HOME` (default `~/.config/squawk/`). The
-  directory is mode 0700 and the key file and database are mode 0600. `squawk
+  directory is mode 0700 when squawk creates it (an existing directory's
+  permissions are left alone), and the key file and the database, including
+  SQLite's `-wal` and `-shm` files, are mode 0600. `squawk
   init` refuses to overwrite an existing key. Tests check the permissions.
   *Tasks 3, 5.*
 - The local socket that sessions use to talk to the service is mode 0600 in a
@@ -179,9 +181,15 @@ impersonates the user to their contacts.
 example to repeat "yes, go ahead".
 
 **Mitigations.** Each message has a unique id; the receiving service rejects
-an id it has seen before, and rejects a message whose timestamp is more than 5
-minutes from its own clock. Seen ids are stored in the database, so this
-survives a restart. *Tasks 4, 5.*
+an id it has already accepted from the same sender, and rejects a message
+whose signed send time is more than 5 minutes from its own clock. A message
+waiting in the sender's queue is signed again with a new send time at each
+attempt, so a long wait does not make it undeliverable; a message still
+undelivered after 7 days is marked failed. Seen ids are stored in the
+database, so this survives a restart, and are forgotten once they are too old
+to be replayed. Ids are kept per sender, and an incoming message whose id or
+thread already belongs to another contact is refused, so one contact cannot
+make another's message be dropped as a duplicate. *Tasks 4, 5.*
 
 ## Summary
 

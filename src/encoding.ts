@@ -24,9 +24,14 @@ export function keyId(publicKey: Uint8Array): string {
 	return toBase64Url(publicKey);
 }
 
-/** True when `text` has the shape of a key identifier made by `keyId`. */
+/**
+ * True when `text` is exactly what `keyId` produces for some 32 bytes. The
+ * last of the 43 characters carries 2 unused bits, so up to four spellings
+ * decode to the same key; only the one with those bits zero is accepted, so
+ * that each key has one identifier and text comparisons of ids are safe.
+ */
 export function isKeyId(text: string): boolean {
-	return KEY_ID_PATTERN.test(text);
+	return KEY_ID_PATTERN.test(text) && toBase64Url(fromBase64Url(text)) === text;
 }
 
 /** Turns a key identifier back into the 32 raw public-key bytes. */

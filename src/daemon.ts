@@ -19,8 +19,6 @@ import {
 	type Envelope,
 	type MessageKind,
 	MessageKindSchema,
-	type Sealed,
-	seal,
 } from "./envelope.ts";
 import { fingerprint, type Identity, loadIdentity } from "./identity.ts";
 import {
@@ -49,8 +47,8 @@ export interface Transport {
 	start?(daemon: Daemon): Promise<void> | void;
 	/** Called when the daemon stops, before the store is closed. */
 	stop?(): Promise<void> | void;
-	/** The outbound queue has a new item (`sealed`, already in the store). */
-	kick(sealed: Sealed): Promise<void> | void;
+	/** The outbound queue has a new item (`envelope`, already in the store). */
+	kick(envelope: Envelope): Promise<void> | void;
 	/** Other services seen on the network. */
 	peers?(): Peer[];
 	/** The TCP port other hosts connect to, if there is one. */
@@ -333,7 +331,7 @@ export class Daemon {
 	}
 
 	/**
-	 * Creates, saves, seals and queues a message to a contact, then tells the
+	 * Creates, saves and queues a message to a contact, then tells the
 	 * transport. Throws `RpcError` if `to` is not a known contact.
 	 */
 	async send(params: SendParams): Promise<SendResult> {
@@ -350,10 +348,9 @@ export class Daemon {
 			input.in_reply_to = params.in_reply_to;
 		if (params.session !== undefined) input.session = params.session;
 		const envelope = createEnvelope(input);
-		const sealed = seal(envelope, this.identity);
-		this.store.queueOutgoing(envelope, sealed);
+		this.store.queueOutgoing(envelope);
 		try {
-			await this.transport.kick(sealed);
+			await this.transport.kick(envelope);
 		} catch (err) {
 			// The message is safely queued; the transport retries later.
 			console.error("squawkd: transport failed:", err);

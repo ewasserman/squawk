@@ -7,10 +7,15 @@
  * used for scheduling or expiry (`next_attempt_at`, `seen_ids.created_at_ms`)
  * are milliseconds since the epoch.
  */
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import type { Envelope, MessageKind, Sealed, SeenIdStore } from "./envelope.ts";
+import {
+	type Envelope,
+	EnvelopeSchema,
+	type MessageKind,
+	type SeenIdStore,
+} from "./envelope.ts";
 
 /**
  * Schema migrations, applied in order. The database's `PRAGMA user_version`
@@ -90,6 +95,17 @@ export const MIGRATIONS: readonly string[] = [
 	ALTER TABLE messages ADD COLUMN delivered_at TEXT;
 	CREATE INDEX messages_undelivered ON messages (direction, delivered_at, created_at);
 	`,
+	// The outbound queue now holds the envelope rather than a sealed copy, so
+	// each attempt can be sealed with a fresh sent_at. Rows queued in the old
+	// form cannot be converted (they are encrypted), so they are marked failed.
+	// Seen ids are now recorded per sender under a different key, so the old
+	// rows are no longer useful.
+	`
+	UPDATE messages SET state = 'failed'
+	 WHERE id IN (SELECT message_id FROM outbox);
+	DELETE FROM outbox;
+	DELETE FROM seen_ids;
+	`,
 ];
 
 export type Trust = "paired" | "blocked";
@@ -156,7 +172,8 @@ export interface StoredMessage {
 export interface OutboundItem {
 	messageId: string;
 	recipient: string;
-	sealed: Sealed;
+	/** The message to seal and send; sealed afresh at each attempt. */
+	envelope: Envelope;
 	attempts: number;
 	/** Milliseconds since the epoch. */
 	nextAttemptAt: number;
@@ -220,7 +237,7 @@ function toOutbound(row: Row): OutboundItem {
 	return {
 		messageId: row.message_id as string,
 		recipient: row.recipient as string,
-		sealed: JSON.parse(row.payload as string) as Sealed,
+		envelope: EnvelopeSchema.parse(JSON.parse(row.payload as string)),
 		attempts: Number(row.attempts),
 		nextAttemptAt: Number(row.next_attempt_at),
 		lastError: (row.last_error as string | null) ?? null,
@@ -268,23 +285,39 @@ export class Store {
 	/**
 	 * Opens (creating if needed) the database at `path` and applies any
 	 * migrations not yet applied. Use ":memory:" for a throwaway database.
-	 * A database file is given mode 0600, since it holds private messages.
+	 * The database file and SQLite's companion files (`-wal`, which holds
+	 * recent message text, and `-shm`) are created with mode 0600, since they
+	 * hold private messages.
 	 */
 	static open(path: string, options: StoreOptions = {}): Store {
-		const inMemory = path === ":memory:";
-		if (!inMemory) {
-			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		if (path === ":memory:") {
+			const store = new Store(new DatabaseSync(path), options);
+			store.#configure();
+			return store;
 		}
-		const db = new DatabaseSync(path);
-		if (!inMemory) {
-			chmodSync(path, 0o600);
-			db.exec("PRAGMA journal_mode = WAL");
+		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+		// SQLite creates its files with the process umask; make that
+		// owner-only while opening so no file is ever readable by others.
+		const previousUmask = process.umask(0o077);
+		let store: Store;
+		try {
+			store = new Store(new DatabaseSync(path), options);
+			store.db.exec("PRAGMA journal_mode = WAL");
+			store.#configure();
+		} finally {
+			process.umask(previousUmask);
 		}
-		db.exec("PRAGMA foreign_keys = ON");
-		db.exec("PRAGMA busy_timeout = 5000");
-		const store = new Store(db, options);
-		store.migrate();
+		// Files left by an older version may have been created more openly.
+		for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+			if (existsSync(file)) chmodSync(file, 0o600);
+		}
 		return store;
+	}
+
+	#configure(): void {
+		this.db.exec("PRAGMA foreign_keys = ON");
+		this.db.exec("PRAGMA busy_timeout = 5000");
+		this.migrate();
 	}
 
 	close(): void {
@@ -297,10 +330,16 @@ export class Store {
 		return Number(row.user_version);
 	}
 
-	/** Applies, in one transaction each, every migration not yet applied. */
+	/**
+	 * Applies, in one transaction each, every migration not yet applied. The
+	 * version is read again inside each transaction, so when two processes
+	 * open the same database at once, the one that waited skips a migration
+	 * the other has just applied.
+	 */
 	migrate(): void {
 		for (let v = this.schemaVersion(); v < MIGRATIONS.length; v++) {
 			this.transaction(() => {
+				if (this.schemaVersion() > v) return;
 				this.db.exec(MIGRATIONS[v] as string);
 				this.db.exec(`PRAGMA user_version = ${v + 1}`);
 			});
@@ -475,6 +514,32 @@ export class Store {
 		);
 	}
 
+	/**
+	 * Says why an incoming message from `envelope.from` must be refused
+	 * because its id or thread already belongs to a different contact or to a
+	 * message this machine sent. Senders choose their own ids, so without
+	 * this check one contact could make another's message be silently dropped
+	 * as a duplicate, or add messages to another contact's thread. Returns
+	 * undefined when there is no conflict (including when this exact message
+	 * from this sender is already stored).
+	 */
+	incomingConflict(
+		envelope: Pick<Envelope, "id" | "from" | "thread_id">,
+	): string | undefined {
+		const existing = this.getMessage(envelope.id);
+		if (
+			existing !== undefined &&
+			(existing.direction !== "in" || existing.peer !== envelope.from)
+		) {
+			return "message id already in use";
+		}
+		const thread = this.getThread(envelope.thread_id);
+		if (thread !== undefined && thread.peer !== envelope.from) {
+			return "thread id already in use";
+		}
+		return undefined;
+	}
+
 	/** Saves a message this machine is sending, without queueing it. */
 	saveOutgoing(envelope: Envelope, state: MessageState = "queued"): boolean {
 		return this.transaction(() =>
@@ -586,25 +651,45 @@ export class Store {
 		return Number(row.n);
 	}
 
-	/** Adds a sealed message to the outbound queue, due immediately unless told otherwise. */
-	enqueue(
-		messageId: string,
-		sealed: Sealed,
-		nextAttemptAt: number = this.#now(),
-	): void {
+	/** Adds a message to the outbound queue, due immediately unless told otherwise. */
+	enqueue(envelope: Envelope, nextAttemptAt: number = this.#now()): void {
 		this.db
 			.prepare(
 				`INSERT INTO outbox (message_id, recipient, payload, attempts, next_attempt_at)
 				 VALUES (?, ?, ?, 0, ?)`,
 			)
-			.run(messageId, sealed.to, JSON.stringify(sealed), nextAttemptAt);
+			.run(envelope.id, envelope.to, JSON.stringify(envelope), nextAttemptAt);
 	}
 
-	/** Saves an outgoing message and queues its sealed form in one transaction. */
-	queueOutgoing(envelope: Envelope, sealed: Sealed): void {
+	/** Saves an outgoing message and queues it for sending, in one transaction. */
+	queueOutgoing(envelope: Envelope): void {
 		this.transaction(() => {
 			this.saveOutgoing(envelope, "queued");
-			this.enqueue(envelope.id, sealed);
+			this.enqueue(envelope);
+		});
+	}
+
+	/**
+	 * Gives up on queued messages created more than `maxAgeMs` ago: removes
+	 * them from the outbound queue and marks them failed. Returns their ids.
+	 */
+	failExpired(maxAgeMs: number): string[] {
+		const cutoff = iso(this.#now() - maxAgeMs);
+		return this.transaction(() => {
+			const ids = this.db
+				.prepare(
+					`SELECT o.message_id FROM outbox o JOIN messages m ON m.id = o.message_id
+					 WHERE m.created_at < ?`,
+				)
+				.all(cutoff)
+				.map((row) => row.message_id as string);
+			for (const id of ids) {
+				this.db.prepare("DELETE FROM outbox WHERE message_id = ?").run(id);
+				this.db
+					.prepare("UPDATE messages SET state = 'failed' WHERE id = ?")
+					.run(id);
+			}
+			return ids;
 		});
 	}
 

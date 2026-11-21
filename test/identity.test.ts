@@ -1,10 +1,19 @@
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import {
+	chmod,
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { main } from "../src/cli.ts";
 import { dbPath, identityPath, runDir, squawkHome } from "../src/config.ts";
+import { fromBase64Url, isKeyId, keyFromId, keyId } from "../src/encoding.ts";
 import {
 	fingerprint,
 	IdentityExistsError,
@@ -84,6 +93,29 @@ describe("identity", () => {
 		expect((await stat(home)).mode & 0o777).toBe(0o700);
 	});
 
+	it("leaves the permissions of an existing directory alone", async () => {
+		await mkdir(home, { mode: 0o755 });
+		await chmod(home, 0o755);
+		await initIdentity(home, "alice");
+		expect((await stat(home)).mode & 0o777).toBe(0o755);
+		expect((await stat(identityPath(home))).mode & 0o777).toBe(0o600);
+	});
+
+	it("reports a damaged identity file clearly", async () => {
+		await initIdentity(home, "alice");
+		const text = await readFile(identityPath(home), "utf8");
+		for (const broken of [
+			text.slice(0, 20),
+			"null",
+			text.replace(/"secretKey": "[^"]+"/, '"secretKey": "abc"'),
+		]) {
+			await writeFile(identityPath(home), broken);
+			await expect(loadIdentity(home)).rejects.toThrow(
+				/is not in a format squawk understands/,
+			);
+		}
+	});
+
 	it("reports a missing identity", async () => {
 		await expect(loadIdentity(home)).rejects.toBeInstanceOf(NoIdentityError);
 	});
@@ -144,5 +176,18 @@ describe("cli", () => {
 	it("rejects unknown commands and options", async () => {
 		expect(await main(["frobnicate"], capture().io)).toBe(2);
 		expect(await main(["init", "--bogus"], capture().io)).toBe(2);
+	});
+});
+
+describe("key identifiers", () => {
+	it("accepts only the one canonical spelling of each key", () => {
+		const id = keyId(new Uint8Array(32).fill(7));
+		expect(isKeyId(id)).toBe(true);
+		// The last character carries 2 unused bits; other spellings that
+		// decode to the same 32 bytes are refused.
+		const alias = `${id.slice(0, 42)}${id.endsWith("c") ? "d" : "c"}`;
+		expect(fromBase64Url(alias)).toEqual(fromBase64Url(id));
+		expect(isKeyId(alias)).toBe(false);
+		expect(() => keyFromId(alias)).toThrow(/not a squawk key identifier/);
 	});
 });
