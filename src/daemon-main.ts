@@ -5,16 +5,21 @@
  */
 import { squawkHome } from "./config.ts";
 import { Daemon } from "./daemon.ts";
+import { NetworkTransport } from "./network.ts";
 
 /** Runs the service in this process until it stops. */
 export async function runDaemon(home: string = squawkHome()): Promise<void> {
-	const daemon = new Daemon({ home });
+	const transport = new NetworkTransport({
+		port: Number(process.env.SQUAWK_PORT ?? 0),
+		...(process.env.SQUAWK_NO_MDNS === "1" ? { discovery: false } : {}),
+	});
+	const daemon = new Daemon({ home, transport });
 	await daemon.start();
 	const shutdown = () => void daemon.stop();
 	process.once("SIGTERM", shutdown);
 	process.once("SIGINT", shutdown);
 	console.log(
-		`${new Date().toISOString()} squawkd ${process.pid} listening on ${daemon.socketPath}`,
+		`${new Date().toISOString()} squawkd ${process.pid} listening on ${daemon.socketPath} and port ${transport.port}`,
 	);
 	await daemon.whenStopped();
 	process.off("SIGTERM", shutdown);

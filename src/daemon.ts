@@ -48,6 +48,10 @@ export interface Transport {
 	stop?(): Promise<void> | void;
 	/** The outbound queue has a new item (`sealed`, already in the store). */
 	kick(sealed: Sealed): Promise<void> | void;
+	/** Other services seen on the network. */
+	peers?(): Peer[];
+	/** The TCP port other hosts connect to, if there is one. */
+	readonly port?: number;
 }
 
 /** A transport that sends nothing; messages stay in the outbound queue. */
@@ -113,6 +117,8 @@ export interface StatusResult {
 	sessions: Array<{ label: string; last_active: string }>;
 	queued_inbound: number;
 	queued_outbound: number;
+	/** TCP port for other hosts, or null when the service has no network transport. */
+	port: number | null;
 }
 
 export interface DaemonOptions {
@@ -340,7 +346,7 @@ export class Daemon {
 
 	/** Peers seen on the network. Empty until discovery is added. */
 	peers(): Peer[] {
-		return [];
+		return this.transport.peers?.() ?? [];
 	}
 
 	status(): StatusResult {
@@ -358,6 +364,7 @@ export class Daemon {
 			sessions,
 			queued_inbound: this.store.countUndeliveredIncoming(),
 			queued_outbound: this.store.countOutbound(),
+			port: this.transport.port ?? null,
 		};
 	}
 

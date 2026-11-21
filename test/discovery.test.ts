@@ -40,7 +40,10 @@ class FakeNetwork {
 class FakeBackend implements MdnsBackend {
 	onUp?: (s: RawService) => void;
 	onDown?: (s: RawService) => void;
-	constructor(private readonly net: FakeNetwork) {}
+	private readonly net: FakeNetwork;
+	constructor(net: FakeNetwork) {
+		this.net = net;
+	}
 
 	publish(name: string, port: number, txt: Record<string, string>): void {
 		this.net.announce(this, {
