@@ -2,6 +2,7 @@
 import { parseArgs } from "node:util";
 import { contactCommands } from "./cli-contacts.ts";
 import { mcpCommands } from "./cli-mcp.ts";
+import { messageCommands } from "./cli-messages.ts";
 import { squawkHome } from "./config.ts";
 import { DaemonRunningError, type StatusResult } from "./daemon.ts";
 import {
@@ -116,6 +117,7 @@ const commands: Record<string, Command> = {
 		},
 	},
 	...mcpCommands,
+	...messageCommands,
 };
 
 function formatStatus(status: StatusResult): string {
