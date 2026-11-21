@@ -80,20 +80,16 @@ export interface ConfirmResult {
 }
 
 /**
- * Asks the human whether to send a draft. The default sends every draft
- * unchanged; a later version asks through MCP elicitation.
+ * Asks the human whether to send a draft. `createMcpServer` uses
+ * `elicitationConfirm` (an MCP elicitation form in Claude Code) unless told
+ * otherwise; tests pass their own.
  */
 export type ConfirmFn = (draft: Draft) => Promise<ConfirmResult>;
-
-export const alwaysSend: ConfirmFn = async (draft) => ({
-	action: "send",
-	text: draft.text,
-});
 
 export interface McpServerOptions {
 	/** The local service. */
 	daemon: DaemonApi;
-	/** Called before every send or reply; defaults to `alwaysSend`. */
+	/** Called before every send or reply; defaults to `elicitationConfirm`. */
 	confirm?: ConfirmFn;
 	/** Where to report errors that cannot go to the client (default: standard error). */
 	log?: (text: string) => void;
@@ -248,9 +244,55 @@ function formatMessage(notification: MessageNotification): string {
  * Incoming messages are held until the client has finished initializing,
  * then pushed in order.
  */
+/** Builds the text shown above the confirmation form. */
+export function confirmationMessage(draft: Draft): string {
+	const who = draft.to_name ?? draft.to;
+	const lines = [
+		draft.in_reply_to
+			? `Claude wants to send this squawk reply to ${who}:`
+			: `Claude wants to send this squawk message to ${who}:`,
+		"",
+		draft.text,
+		"",
+		"Check it for anything private before sending. You can edit the text below, then Accept to send it, or Decline to not send it.",
+	];
+	return lines.join("\n");
+}
+
+/**
+ * Asks the human with an MCP elicitation form: the recipient and full text,
+ * with the text in an editable field. Accept sends (the possibly edited
+ * text); Decline, Esc, an empty text, or a client that cannot show forms all
+ * mean "do not send". Nothing is ever sent without an answer.
+ */
+export function elicitationConfirm(server: Server): ConfirmFn {
+	return async (draft) => {
+		const cancel: ConfirmResult = { action: "cancel", text: draft.text };
+		if (!server.getClientCapabilities()?.elicitation) return cancel;
+		const result = await server.elicitInput({
+			message: confirmationMessage(draft),
+			requestedSchema: {
+				type: "object",
+				properties: {
+					text: {
+						type: "string",
+						title: "Message",
+						description: "Edit the text if you like",
+						default: draft.text,
+					},
+				},
+				required: ["text"],
+			},
+		});
+		if (result.action !== "accept") return cancel;
+		const text = result.content?.text;
+		if (typeof text !== "string" || text.trim() === "") return cancel;
+		return { action: "send", text };
+	};
+}
+
 export function createMcpServer(options: McpServerOptions): Server {
 	const { daemon } = options;
-	const confirm = options.confirm ?? alwaysSend;
 	const log =
 		options.log ?? ((text) => process.stderr.write(`squawk mcp: ${text}\n`));
 
@@ -258,6 +300,7 @@ export function createMcpServer(options: McpServerOptions): Server {
 		{ name: "squawk", version: VERSION },
 		{ capabilities: SERVER_CAPABILITIES, instructions: SERVER_INSTRUCTIONS },
 	);
+	const confirm = options.confirm ?? elicitationConfirm(server);
 
 	let initialized = false;
 	const waiting: MessageNotification[] = [];
@@ -287,7 +330,18 @@ export function createMcpServer(options: McpServerOptions): Server {
 
 	/** Confirms a draft with the human, then sends it through the service. */
 	async function confirmAndSend(draft: Draft): Promise<CallToolResult> {
-		const decision = await confirm(draft);
+		// The human can let one contact's messages go out without asking
+		// (`squawk auto-send <contact> on`); it is off for everyone by default.
+		const { contacts } = await daemon.call<{ contacts: ContactInfo[] }>(
+			"contacts",
+		);
+		const contact = contacts.find(
+			(c) => c.key_id === draft.to || c.name === draft.to,
+		);
+		if (contact && draft.to_name === undefined) draft.to_name = contact.name;
+		const decision: ConfirmResult = contact?.auto_send
+			? { action: "send", text: draft.text }
+			: await confirm(draft);
 		if (decision.action === "cancel") {
 			return textResult(
 				"Not sent: your user cancelled the message. Do not resend it unless they ask.",

@@ -170,6 +170,39 @@ export const contactCommands: Record<string, ContactsCommand> = {
 			});
 		},
 	},
+	"auto-send": {
+		summary:
+			"let Claude send to a contact without asking you first: `auto-send <contact> on|off` (off by default)",
+		async run(args, io) {
+			const { positionals } = parseArgs({
+				args,
+				options: {},
+				allowPositionals: true,
+				strict: true,
+			});
+			const [contact, setting] = positionals;
+			if (
+				!contact ||
+				(setting !== "on" && setting !== "off") ||
+				positionals.length > 2
+			) {
+				io.stderr("Usage: squawk auto-send <contact> on|off\n");
+				return 2;
+			}
+			return withService(io, async (rpc) => {
+				const { contact: c } = await rpc.call<{ contact: { name: string } }>(
+					"update_contact",
+					{ contact, auto_send: setting === "on" },
+				);
+				io.stdout(
+					setting === "on"
+						? `Claude will now send messages to "${c.name}" without asking you first.\n`
+						: `Claude will ask you before sending each message to "${c.name}".\n`,
+				);
+				return 0;
+			});
+		},
+	},
 	block: {
 		summary: "refuse all connections and messages from a contact",
 		async run(args, io) {

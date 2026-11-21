@@ -130,3 +130,21 @@ describe("squawk pair, contacts, block", () => {
 		}
 	});
 });
+
+describe("squawk auto-send", () => {
+	it("turns auto_send on and off for a contact", async () => {
+		const alice = await startNode("alice");
+		alice.daemon.store.upsertContact({
+			publicKey: "A".repeat(43),
+			name: "bob",
+			trust: "paired",
+		});
+		const on = await run(alice.home, ["auto-send", "bob", "on"]);
+		expect(on.code).toBe(0);
+		expect(on.out).toContain("without asking");
+		expect(alice.daemon.store.getContact("A".repeat(43))?.autoSend).toBe(true);
+		await run(alice.home, ["auto-send", "bob", "off"]);
+		expect(alice.daemon.store.getContact("A".repeat(43))?.autoSend).toBe(false);
+		expect((await run(alice.home, ["auto-send", "bob"])).code).toBe(2);
+	});
+});

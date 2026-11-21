@@ -33,6 +33,7 @@ import {
 } from "./rpc.ts";
 import {
 	type Contact,
+	DEFAULT_INBOUND_POLICY_KEY,
 	type InboundPolicy,
 	Store,
 	type StoredMessage,
@@ -130,6 +131,18 @@ export interface MessageInfo {
 }
 
 /** A contact as returned by the `contacts` method. */
+const InboundPolicySchema = z.enum(["show_first", "auto_answer"]);
+
+const UpdateContactParamsSchema = z.object({
+	/** A contact name or key identifier. */
+	contact: z.string().min(1),
+	auto_send: z.boolean().optional(),
+	/** null clears the contact's own policy so the default applies. */
+	inbound_policy: InboundPolicySchema.nullable().optional(),
+});
+
+const DefaultPolicyParamsSchema = z.object({ policy: InboundPolicySchema });
+
 export interface ContactInfo {
 	name: string;
 	key_id: string;
@@ -435,6 +448,26 @@ export class Daemon {
 			)
 			.handle("peers", () => ({ peers: this.peers() }))
 			.handle("contacts", () => ({ contacts: this.contacts() }))
+			.handle("update_contact", (params) => {
+				const p = parseParams(UpdateContactParamsSchema, params);
+				const contact = this.resolveContact(p.contact);
+				const changes: {
+					autoSend?: boolean;
+					inboundPolicy?: InboundPolicy | null;
+				} = {};
+				if (p.auto_send !== undefined) changes.autoSend = p.auto_send;
+				if (p.inbound_policy !== undefined)
+					changes.inboundPolicy = p.inbound_policy;
+				this.store.updateContact(contact.publicKey, changes);
+				return {
+					contact: this.contacts().find((c) => c.key_id === contact.publicKey),
+				};
+			})
+			.handle("set_default_policy", (params) => {
+				const { policy } = parseParams(DefaultPolicyParamsSchema, params);
+				this.store.setSetting(DEFAULT_INBOUND_POLICY_KEY, policy);
+				return { policy };
+			})
 			.handle("get_message", (params) => {
 				const { id } = parseParams(GetMessageParamsSchema, params);
 				const message = this.store.getMessage(id);

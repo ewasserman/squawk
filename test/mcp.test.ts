@@ -4,6 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -239,7 +240,13 @@ describe("squawk mcp server", () => {
 		expect(result.isError).toBeFalsy();
 		expect(text(result)).toMatch(/^Sent to alice \(queued for delivery\)/);
 		expect(drafts).toEqual([
-			{ to: "alice", text: "hello", kind: "question", session: "s" },
+			{
+				to: "alice",
+				to_name: "alice",
+				text: "hello",
+				kind: "question",
+				session: "s",
+			},
 		]);
 		expect(kicked).toHaveLength(1);
 		expect(open(kicked[0], alice)).toMatchObject({
@@ -398,4 +405,140 @@ describe("squawk mcp (real entry point)", () => {
 			rmSync(stdioHome, { recursive: true, force: true });
 		}
 	}, 20_000);
+});
+
+describe("confirmation through MCP elicitation", () => {
+	type Answer =
+		| { action: "accept"; content: { text: string } }
+		| { action: "decline" }
+		| { action: "cancel" };
+
+	let asked: Array<{ message: string; default: unknown }>;
+
+	/** Connects a fake client that answers every confirmation form with `answer`. */
+	async function connectWithForms(answer: Answer | undefined): Promise<void> {
+		asked = [];
+		link = new DaemonLink({
+			home,
+			label: "test-session",
+			minBackoffMs: 20,
+			maxBackoffMs: 100,
+			log: () => {},
+		});
+		expect(await link.open()).toBe(true);
+		server = createMcpServer({ daemon: link, log: () => {} });
+		const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+		client = new Client(
+			{ name: "fake-claude", version: "0.0.0" },
+			answer ? { capabilities: { elicitation: { form: {} } } } : {},
+		);
+		if (answer) {
+			client.setRequestHandler(ElicitRequestSchema, (request) => {
+				const params = request.params as unknown as {
+					message: string;
+					requestedSchema: { properties: { text: { default?: unknown } } };
+				};
+				asked.push({
+					message: params.message,
+					default: params.requestedSchema.properties.text.default,
+				});
+				return answer;
+			});
+		}
+		await server.connect(serverSide);
+		await client.connect(clientSide);
+	}
+
+	function pairAlice(autoSend = false): void {
+		daemon.store.updateContact(alice.id, { trust: "paired", autoSend });
+	}
+
+	it("shows the recipient and full text, and sends when the human accepts", async () => {
+		pairAlice();
+		await connectWithForms({
+			action: "accept",
+			content: { text: "Is the build green?" },
+		});
+		const result = await client.callTool({
+			name: "send",
+			arguments: { to: "alice", text: "Is the build green?" },
+		});
+		expect(asked).toHaveLength(1);
+		expect(asked[0]?.message).toContain("to alice");
+		expect(asked[0]?.message).toContain("Is the build green?");
+		expect(asked[0]?.default).toBe("Is the build green?");
+		expect(text(result)).toMatch(/^Sent to alice/);
+		expect(kicked).toHaveLength(1);
+		expect(open(kicked[0], alice).body).toBe("Is the build green?");
+	});
+
+	it("sends the text as the human edited it", async () => {
+		pairAlice();
+		await connectWithForms({
+			action: "accept",
+			content: { text: "Edited by me" },
+		});
+		const result = await client.callTool({
+			name: "send",
+			arguments: { to: "alice", text: "Original" },
+		});
+		expect(text(result)).toContain("edited the text");
+		expect(open(kicked[0], alice).body).toBe("Edited by me");
+	});
+
+	it.each([
+		["declines", { action: "decline" } as Answer],
+		["presses Esc", { action: "cancel" } as Answer],
+		[
+			"empties the text",
+			{ action: "accept", content: { text: "  " } } as Answer,
+		],
+	])("sends nothing when the human %s", async (_label, answer) => {
+		pairAlice();
+		await connectWithForms(answer);
+		const result = await client.callTool({
+			name: "send",
+			arguments: { to: "alice", text: "secret stuff" },
+		});
+		expect(text(result)).toMatch(/^Not sent/);
+		expect(kicked).toHaveLength(0);
+		expect(daemon.store.countOutbound()).toBe(0);
+	});
+
+	it("sends nothing when the client cannot show a confirmation form", async () => {
+		pairAlice();
+		await connectWithForms(undefined);
+		const result = await client.callTool({
+			name: "send",
+			arguments: { to: "alice", text: "hello" },
+		});
+		expect(text(result)).toMatch(/^Not sent/);
+		expect(kicked).toHaveLength(0);
+	});
+
+	it("skips the question for a contact with auto_send on", async () => {
+		pairAlice(true);
+		await connectWithForms({ action: "decline" });
+		const result = await client.callTool({
+			name: "send",
+			arguments: { to: "alice", text: "no need to ask" },
+		});
+		expect(asked).toHaveLength(0);
+		expect(text(result)).toMatch(/^Sent to alice/);
+		expect(kicked).toHaveLength(1);
+	});
+
+	it("asks before a reply too", async () => {
+		pairAlice();
+		await connectWithForms({ action: "decline" });
+		const incoming = fromAlice("Can you check the logs?", { kind: "question" });
+		daemon.deliverIncoming(incoming);
+		const result = await client.callTool({
+			name: "reply",
+			arguments: { msg_id: incoming.id, text: "Here are the logs" },
+		});
+		expect(asked[0]?.message).toContain("reply to alice");
+		expect(text(result)).toMatch(/^Not sent/);
+		expect(kicked).toHaveLength(0);
+	});
 });
