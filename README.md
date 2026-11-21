@@ -13,6 +13,9 @@ into the session and asks the human before anything is sent.
 
 Security design: [docs/plan/security.md](docs/plan/security.md).
 
+**Trying squawk with a colleague from a clone of this repository?** Follow
+[docs/setup-guide.md](docs/setup-guide.md).
+
 ## Quickstart
 
 Requires Node 24 or later, pnpm, and Claude Code 2.1.330 or later. Both people
