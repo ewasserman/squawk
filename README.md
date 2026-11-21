@@ -82,7 +82,7 @@ messages, so restarting it does not repeat old ones.
 
 ```bash
 squawk send Bob "text"   # send from the terminal (or pipe text in)
-squawk tail --pretty     # watch incoming messages
+squawk tail --pretty     # show unread messages, then watch for new ones
 squawk contacts          # paired and blocked contacts
 squawk block Bob         # refuse Bob's connections and messages
 squawk status            # service status

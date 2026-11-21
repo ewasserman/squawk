@@ -349,7 +349,7 @@ export const messageCommands: Record<string, Command> = {
 	},
 	tail: {
 		summary:
-			"print incoming messages as JSON lines as they arrive (--unread first prints unread ones; --pretty for people)",
+			"print incoming messages as JSON lines as they arrive (--unread first prints unread ones; --pretty for people, which includes unread ones)",
 		async run(args, io: MessagesIo) {
 			const { values } = parseArgs({
 				args,
@@ -362,7 +362,9 @@ export const messageCommands: Record<string, Command> = {
 			const signals = io.signal === undefined ? processSignal() : undefined;
 			try {
 				return await tail(squawkHome(io.env), {
-					unread: values.unread ?? false,
+					// People reading --pretty want what is already waiting too; the
+					// JSON form (for Monitor) prints only new messages unless asked.
+					unread: values.unread ?? values.pretty ?? false,
 					pretty: values.pretty ?? false,
 					write: io.stdout,
 					stderr: io.stderr,

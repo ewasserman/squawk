@@ -224,6 +224,19 @@ describe("squawk send and tail", () => {
 		expect(bob.daemon.store.inbox()).toHaveLength(2);
 	});
 
+	it("--pretty on its own also shows messages that were already waiting", async () => {
+		const { alice, bob } = await pairedNodes();
+		const id = await cliSend(alice, "bob", "sent before tail started");
+		await waitFor(() => bob.daemon.store.getMessage(id));
+		const controller = new AbortController();
+		const io = capture(bob.home, { signal: controller.signal });
+		const tailing = main(["tail", "--pretty"], io);
+		await waitFor(() => io.out.length > 0);
+		controller.abort();
+		expect(await tailing).toBe(0);
+		expect(io.out.join("")).toContain("\nsent before tail started\n");
+	});
+
 	it("--pretty prints a block for people", async () => {
 		const { alice, bob } = await pairedNodes();
 		const id = await cliSend(alice, "bob", "pretty please");
