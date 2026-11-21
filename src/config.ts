@@ -28,3 +28,18 @@ export function dbPath(home: string): string {
 export function runDir(home: string): string {
 	return join(home, "run");
 }
+
+/** Path of the background service's unix socket. */
+export function socketPath(home: string): string {
+	return join(runDir(home), "squawkd.sock");
+}
+
+/** Path of the file holding the background service's process id. */
+export function pidPath(home: string): string {
+	return join(runDir(home), "squawkd.pid");
+}
+
+/** Path of the background service's log file (its stdout and stderr). */
+export function logPath(home: string): string {
+	return join(runDir(home), "squawkd.log");
+}

@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { squawkHome } from "./config.ts";
+import { DaemonRunningError, type StatusResult } from "./daemon.ts";
+import {
+	DaemonControlError,
+	daemonStatus,
+	runDaemonForeground,
+	startDaemon,
+	stopDaemon,
+} from "./daemon-control.ts";
 import {
 	fingerprint,
 	IdentityExistsError,
@@ -54,7 +62,73 @@ const commands: Record<string, Command> = {
 			return 0;
 		},
 	},
+	daemon: {
+		summary: "control the background service (start | stop | status | run)",
+		async run(args, io) {
+			const { positionals } = parseArgs({
+				args,
+				options: {},
+				allowPositionals: true,
+				strict: true,
+			});
+			const [action, ...extra] = positionals;
+			const home = squawkHome(io.env);
+			if (extra.length > 0) {
+				io.stderr(`squawk daemon: unexpected argument "${extra[0]}"\n`);
+				return 2;
+			}
+			switch (action) {
+				case "start": {
+					await loadIdentity(home);
+					const result = await startDaemon(home, io.env);
+					io.stdout(
+						result.alreadyRunning
+							? `squawkd is already running (pid ${result.pid})\n`
+							: `squawkd started (pid ${result.pid})\n`,
+					);
+					return 0;
+				}
+				case "stop": {
+					const stopped = await stopDaemon(home);
+					io.stdout(stopped ? "squawkd stopped\n" : "squawkd is not running\n");
+					return stopped ? 0 : 1;
+				}
+				case "status": {
+					const status = await daemonStatus(home);
+					if (status === undefined) {
+						io.stdout("squawkd is not running\n");
+						return 1;
+					}
+					io.stdout(formatStatus(status));
+					return 0;
+				}
+				case "run":
+					await loadIdentity(home);
+					await runDaemonForeground(home);
+					return 0;
+				default:
+					io.stderr("Usage: squawk daemon start | stop | status | run\n");
+					return 2;
+			}
+		},
+	},
 };
+
+function formatStatus(status: StatusResult): string {
+	const lines = [
+		`squawkd is running (pid ${status.pid})`,
+		`Name:            ${status.name}`,
+		`Key:             ${status.key_id}`,
+		`Fingerprint:     ${status.fingerprint}`,
+		`Queued inbound:  ${status.queued_inbound}`,
+		`Queued outbound: ${status.queued_outbound}`,
+		`Sessions:        ${status.sessions.length === 0 ? "none" : ""}`,
+		...status.sessions.map(
+			(s) => `  ${s.label} (last active ${s.last_active})`,
+		),
+	];
+	return `${lines.join("\n")}\n`;
+}
 
 function usage(): string {
 	const width = Math.max(...Object.keys(commands).map((name) => name.length));
@@ -90,7 +164,12 @@ export async function main(
 	try {
 		return await command.run(rest, io);
 	} catch (err) {
-		if (err instanceof IdentityExistsError || err instanceof NoIdentityError) {
+		if (
+			err instanceof IdentityExistsError ||
+			err instanceof NoIdentityError ||
+			err instanceof DaemonRunningError ||
+			err instanceof DaemonControlError
+		) {
 			io.stderr(`squawk: ${err.message}\n`);
 			return 1;
 		}

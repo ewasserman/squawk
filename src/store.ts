@@ -84,6 +84,12 @@ export const MIGRATIONS: readonly string[] = [
 		value TEXT NOT NULL
 	);
 	`,
+	// When an incoming message was pushed to a local session by the background
+	// service. NULL means it is still waiting for a session to open.
+	`
+	ALTER TABLE messages ADD COLUMN delivered_at TEXT;
+	CREATE INDEX messages_undelivered ON messages (direction, delivered_at, created_at);
+	`,
 ];
 
 export type Trust = "paired" | "blocked";
@@ -142,6 +148,8 @@ export interface StoredMessage {
 	receivedAt: string | null;
 	sentAt: string | null;
 	readAt: string | null;
+	/** Incoming only: when the background service pushed it to a local session. */
+	deliveredAt: string | null;
 	state: MessageState;
 }
 
@@ -203,6 +211,7 @@ function toMessage(row: Row): StoredMessage {
 		receivedAt: (row.received_at as string | null) ?? null,
 		sentAt: (row.sent_at as string | null) ?? null,
 		readAt: (row.read_at as string | null) ?? null,
+		deliveredAt: (row.delivered_at as string | null) ?? null,
 		state: row.state as MessageState,
 	};
 }
@@ -531,7 +540,51 @@ export class Store {
 		);
 	}
 
+	/**
+	 * Unread incoming messages not yet pushed to a local session, oldest first.
+	 */
+	undeliveredIncoming(): StoredMessage[] {
+		return this.db
+			.prepare(
+				`SELECT * FROM messages
+				 WHERE direction = 'in' AND state = 'unread' AND delivered_at IS NULL
+				 ORDER BY created_at, rowid`,
+			)
+			.all()
+			.map(toMessage);
+	}
+
+	/** How many messages `undeliveredIncoming` would return. */
+	countUndeliveredIncoming(): number {
+		const row = this.db
+			.prepare(
+				`SELECT count(*) AS n FROM messages
+				 WHERE direction = 'in' AND state = 'unread' AND delivered_at IS NULL`,
+			)
+			.get() as Row;
+		return Number(row.n);
+	}
+
+	/** Records that an incoming message was pushed to a local session. Returns false if it already had been. */
+	markDelivered(id: string): boolean {
+		const result = this.db
+			.prepare(
+				`UPDATE messages SET delivered_at = ?
+				 WHERE id = ? AND direction = 'in' AND delivered_at IS NULL`,
+			)
+			.run(this.#nowIso(), id);
+		return result.changes > 0;
+	}
+
 	// Outbound queue
+
+	/** How many messages are in the outbound queue. */
+	countOutbound(): number {
+		const row = this.db
+			.prepare("SELECT count(*) AS n FROM outbox")
+			.get() as Row;
+		return Number(row.n);
+	}
 
 	/** Adds a sealed message to the outbound queue, due immediately unless told otherwise. */
 	enqueue(
