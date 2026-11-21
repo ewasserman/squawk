@@ -1,0 +1,23 @@
+{
+	"name": "squawk",
+	"version": "0.1.0",
+	"description": "Lets Claude Code sessions on different machines send messages to each other over a local network.",
+	"type": "module",
+	"license": "MIT",
+	"engines": {
+		"node": ">=24"
+	},
+	"packageManager": "pnpm@11.12.0",
+	"scripts": {
+		"lint": "biome check .",
+		"format": "biome check --write .",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.6.8",
+		"@types/node": "^24.19.2",
+		"typescript": "^7.0.2",
+		"vitest": "^5.1.1"
+	}
+}

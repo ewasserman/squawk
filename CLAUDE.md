@@ -60,13 +60,16 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+Node 24, pnpm, TypeScript (ESM, run directly by Node with type stripping in development).
 
 ```bash
-# Example:
-# npm install
-# npm test
+pnpm install
+pnpm lint        # Biome (pnpm format to auto-fix)
+pnpm typecheck   # tsc --noEmit
+pnpm test        # Vitest
 ```
+
+All three must pass before committing. CI runs the same three commands.
 
 ## Architecture Overview
 
