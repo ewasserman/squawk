@@ -359,9 +359,15 @@ export class Daemon {
 			created_at: new Date(this.#now()),
 		};
 		if (params.kind !== undefined) input.kind = params.kind;
-		if (params.thread_id !== undefined) input.thread_id = params.thread_id;
 		if (params.in_reply_to !== undefined)
 			input.in_reply_to = params.in_reply_to;
+		// A reply joins the thread of the message it answers, unless told otherwise.
+		const thread =
+			params.thread_id ??
+			(params.in_reply_to !== undefined
+				? this.store.getMessage(params.in_reply_to)?.threadId
+				: undefined);
+		if (thread !== undefined) input.thread_id = thread;
 		if (params.session !== undefined) input.session = params.session;
 		const envelope = createEnvelope(input);
 		this.store.queueOutgoing(envelope);

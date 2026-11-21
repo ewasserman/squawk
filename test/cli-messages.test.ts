@@ -224,6 +224,18 @@ describe("squawk send and tail", () => {
 		expect(bob.daemon.store.inbox()).toHaveLength(2);
 	});
 
+	it("--reply-to joins the thread of the message being answered", async () => {
+		const { alice, bob } = await pairedNodes();
+		const question = await cliSend(alice, "bob", "staging green?");
+		await waitFor(() => bob.daemon.store.getMessage(question));
+		const reply = await cliSend(bob, "alice", "yes", "--reply-to", question);
+		const stored = bob.daemon.store.getMessage(reply);
+		expect(stored?.threadId).toBe(
+			bob.daemon.store.getMessage(question)?.threadId,
+		);
+		expect(stored?.inReplyTo).toBe(question);
+	});
+
 	it("--pretty on its own also shows messages that were already waiting", async () => {
 		const { alice, bob } = await pairedNodes();
 		const id = await cliSend(alice, "bob", "sent before tail started");
