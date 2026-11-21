@@ -204,16 +204,6 @@ export class Pairing {
 				})),
 			);
 		});
-		this.daemon.handle("contacts", () => ({
-			contacts: this.daemon.store.listContacts().map((c) => ({
-				name: c.name,
-				key_id: c.publicKey,
-				fingerprint: fingerprint(keyFromId(c.publicKey)),
-				trust: c.trust,
-				auto_send: c.autoSend,
-				inbound_policy: c.inboundPolicy,
-			})),
-		}));
 		for (const [method, trust] of [
 			["block", "blocked"],
 			["unblock", "paired"],

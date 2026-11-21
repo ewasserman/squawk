@@ -262,6 +262,71 @@ describe("Daemon methods", () => {
 		expect(second.messages).toEqual([]);
 	});
 
+	it("get_message returns a stored message, incoming or outgoing", async () => {
+		const envelope = incoming("a question");
+		daemon.deliverIncoming(envelope);
+		const client = await RpcClient.connect(socketPath(home));
+		clients.push(client);
+		const { message } = await client.call<{
+			message: Record<string, unknown>;
+		}>("get_message", { id: envelope.id });
+		expect(message).toEqual({
+			id: envelope.id,
+			direction: "in",
+			peer: alice.id,
+			peer_name: "alice",
+			session: null,
+			thread_id: envelope.thread_id,
+			in_reply_to: null,
+			kind: "text",
+			body: "a question",
+			created_at: envelope.created_at,
+			state: "unread",
+		});
+
+		const sent = await client.call<{ id: string }>("send", {
+			to: "alice",
+			body: "out",
+		});
+		const out = await client.call<{ message: Record<string, unknown> }>(
+			"get_message",
+			{ id: sent.id },
+		);
+		expect(out.message).toMatchObject({
+			direction: "out",
+			peer: alice.id,
+			body: "out",
+		});
+
+		await expect(
+			client.call("get_message", { id: "nope" }),
+		).rejects.toMatchObject({
+			code: RpcErrorCode.ApplicationError,
+			message: expect.stringContaining('no message with id "nope"'),
+		});
+		await expect(client.call("get_message", {})).rejects.toMatchObject({
+			code: RpcErrorCode.InvalidParams,
+		});
+	});
+
+	it("contacts lists contacts with their fingerprint and policy", async () => {
+		const client = await RpcClient.connect(socketPath(home));
+		clients.push(client);
+		const { contacts } = await client.call<{
+			contacts: Array<Record<string, unknown>>;
+		}>("contacts");
+		expect(contacts).toEqual([
+			{
+				name: "alice",
+				key_id: alice.id,
+				fingerprint: expect.any(String),
+				trust: "paired",
+				auto_send: false,
+				inbound_policy: "auto_answer",
+			},
+		]);
+	});
+
 	it("status and peers report the service state", async () => {
 		const a = await openSession("a");
 		const status = await a.client.call<Record<string, unknown>>("status");

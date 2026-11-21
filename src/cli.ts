@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { contactCommands } from "./cli-contacts.ts";
+import { mcpCommands } from "./cli-mcp.ts";
 import { squawkHome } from "./config.ts";
 import { DaemonRunningError, type StatusResult } from "./daemon.ts";
 import {
@@ -27,7 +28,7 @@ export interface CliIo {
 }
 
 /** A subcommand. Receives the arguments after its name; returns an exit code. */
-interface Command {
+export interface Command {
 	summary: string;
 	run: (args: string[], io: CliIo) => Promise<number>;
 }
@@ -114,6 +115,7 @@ const commands: Record<string, Command> = {
 			}
 		},
 	},
+	...mcpCommands,
 };
 
 function formatStatus(status: StatusResult): string {

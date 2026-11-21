@@ -13,10 +13,11 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { dbPath, pidPath, runDir, socketPath } from "./config.ts";
-import { isKeyId } from "./encoding.ts";
+import { isKeyId, keyFromId } from "./encoding.ts";
 import {
 	createEnvelope,
 	type Envelope,
+	type MessageKind,
 	MessageKindSchema,
 	type Sealed,
 	seal,
@@ -110,6 +111,35 @@ export interface SendResult {
 	state: "queued";
 }
 
+/** A stored message as returned by the `get_message` method. */
+export interface MessageInfo {
+	id: string;
+	/** "in" for a message received, "out" for one this machine sent. */
+	direction: "in" | "out";
+	/** The other party's key identifier: the sender for "in", the recipient for "out". */
+	peer: string;
+	/** The other party's contact name, or null if they are not a contact. */
+	peer_name: string | null;
+	session: string | null;
+	thread_id: string;
+	in_reply_to: string | null;
+	kind: MessageKind;
+	body: string;
+	created_at: string;
+	state: string;
+}
+
+/** A contact as returned by the `contacts` method. */
+export interface ContactInfo {
+	name: string;
+	key_id: string;
+	fingerprint: string;
+	trust: "paired" | "blocked";
+	auto_send: boolean;
+	/** The policy that applies to this contact's messages (their own or the default). */
+	inbound_policy: InboundPolicy;
+}
+
 export interface StatusResult {
 	name: string;
 	key_id: string;
@@ -142,6 +172,7 @@ interface Session {
 }
 
 const RegisterParamsSchema = z.object({ label: z.string().min(1).max(256) });
+const GetMessageParamsSchema = z.object({ id: z.string().min(1).max(128) });
 const InboxParamsSchema = z
 	.object({ mark_read: z.boolean().optional() })
 	.optional();
@@ -359,6 +390,21 @@ export class Daemon {
 		this.#server.handle(method, handler);
 	}
 
+	/** Every contact, paired or blocked, sorted by name. */
+	contacts(): ContactInfo[] {
+		return this.store
+			.listContacts()
+			.map((c) => ({
+				name: c.name,
+				key_id: c.publicKey,
+				fingerprint: fingerprint(keyFromId(c.publicKey)),
+				trust: c.trust,
+				auto_send: c.autoSend,
+				inbound_policy: this.store.inboundPolicyFor(c.publicKey),
+			}))
+			.sort((a, b) => a.name.localeCompare(b.name));
+	}
+
 	status(): StatusResult {
 		const sessions = [...this.#sessions.values()]
 			.sort((a, b) => b.activeSeq - a.activeSeq)
@@ -388,6 +434,18 @@ export class Daemon {
 				this.send(parseParams(SendParamsSchema, params)),
 			)
 			.handle("peers", () => ({ peers: this.peers() }))
+			.handle("contacts", () => ({ contacts: this.contacts() }))
+			.handle("get_message", (params) => {
+				const { id } = parseParams(GetMessageParamsSchema, params);
+				const message = this.store.getMessage(id);
+				if (message === undefined) {
+					throw new RpcError(
+						RpcErrorCode.ApplicationError,
+						`no message with id "${id}"`,
+					);
+				}
+				return { message: this.#messageInfo(message) };
+			})
 			.handle("inbox", (params) => {
 				const options = parseParams(InboxParamsSchema, params);
 				const messages = this.store.inbox();
@@ -493,6 +551,22 @@ export class Daemon {
 			envelope,
 			from_name: this.store.getContact(envelope.from)?.name ?? null,
 			policy: this.store.inboundPolicyFor(envelope.from),
+		};
+	}
+
+	#messageInfo(message: StoredMessage): MessageInfo {
+		return {
+			id: message.id,
+			direction: message.direction,
+			peer: message.peer,
+			peer_name: this.store.getContact(message.peer)?.name ?? null,
+			session: message.session,
+			thread_id: message.threadId,
+			in_reply_to: message.inReplyTo,
+			kind: message.kind,
+			body: message.body,
+			created_at: message.createdAt,
+			state: message.state,
 		};
 	}
 
