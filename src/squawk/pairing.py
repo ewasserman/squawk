@@ -26,6 +26,16 @@ other side's nonce, so it gets a single one-in-a-million guess at matching
 codes instead of trying keys until the codes happen to match. See
 docs/plan/security.md, threat 5.
 
+People on different networks pair through the relay instead: one runs
+`squawk invite`, which asks the relay for a one-time code, and reads the
+code to the other, who runs `squawk pair --code <code>`. The relay puts the
+two services in a pairing room and passes the same frames between them
+(relay_client.RoomLink), with the joiner as the initiator. Each side's relay
+URL travels in `pair-commit` and `pair-nonce` (the optional "relay" field)
+and is saved with the contact. Through the relay, the relay itself says
+which key is on the other side, so comparing the 6-digit codes over a call
+is what protects the pairing (docs/plan/security.md, threat 13).
+
 Pairing again with someone already saved as a paired contact (for example
 after a pairing that finished on only one side) runs the same steps: while
 `pair --accept` waits, a connection from a paired contact whose first frame
@@ -42,7 +52,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar
 
 from squawk import jsontext
 from squawk.crypto import random_bytes
@@ -57,6 +67,8 @@ from squawk.network import (
     address_setting_key,
     dialable,
 )
+from squawk.relay_client import RelayRefused, RoomLink
+from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcConnection, RpcError, RpcErrorCode
 from squawk.store import Contact, Trust
 
@@ -68,6 +80,29 @@ _CODE_PREFIX = b"squawk pair code v1"
 
 DEFAULT_PAIRING_TIMEOUT_MS = 120_000
 """How long each step may take before pairing gives up, in milliseconds."""
+
+INVITE_TIMEOUT_MS = 10 * 60_000
+"""How long `squawk invite` waits for someone to join: as long as the code is valid."""
+
+
+class PairLink(Protocol):
+    """What pairing needs from a connection: a direct `PeerLink` or a
+    pairing room at the relay (`RoomLink`)."""
+
+    @property
+    def peer_key(self) -> str | None: ...
+
+    @property
+    def remote_address(self) -> str | None: ...
+
+    def send(self, frame: Frame) -> None: ...
+
+    def on_frame(self, fn: Callable[[Frame], None]) -> Callable[[], None]: ...
+
+    def on_close(self, fn: Callable[[], None]) -> Callable[[], None]: ...
+
+    def close(self, code: int = 1000, reason: str = "") -> None: ...
+
 
 _T = TypeVar("_T")
 
@@ -117,11 +152,13 @@ def _future() -> "asyncio.Future[Any]":
 class _Session:
     id: str
     role: Literal["initiator", "responder"]
-    link: PeerLink
+    link: PairLink
     peer_key: str
     peer_name: str
     peer_address: Address | None
     """The other side's listening address, saved with the contact."""
+    peer_relay: str | None
+    """The relay the other side uses, saved with the contact."""
     code: str | None
     local_confirmed: bool
     remote_confirmed: bool
@@ -166,6 +203,17 @@ def _port_field(value: object) -> int | None:
     return None
 
 
+def _relay_url_field(frame: Frame) -> str | None:
+    """The sender's relay URL in a pairing frame, or None if absent or unusable."""
+    value = frame.get("relay")
+    if not isinstance(value, str) or jsontext.js_length(value) > 512:
+        return None
+    try:
+        return check_relay_url(value, allow_plain=True)
+    except RelayUrlError:
+        return None
+
+
 _HOST_PORT = re.compile(r"^\[?([^\]]+?)\]?:(\d+)$")
 
 
@@ -191,6 +239,8 @@ class Pairing:
         self._accept_timer: asyncio.TimerHandle | None = None
         self._dialling = 0
         """How many pairing dials are in their handshake right now."""
+        self._invite: asyncio.Future[PairingOffer] | None = None
+        """Set while `squawk invite` waits for someone to join its code."""
 
     def start(self) -> None:
         """Hooks into the transport and adds the socket methods.
@@ -207,7 +257,7 @@ class Pairing:
             if link.outgoing or self._accepting is None:
                 return
             if link.authorization == "pairing":
-                self._respond(link)
+                self._respond(link, self._accepting)
             elif link.authorization == "paired":
                 # Someone already saved as a paired contact may be pairing
                 # again (an earlier pairing finished only on this side). Answer
@@ -256,6 +306,18 @@ class Pairing:
 
             return handler
 
+        async def invite_create(_params: Any, _connection: RpcConnection) -> dict[str, str]:
+            return await self._wrap(self.invite())
+
+        async def invite_wait(_params: Any, _connection: RpcConnection) -> PairingOffer:
+            return await self._wrap(self.invite_joined())
+
+        async def pair_join(params: Any, _connection: RpcConnection) -> PairingOffer:
+            code = params.get("code") if isinstance(params, dict) else None
+            if not isinstance(code, str) or code.strip() == "":
+                raise RpcError(RpcErrorCode.INVALID_PARAMS, "code is required")
+            return await self._wrap(self.join(code))
+
         def pair_cancel(_params: Any, _connection: RpcConnection) -> dict[str, bool]:
             self._cancel_all("cancelled")
             return {"ok": True}
@@ -266,6 +328,9 @@ class Pairing:
         self._daemon.handle("block", set_trust("blocked"))
         self._daemon.handle("unblock", set_trust("paired"))
         self._daemon.handle("pair_cancel", pair_cancel)
+        self._daemon.handle("invite_create", invite_create)
+        self._daemon.handle("invite_wait", invite_wait)
+        self._daemon.handle("pair_join", pair_join)
 
     def stop(self) -> None:
         """Gives up on every pairing in progress."""
@@ -274,7 +339,6 @@ class Pairing:
     async def initiate(self, peer: str) -> PairingOffer:
         """Starts pairing with a peer: a discovered peer's name or key id, or a
         `host:port` address. Returns when the code is ready to compare."""
-        self_identity = self._daemon.identity
         address: Address | None = None
         expect_key: str | None = None
         found = self._transport.find_peer(peer)
@@ -306,6 +370,91 @@ class Pairing:
             raise PairingError(f"could not connect to {peer}: {reason}") from None
         finally:
             self._dialling -= 1
+        return await self._run_initiator(link, address)
+
+    async def join(self, code: str) -> PairingOffer:
+        """Joins someone's invite through the relay and starts pairing with
+        them. Returns when the code is ready to compare."""
+        relay = self._transport.relay
+        if relay is None:
+            raise PairingError("no relay is set; set one with `squawk relay set <url>`")
+        if not relay.connected:
+            raise PairingError(f"not connected to the relay {relay.url}; try again shortly")
+        try:
+            room = await relay.join_invite(code.strip())
+        except RelayRefused as err:
+            if err.reason == "no-such-invite":
+                raise PairingError(
+                    "that invite code is unknown, expired or already used; "
+                    "ask for a new one (`squawk invite`)"
+                ) from None
+            raise PairingError(f"the relay refused: {err.reason}") from None
+        except Exception as err:
+            raise PairingError(f"could not reach the relay: {err}") from None
+        return await self._run_initiator(room, None)
+
+    async def invite(self) -> dict[str, str]:
+        """Asks the relay for a one-time invite code. Someone joining with it
+        starts pairing; `invite_joined` waits for that."""
+        relay = self._transport.relay
+        if relay is None:
+            raise PairingError("no relay is set; set one with `squawk relay set <url>`")
+        if not relay.connected:
+            raise PairingError(f"not connected to the relay {relay.url}; try again shortly")
+        if self._invite is not None and not self._invite.done():
+            self._invite.set_exception(PairingError("replaced by a new invite"))
+        try:
+            code, expires_at, joined = await relay.create_invite()
+        except RelayRefused as err:
+            raise PairingError(f"the relay refused: {err.reason}") from None
+        except Exception as err:
+            raise PairingError(f"could not reach the relay: {err}") from None
+        waiting: asyncio.Future[PairingOffer] = _future()
+        self._invite = waiting
+
+        def on_joined(future: "asyncio.Future[RoomLink]") -> None:
+            if waiting.done():
+                if not future.cancelled() and future.exception() is None:
+                    future.result().close()
+                return
+            if future.cancelled() or future.exception() is not None:
+                waiting.set_exception(
+                    PairingError("the connection to the relay closed; the invite is gone")
+                )
+                return
+            self._respond(future.result(), waiting)
+
+        joined.add_done_callback(on_joined)
+
+        def expire() -> None:
+            if not waiting.done():
+                waiting.set_exception(PairingError("nobody joined before the invite expired"))
+
+        timer = asyncio.get_running_loop().call_later(INVITE_TIMEOUT_MS / 1000, expire)
+
+        def clear(_f: "asyncio.Future[PairingOffer]") -> None:
+            timer.cancel()
+            if not joined.done():
+                joined.cancel()
+            if self._invite is waiting:
+                self._invite = None
+
+        waiting.add_done_callback(clear)
+        return {"code": code, "expires_at": expires_at}
+
+    async def invite_joined(self) -> PairingOffer:
+        """Waits until someone joins the open invite and the code is ready."""
+        waiting = self._invite
+        if waiting is None:
+            raise PairingError("there is no open invite; create one with `squawk invite`")
+        return await asyncio.shield(waiting)
+
+    def _relay_field(self) -> dict[str, str]:
+        relay = self._transport.relay
+        return {} if relay is None else {"relay": relay.url}
+
+    async def _run_initiator(self, link: PairLink, address: Address | None) -> PairingOffer:
+        self_identity = self._daemon.identity
         session = self._new_session("initiator", link, address)
         nonce = random_bytes(32)
 
@@ -316,6 +465,7 @@ class Pairing:
                         raise PairingError("repeated nonce")
                     their_nonce = _bytes_field(frame, "nonce", 32)
                     session.peer_name = _name_field(frame)
+                    session.peer_relay = _relay_url_field(frame)
                     session.link.send({"t": "pair-reveal", "nonce": to_base64url(nonce)})
                     self._code_is_ready(
                         session, pair_code(self_identity.id, session.peer_key, nonce, their_nonce)
@@ -332,6 +482,7 @@ class Pairing:
                 "commit": to_base64url(pair_commitment(self_identity.id, nonce)),
                 "name": self_identity.name,
                 "port": self._transport.port,
+                **self._relay_field(),
             }
         )
         return await asyncio.shield(session.code_ready)
@@ -386,7 +537,7 @@ class Pairing:
             stop_watching()
             if frame["t"] != "pair-commit" or self._accepting is None:
                 return
-            respond = self._respond(link)
+            respond = self._respond(link, self._accepting)
             if respond is not None:
                 # The responder's listener was added during this frame, so
                 # it has not seen the frame yet.
@@ -394,11 +545,13 @@ class Pairing:
 
         stop_watching = link.on_frame(first_frame)
 
-    def _respond(self, link: PeerLink) -> Callable[[Frame], None] | None:
-        """Answers a pairing request on `link`. Returns the frame listener it
-        added (None if nobody is waiting to pair any more)."""
-        waiting = self._accepting
-        if waiting is None:
+    def _respond(
+        self, link: PairLink, waiting: "asyncio.Future[PairingOffer] | None"
+    ) -> Callable[[Frame], None] | None:
+        """Answers a pairing request on `link`, passing the code to `waiting`.
+        Returns the frame listener it added (None if nobody is waiting to pair
+        any more)."""
+        if waiting is None or waiting.done():
             return None
         self_identity = self._daemon.identity
         session = self._new_session("responder", link, None)
@@ -423,6 +576,7 @@ class Pairing:
                         raise PairingError("repeated commitment")
                     commitment.append(_bytes_field(frame, "commit", 32))
                     session.peer_name = _name_field(frame)
+                    session.peer_relay = _relay_url_field(frame)
                     port = _port_field(frame.get("port"))
                     host = link.remote_address
                     if host and dialable(host) and port is not None:
@@ -432,6 +586,7 @@ class Pairing:
                             "t": "pair-nonce",
                             "nonce": to_base64url(nonce),
                             "name": self_identity.name,
+                            **self._relay_field(),
                         }
                     )
                 elif frame["t"] == "pair-reveal":
@@ -459,7 +614,7 @@ class Pairing:
     def _new_session(
         self,
         role: Literal["initiator", "responder"],
-        link: PeerLink,
+        link: PairLink,
         peer_address: Address | None,
     ) -> _Session:
         peer_key = link.peer_key
@@ -472,6 +627,7 @@ class Pairing:
             peer_key=peer_key,
             peer_name="unnamed",
             peer_address=peer_address,
+            peer_relay=None,
             code=None,
             local_confirmed=False,
             remote_confirmed=False,
@@ -523,7 +679,11 @@ class Pairing:
         if session.finished or not session.local_confirmed or not session.remote_confirmed:
             return
         store = self._daemon.store
-        contact = store.upsert_contact(session.peer_key, session.peer_name, trust="paired")
+        contact = store.upsert_contact(
+            session.peer_key, session.peer_name, trust="paired", relay_url=session.peer_relay
+        )
+        if self._transport.relay is not None:
+            self._transport.relay.refresh_allow_list()
         if session.peer_address is not None:
             store.set_setting(
                 address_setting_key(session.peer_key),
@@ -563,6 +723,9 @@ class Pairing:
             self._accepting = None
             if not accepting.done():
                 accepting.set_exception(PairingError(f"pairing cancelled: {reason}"))
+        invite = self._invite
+        if invite is not None and not invite.done():
+            invite.set_exception(PairingError(f"pairing cancelled: {reason}"))
 
     async def _wrap(self, work: Awaitable[_T]) -> _T:
         """Turns PairingError into an RPC error the CLI can print."""

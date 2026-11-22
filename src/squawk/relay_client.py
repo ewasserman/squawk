@@ -32,13 +32,20 @@ contact.
 Messages whose signature or encryption does not check out, and messages
 from keys that are not paired contacts, are deleted without a receipt: we
 cannot tell who sent them, or do not answer them.
+
+Pairing through the relay (`create_invite`, `join_invite`) runs in a pairing
+room: the relay passes frames between the two sides unchanged. A `RoomLink`
+offers the same calls as a direct connection (`PeerLink`), so pairing.py
+runs the same exchange over either. The relay, not a signed handshake, says
+which key is on the other side, so the 6-digit code comparison is what
+catches a relay that lies (docs/plan/security.md, threat 13).
 """
 
 import asyncio
 import contextlib
 import random
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING, Any
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -98,6 +105,83 @@ class RelayRefused(LinkError):
         return self.reason in PERMANENT_REFUSALS
 
 
+class RoomLink:
+    """The pairing frames exchanged with one other service through a
+    pairing room at the relay. Frames are sent in order; `close` ends the
+    room (`pair-end`)."""
+
+    outgoing = False
+
+    def __init__(self, client: "RelayClient", room: str, peer_key: str) -> None:
+        self.room = room
+        self.peer_key: str | None = peer_key
+        """The other side's key id, as the relay reports it."""
+        self.remote_address: str | None = None
+        self._client = client
+        self._frame_listeners: list[Callable[[dict[str, Any]], None]] = []
+        self._close_listeners: list[Callable[[], None]] = []
+        self._last_send: asyncio.Task[None] | None = None
+        self.closed = False
+
+    def send(self, frame: dict[str, Any]) -> None:
+        if not self.closed:
+            self._send_in_order({"t": "pair", "room": self.room, "frame": frame})
+
+    def _send_in_order(self, wrapped: dict[str, Any]) -> None:
+        previous = self._last_send
+
+        async def go() -> None:
+            if previous is not None:
+                await asyncio.gather(previous, return_exceptions=True)
+            with contextlib.suppress(LinkError):
+                await self._client._send(wrapped)
+
+        self._last_send = self._client._spawn(go())
+
+    def on_frame(self, fn: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+        self._frame_listeners.append(fn)
+
+        def stop() -> None:
+            if fn in self._frame_listeners:
+                self._frame_listeners.remove(fn)
+
+        return stop
+
+    def on_close(self, fn: Callable[[], None]) -> Callable[[], None]:
+        self._close_listeners.append(fn)
+
+        def stop() -> None:
+            if fn in self._close_listeners:
+                self._close_listeners.remove(fn)
+
+        return stop
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        """Ends the room. (`code` and `reason` are accepted for the same calls
+        as `PeerLink.close` and not sent.)"""
+        if not self.closed:
+            self._send_in_order({"t": "pair-end", "room": self.room})
+        self._ended()
+
+    def _deliver(self, frame: object) -> None:
+        if self.closed or not isinstance(frame, dict) or not isinstance(frame.get("t"), str):
+            return
+        for fn in list(self._frame_listeners):
+            try:
+                fn(frame)
+            except Exception as err:
+                _log(f"a pairing frame listener raised {type(err).__name__}: {err}")
+
+    def _ended(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._client._rooms.pop(self.room, None)
+        for fn in list(self._close_listeners):
+            with contextlib.suppress(Exception):
+                fn()
+
+
 class RelayClient:
     """Keeps the service connected to one relay.
 
@@ -138,6 +222,8 @@ class RelayClient:
         self.on_ready: list[Callable[[], None]] = []
         """Called each time the connection is ready (after `ok`, the allow
         list and `fetch` have been sent)."""
+        self._rooms: dict[str, RoomLink] = {}
+        self._invite_waiters: dict[str, asyncio.Future[RoomLink]] = {}
         self.on_live: Callable[[Envelope], None] | None = None
         """Called with each live request or answer (`forward`ed to us) from a
         paired contact, already opened and checked."""
@@ -187,12 +273,53 @@ class RelayClient:
         if answer.get("t") != "forwarded":
             raise LinkError(f"unexpected answer from the relay: {answer.get('t')}")
 
-    async def _request(self, frame: dict[str, Any]) -> dict[str, Any]:
+    async def create_invite(self) -> tuple[str, str, "asyncio.Future[RoomLink]"]:
+        """Asks the relay for a one-time invite code. Returns the code, when it
+        expires (ISO time), and a future that completes with the pairing room
+        once someone joins with the code (or fails if the connection drops)."""
+        req = self._new_req()
+        joined: asyncio.Future[RoomLink] = asyncio.get_running_loop().create_future()
+        joined.add_done_callback(lambda f: f.cancelled() or f.exception())
+        self._invite_waiters[req] = joined
+        joined.add_done_callback(lambda _f: self._invite_waiters.pop(req, None))
+        try:
+            answer = await self._request({"t": "invite-create"}, req)
+        except BaseException:
+            joined.cancel()
+            raise
+        code, expires_at = answer.get("code"), answer.get("expires_at")
+        if answer.get("t") != "invite" or not isinstance(code, str):
+            joined.cancel()
+            raise LinkError("unexpected answer from the relay")
+        return code, str(expires_at), joined
+
+    async def join_invite(self, code: str) -> RoomLink:
+        """Joins someone's invite. Returns the pairing room; raises
+        `RelayRefused` ("no-such-invite") for an unknown, expired or used code."""
+        answer = await self._request({"t": "invite-join", "code": code})
+        room = self._open_room(answer)
+        if room is None:
+            raise LinkError("unexpected answer from the relay")
+        return room
+
+    def _open_room(self, frame: dict[str, Any]) -> RoomLink | None:
+        room_id, peer = frame.get("room"), frame.get("peer")
+        if frame.get("t") != "invite-joined" or not isinstance(room_id, str) or not is_key_id(peer):
+            return None
+        assert isinstance(peer, str)
+        room = RoomLink(self, room_id, peer)
+        self._rooms[room_id] = room
+        return room
+
+    def _new_req(self) -> str:
+        self._next_req += 1
+        return f"r{self._next_req}"
+
+    async def _request(self, frame: dict[str, Any], req: str | None = None) -> dict[str, Any]:
         ws = self._ws
         if ws is None or not self._ready:
             raise LinkError("not connected to the relay")
-        self._next_req += 1
-        req = f"r{self._next_req}"
+        req = req or self._new_req()
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req] = future
         try:
@@ -259,6 +386,11 @@ class RelayClient:
             if not future.done():
                 future.set_exception(LinkError("the connection to the relay closed"))
         self._pending.clear()
+        for waiter in list(self._invite_waiters.values()):
+            if not waiter.done():
+                waiter.set_exception(LinkError("the connection to the relay closed"))
+        for room in list(self._rooms.values()):
+            room._ended()
 
     async def _handshake(self, ws: ClientConnection) -> None:
         daemon = self._require_daemon()
@@ -329,6 +461,21 @@ class RelayClient:
             future = self._pending[req]
             if not future.done():
                 future.set_result(frame)
+            return
+        if t == "invite-joined" and isinstance(req, str) and req in self._invite_waiters:
+            waiter = self._invite_waiters[req]
+            room = self._open_room(frame)
+            if room is not None and not waiter.done():
+                waiter.set_result(room)
+            return
+        if t in ("pair", "pair-end"):
+            room_id = frame.get("room")
+            target = self._rooms.get(room_id) if isinstance(room_id, str) else None
+            if target is not None:
+                if t == "pair":
+                    target._deliver(frame.get("frame"))
+                else:
+                    target._ended()
             return
         if t == "deliver":
             rid = frame.get("rid")
@@ -473,10 +620,11 @@ class RelayClient:
 
     # Helpers.
 
-    def _spawn(self, coro: Any) -> None:
-        task = asyncio.ensure_future(coro)
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
+        task: asyncio.Task[Any] = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
 
     def _require_daemon(self) -> "Daemon":
         if self._daemon is None:

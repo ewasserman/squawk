@@ -37,12 +37,18 @@ def format_code(code: str) -> str:
     return f"{code[:3]} {code[3:]}"
 
 
+PAIR_USAGE = "Usage: squawk pair <peer> | squawk pair --accept | squawk pair --code <code>\n"
+
+
 async def _pair(args: list[str], io: CliIo) -> int:
-    values, positionals = parse_args(args, {"accept": Opt("boolean")}, allow_positionals=True)
+    values, positionals = parse_args(
+        args, {"accept": Opt("boolean"), "code": Opt("string")}, allow_positionals=True
+    )
     accept = values.get("accept") is True
+    code = string_value(values, "code")
     peer = positionals[0] if positionals else None
-    if (accept and peer) or (not accept and not peer):
-        io.stderr("Usage: squawk pair <peer> | squawk pair --accept\n")
+    if sum(1 for chosen in (accept, code is not None, peer is not None) if chosen) != 1:
+        io.stderr(PAIR_USAGE)
         return 2
 
     async def work(rpc: RpcClient) -> int:
@@ -52,37 +58,85 @@ async def _pair(args: list[str], io: CliIo) -> int:
                 "Ask them to run `squawk pair <your name>`.\n"
             )
             offer = await rpc.call("pair_accept")
+        elif code is not None:
+            io.stdout("Joining the invite through the relay...\n")
+            offer = await rpc.call("pair_join", {"code": code})
         else:
             io.stdout(f"Contacting {peer}...\n")
             offer = await rpc.call("pair_start", {"peer": peer})
+        return await _compare_and_confirm(rpc, offer, io, through_relay=code is not None)
+
+    return await _with_service(io, work)
+
+
+async def _invite(args: list[str], io: CliIo) -> int:
+    parse_args(args)
+
+    async def work(rpc: RpcClient) -> int:
+        invite = await rpc.call("invite_create")
         io.stdout(
             "\n".join(
                 [
                     "",
-                    f'Pairing with "{offer["peer_name"]}"',
-                    f"Their key fingerprint: {offer['peer_fingerprint']}",
+                    f"    Invite code: {invite['code']}",
                     "",
-                    f"    Code: {format_code(offer['code'])}",
+                    "Read this code to the person you want to pair with, on a phone or",
+                    "video call. They run:",
                     "",
-                    "Compare this code with the one on the other person's screen,",
-                    "in person or on a call. If they differ, someone may be",
-                    "interfering: answer no.",
+                    f"    squawk pair --code {invite['code']}",
+                    "",
+                    "The code works once, for 10 minutes. Waiting for them to join...",
                     "",
                 ]
             )
         )
-        answer = await io.ask("Do the codes match? [y/N] ")
-        if not re.fullmatch(r"\s*y(es)?\s*", answer, re.IGNORECASE):
-            with contextlib.suppress(RpcError, ConnectionError):
-                await rpc.call("pair_confirm", {"pairing_id": offer["pairing_id"], "match": False})
-            io.stdout("Pairing cancelled. Nothing was saved.\n")
-            return 1
-        io.stdout("Waiting for the other person to confirm...\n")
-        result = await rpc.call("pair_confirm", {"pairing_id": offer["pairing_id"], "match": True})
-        io.stdout(f'Paired with "{result["contact"]["name"]}".\n')
-        return 0
+        offer = await rpc.call("invite_wait")
+        return await _compare_and_confirm(rpc, offer, io, through_relay=True)
 
     return await _with_service(io, work)
+
+
+async def _compare_and_confirm(
+    rpc: RpcClient, offer: dict[str, Any], io: CliIo, *, through_relay: bool
+) -> int:
+    """Shows the code to compare, asks whether it matches, and confirms."""
+    if through_relay:
+        how = [
+            "Compare this code with the one on the other person's screen,",
+            "on a phone or video call, where you can hear or see them. Do not",
+            "send it as a message: the relay passed this pairing along and",
+            "could be interfering. If the codes differ, answer no.",
+        ]
+    else:
+        how = [
+            "Compare this code with the one on the other person's screen,",
+            "in person or on a call. If they differ, someone may be",
+            "interfering: answer no.",
+        ]
+    io.stdout(
+        "\n".join(
+            [
+                "",
+                f'Pairing with "{offer["peer_name"]}"',
+                f"Their key fingerprint: {offer['peer_fingerprint']}",
+                "",
+                f"    Code: {format_code(offer['code'])}",
+                "",
+                *how,
+                "",
+            ]
+        )
+    )
+    answer = await io.ask("Do the codes match? [y/N] ")
+    if not re.fullmatch(r"\s*y(es)?\s*", answer, re.IGNORECASE):
+        with contextlib.suppress(RpcError, ConnectionError):
+            await rpc.call("pair_confirm", {"pairing_id": offer["pairing_id"], "match": False})
+        io.stdout("Pairing cancelled. Nothing was saved.\n")
+        return 1
+    io.stdout("Waiting for the other person to confirm...\n")
+    result = await rpc.call("pair_confirm", {"pairing_id": offer["pairing_id"], "match": True})
+    io.stdout(f'Paired with "{result["contact"]["name"]}".\n')
+    return 0
 
 
 async def _contacts(args: list[str], io: CliIo) -> int:
@@ -233,8 +287,12 @@ async def _unblock(args: list[str], io: CliIo) -> int:
 CONTACT_COMMANDS: dict[str, Command] = {
     "pair": Command(
         "pair with someone: `pair <peer>` (name from `squawk peers`, or host:port), "
-        "or `pair --accept` to wait",
+        "`pair --accept` to wait, or `pair --code <code>` to join an invite through the relay",
         _pair,
+    ),
+    "invite": Command(
+        "create a one-time code for pairing through the relay with someone on another network",
+        _invite,
     ),
     "contacts": Command("list paired and blocked contacts (--json)", _contacts),
     "auto-send": Command(

@@ -56,10 +56,11 @@ async def test_help_lists_every_command(home: str) -> None:
     assert text.startswith("Usage: squawk <command> [options]\n\nCommands:\n")
     for name in COMMANDS:
         assert f"\n  {name} " in text
-    assert list(COMMANDS)[:11] == [
+    assert list(COMMANDS)[:12] == [
         "setup",
         "uninstall",
         "pair",
+        "invite",
         "contacts",
         "auto-send",
         "policy",

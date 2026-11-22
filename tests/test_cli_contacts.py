@@ -143,7 +143,9 @@ async def test_explains_usage_and_a_missing_service(nodes: Nodes) -> None:
     home = nodes.make_home()
     usage = await cli(home, "pair")
     assert usage.code == 2
-    assert usage.err == "Usage: squawk pair <peer> | squawk pair --accept\n"
+    assert usage.err == (
+        "Usage: squawk pair <peer> | squawk pair --accept | squawk pair --code <code>\n"
+    )
     r = await cli(home, "contacts")
     assert r.code == 1
     assert r.err == "squawk service is not running; start it with `squawk daemon start`\n"
