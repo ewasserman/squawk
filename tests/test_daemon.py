@@ -266,6 +266,37 @@ async def test_a_conversation_stays_with_the_session_that_started_it(env: Env) -
     assert await delivered(env.daemon.deliver_incoming(late)) == "b"
 
 
+async def test_a_conversation_returns_to_its_session_after_a_moment_unreachable(
+    env: Env,
+) -> None:
+    a = await env.open_session("a")
+    b = await env.open_session("b")
+    sent = await env.daemon.send({"to": "alice", "body": "question", "from_socket": a.inbox.path})
+
+    def answer(body: str) -> Envelope:
+        return create_envelope(
+            from_=alice.id, to=env.me.id, body=body, thread_id=sent["thread_id"], session="b"
+        )
+
+    # Session a briefly refuses connections: the message goes to b instead.
+    await a.inbox.close(remove=False)
+    assert await delivered(env.daemon.deliver_incoming(answer("while away"))) == "b"
+    # a is back; the conversation is still a's.
+    await a.inbox.reopen()
+    await env.daemon.check_sessions()
+    assert await delivered(env.daemon.deliver_incoming(answer("back again"))) == "a"
+    await poll(lambda: a.bodies() == ["back again"])
+    assert b.bodies() == ["while away"]
+
+    # Once a is forgotten, the session that takes the conversation keeps it.
+    env.daemon.unregister_session(a.session_id)
+    assert await delivered(env.daemon.deliver_incoming(answer("a is gone"))) == "b"
+    follow_up = create_envelope(
+        from_=alice.id, to=env.me.id, body="still b", thread_id=sent["thread_id"]
+    )
+    assert await delivered(env.daemon.deliver_incoming(follow_up)) == "b"
+
+
 async def test_repeated_labels_get_a_number_and_a_session_keeps_its_label(env: Env) -> None:
     first = await env.open_session("squawk@main")
     second = await env.open_session("squawk@main")

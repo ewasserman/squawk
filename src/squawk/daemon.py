@@ -716,7 +716,13 @@ class Daemon:
                     self._forget(target.session_id)
                 continue
             self.store.mark_delivered(message.id)
-            self.store.bind_thread(message.thread_id, target.session_id)
+            # The conversation moves to this session only if it had none, or
+            # its session has been forgotten. A session that is merely
+            # unreachable for a moment keeps it, so later messages go back
+            # to it once it answers again.
+            bound = self.store.thread_session(message.thread_id)
+            if bound is None or bound not in self._sessions:
+                self.store.bind_thread(message.thread_id, target.session_id)
             return target.label
 
     def session_infos(self) -> list[SessionInfo]:
