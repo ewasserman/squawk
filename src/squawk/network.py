@@ -57,6 +57,7 @@ from squawk.daemon import Peer, PeerSession, PeerSessions, Transport
 from squawk.discovery import Advertisement, DiscoveredPeer, Discovery
 from squawk.encoding import from_base64url, is_key_id, key_from_id, to_base64url
 from squawk.envelope import (
+    MESSAGE_KINDS,
     EnvelopeError,
     EnvelopeValidationError,
     ReplayGuard,
@@ -1052,6 +1053,10 @@ class NetworkTransport(Transport):
             envelope = open_sealed(sealed, daemon.identity, guard)
             if envelope["id"] != id:
                 nack("id does not match the message")
+                return
+            if envelope["kind"] not in MESSAGE_KINDS:
+                # Receipts and live requests travel only through a relay.
+                nack("malformed")
                 return
             conflict = daemon.store.incoming_conflict(envelope)
             if conflict is not None:

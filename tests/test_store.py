@@ -14,6 +14,7 @@ from squawk.envelope import (
     EnvelopeError,
     ReplayGuard,
     create_envelope,
+    create_receipt,
     open_sealed,
     seal,
 )
@@ -428,3 +429,29 @@ class TestSubject:
         assert subject_of("\U0001f600" * 60) == "\U0001f600" * 60
         # Cutting at 119 units splits an emoji; the leftover half becomes U+FFFD.
         assert subject_of("\U0001f600" * 61) == "\U0001f600" * 59 + "\ufffd\u2026"
+
+
+def test_receipt_target_is_only_a_message_sent_to_the_receipts_signer(tmp_path: Path) -> None:
+    store = Store.open(str(tmp_path / "squawk.db"))
+    alice, bob, carol = (identity_from_secret_key(n, ed25519_random_secret_key()) for n in "abc")
+    sent = create_envelope(from_=alice.id, to=bob.id, body="hi")
+    store.save_outgoing(sent, "sent")
+    from_bob = create_receipt(from_=bob.id, message=sent, status="ack")
+    target = store.receipt_target(from_bob)
+    assert target is not None and target.id == sent["id"]
+    # Carol cannot acknowledge a message that was sent to Bob.
+    from_carol: Envelope = {**from_bob, "from": carol.id}
+    assert store.receipt_target(from_carol) is None
+    # Nor can a receipt name a message this machine received.
+    incoming = create_envelope(from_=bob.id, to=alice.id, body="hello")
+    store.save_incoming(incoming)
+    about_incoming: Envelope = {**from_bob, "in_reply_to": incoming["id"]}
+    assert store.receipt_target(about_incoming) is None
+
+
+def test_refuses_to_store_a_receipt_as_a_message(tmp_path: Path) -> None:
+    store = Store.open(str(tmp_path / "squawk.db"))
+    alice, bob = (identity_from_secret_key(n, ed25519_random_secret_key()) for n in "ab")
+    sent = create_envelope(from_=alice.id, to=bob.id, body="hi")
+    with pytest.raises(ValueError, match="cannot store"):
+        store.save_incoming(create_receipt(from_=bob.id, message=sent, status="ack"))
