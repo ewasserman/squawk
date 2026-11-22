@@ -18,6 +18,7 @@ every squawk version since 0.1 find each other.
 import asyncio
 import contextlib
 import inspect
+import ipaddress
 import os
 import re
 import shutil
@@ -91,7 +92,9 @@ class MdnsBackend(Protocol):
     ) -> None: ...
 
     def query(self) -> None:
-        """Asks the network again for services (used by `refresh`)."""
+        """Asks the network again for services (used by `refresh`). Answers
+        arrive through `browse`'s `on_up`, with current host names and
+        addresses: a host may have been renamed since it was first seen."""
         ...
 
     async def destroy(self) -> None:
@@ -272,6 +275,35 @@ def parse_dns_sd_txt(line: str) -> dict[str, str]:
 
 _BROWSE_LINE = re.compile(r"^\S+\s+(Add|Rmv)\s+\d+\s+\d+\s+\S+\s+(\S+)\s+(.+)$")
 _REACHED_AT = re.compile(r"can be reached at (\S+?)\.?:(\d+)")
+_ADDRESS_LINE = re.compile(r"^\S+\s+Add\s+\S+\s+\d+\s+\S+\s+(\S+)\s+\d+\s*$")
+
+_ADDRESS_LOOKUP_SECONDS = 1.5
+"""How long `dns-sd -G` is given to report a host's addresses. Answers already
+known to mDNSResponder arrive at once; others take a round trip."""
+
+_RESCAN_SECONDS = 2.0
+"""How long `query` browses afresh for instances the long-running browse missed."""
+
+
+def parse_dns_sd_address(line: str) -> str | None:
+    """The IP address in one "Add" line printed by `dns-sd -G v4v6 <host>`,
+    in its short form, or None. Loopback addresses are left out, and so is
+    the "%interface" zone of an address that does not need one (dns-sd
+    prints "%<0>" after global IPv6 addresses); a link-local address keeps
+    its zone, which marks it as not dialable."""
+    m = _ADDRESS_LINE.match(line.strip())
+    if m is None:
+        return None
+    text, _, zone = m.group(1).partition("%")
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if address.is_loopback:
+        return None
+    if address.is_link_local:
+        return f"{address.compressed}%{zone}" if zone else address.compressed
+    return address.compressed
 
 
 class DnsSdBackend:
@@ -283,6 +315,8 @@ class DnsSdBackend:
         self._seen_on: dict[str, int] = {}
         """Instance name -> number of interfaces it is currently seen on."""
         self._resolved: dict[str, RawService] = {}
+        self._on_up: Callable[[RawService], None] | None = None
+        self._rescanning = False
 
     async def _run(self, args: list[str]) -> asyncio.subprocess.Process:
         child = await asyncio.create_subprocess_exec(
@@ -326,6 +360,7 @@ class DnsSdBackend:
         on_up: Callable[[RawService], None],
         on_down: Callable[[RawService], None],
     ) -> None:
+        self._on_up = on_up
         child = await self._run(["-B", f"_{SERVICE_TYPE}._tcp", "local"])
         marker = f"_{SERVICE_TYPE}._tcp."
 
@@ -355,11 +390,16 @@ class DnsSdBackend:
 
         self._spawn(read())
 
-    async def _resolve(self, name: str, on_up: Callable[[RawService], None]) -> None:
-        """Looks up one instance's host, port and TXT record, then stops the lookup."""
+    async def _resolve(
+        self, name: str, on_up: Callable[[RawService], None], *, found_by_rescan: bool = False
+    ) -> None:
+        """Looks up one instance's host, port and TXT record, then the host's
+        IP addresses, and reports the result with `on_up`. An instance the
+        long-running browse no longer sees is not reported, unless a rescan
+        has just found it."""
         child = await self._run(["-L", name, f"_{SERVICE_TYPE}._tcp", "local"])
 
-        async def read() -> None:
+        async def read() -> tuple[str, int, dict[str, str]] | None:
             assert child.stdout is not None
             pending: tuple[str, int] | None = None
             async for raw in child.stdout:
@@ -369,28 +409,84 @@ class DnsSdBackend:
                     pending = (reach.group(1), int(reach.group(2)))
                     continue
                 if pending is not None and line.startswith(" "):
-                    service = RawService(
-                        name=name,
-                        host=pending[0],
-                        port=pending[1],
-                        addresses=[],
-                        txt=parse_dns_sd_txt(line),
-                    )
-                    if name in self._seen_on:
-                        self._resolved[name] = service
-                        on_up(service)
-                    return
+                    return pending[0], pending[1], parse_dns_sd_txt(line)
+            return None
 
+        found: tuple[str, int, dict[str, str]] | None = None
         try:
-            await asyncio.wait_for(read(), 5)
+            found = await asyncio.wait_for(read(), 5)
         except TimeoutError:
             pass
         finally:
             await self._finish(child)
+        if found is None:
+            return
+        host, port, txt = found
+        addresses = await self._addresses(host)
+        if name not in self._seen_on and not found_by_rescan:
+            return
+        service = RawService(name=name, host=host, port=port, addresses=addresses, txt=txt)
+        self._resolved[name] = service
+        on_up(service)
+
+    async def _addresses(self, host: str) -> list[str]:
+        """The IP addresses mDNS currently gives for `host`, IPv4 first."""
+        child = await self._run(["-G", "v4v6", host])
+        found: list[str] = []
+
+        async def read() -> None:
+            assert child.stdout is not None
+            async for raw in child.stdout:
+                address = parse_dns_sd_address(raw.decode("utf-8", "replace"))
+                if address is not None and address not in found:
+                    found.append(address)
+
+        try:
+            await asyncio.wait_for(read(), _ADDRESS_LOOKUP_SECONDS)
+        except TimeoutError:
+            pass
+        finally:
+            await self._finish(child)
+        return sorted(found, key=lambda a: ":" in a)
 
     def query(self) -> None:
-        # mDNSResponder keeps asking the network by itself.
-        pass
+        """Looks up every instance again, since a host name or address may
+        have changed without the instance itself coming or going, and
+        browses afresh for a short while to catch any instance the
+        long-running browse has missed."""
+        on_up = self._on_up
+        if on_up is None:
+            return
+        for name in list(self._seen_on):
+            self._spawn(self._resolve(name, on_up))
+        if not self._rescanning:
+            self._spawn(self._rescan(on_up))
+
+    async def _rescan(self, on_up: Callable[[RawService], None]) -> None:
+        self._rescanning = True
+        child = await self._run(["-B", f"_{SERVICE_TYPE}._tcp", "local"])
+        marker = f"_{SERVICE_TYPE}._tcp."
+        names: list[str] = []
+
+        async def read() -> None:
+            assert child.stdout is not None
+            async for raw in child.stdout:
+                m = _BROWSE_LINE.match(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                if m is not None and m.group(1) == "Add" and m.group(2) == marker:
+                    name = m.group(3).strip()
+                    if name not in names:
+                        names.append(name)
+
+        try:
+            await asyncio.wait_for(read(), _RESCAN_SECONDS)
+        except TimeoutError:
+            pass
+        finally:
+            await self._finish(child)
+            self._rescanning = False
+        for name in names:
+            if name not in self._seen_on:
+                self._spawn(self._resolve(name, on_up, found_by_rescan=True))
 
     async def destroy(self) -> None:
         for task in list(self._tasks):
@@ -545,6 +641,27 @@ class Discovery:
     def refresh(self) -> None:
         """Asks the network again; answers arrive as `up` events."""
         self.backend.query()
+
+    async def lookup(self, key_id: str, timeout: float = 4.0) -> DiscoveredPeer | None:
+        """Asks the network again and waits up to `timeout` seconds for an
+        answer from an instance advertising `key_id`. Returns that answer,
+        or what is already known about the key if none comes. Like
+        everything from mDNS, the answer is only a hint."""
+        loop = asyncio.get_running_loop()
+        answer: asyncio.Future[DiscoveredPeer] = loop.create_future()
+
+        def on_up(peer: DiscoveredPeer) -> None:
+            if peer.key_id == key_id and not answer.done():
+                answer.set_result(peer)
+
+        stop = self.on("up", on_up)
+        try:
+            self.refresh()
+            with contextlib.suppress(TimeoutError):
+                return await asyncio.wait_for(answer, timeout)
+            return self.peer(key_id)
+        finally:
+            stop()
 
     def peers(self) -> list[DiscoveredPeer]:
         """Peers currently seen, excluding ourselves, most recently seen first."""
