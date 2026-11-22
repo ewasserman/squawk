@@ -382,6 +382,19 @@ def _check_claude(io: CliIo) -> None:
         io.stdout(f"Claude Code {_format_version(version)} supports squawk.\n")
 
 
+def _check_dialog(io: CliIo) -> None:
+    """Warns when this machine has no program for the confirmation dialog:
+    without one, `squawk send` sends nothing unless auto-send is on."""
+    if io.dialog is not None:
+        return
+    io.stderr(
+        "Warning: squawk found neither zenity nor kdialog, so it cannot show the "
+        "dialog that asks you before a message goes out, and `squawk send` will "
+        "send nothing. Install one (for example `sudo apt install zenity`, "
+        "`sudo dnf install zenity` or `sudo pacman -S zenity`; on KDE, kdialog).\n"
+    )
+
+
 def _remove_old_mcp_registration(io: CliIo) -> None:
     """Removes the MCP server an earlier version of squawk registered, if any."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -436,6 +449,7 @@ async def _setup(args: list[str], io: CliIo) -> int:
         if started.already_running
         else f"Started the squawk service (pid {started.pid}).\n"
     )
+    _check_dialog(io)
 
     if values.get("no-claude"):
         io.stdout("Skipped the Claude Code hooks and skill (--no-claude).\n")

@@ -36,6 +36,7 @@ from collections.abc import Callable, Iterable
 from typing import Literal
 
 from squawk import jsontext
+from squawk.config import find_system_program
 from squawk.envelope import Envelope
 from squawk.store import InboundPolicy, SessionRecord
 
@@ -236,16 +237,11 @@ def notification_text(from_name: str | None, envelope: Envelope) -> tuple[str, s
     return f"squawk: message from {sender}", body
 
 
-def macos_notify(title: str, text: str, osascript: str = "/usr/bin/osascript") -> None:
-    """Shows a macOS notification without waiting for it. The title and text
-    are passed as arguments, never put inside the script. Does nothing on
-    other systems or when osascript is missing."""
-    if sys.platform != "darwin" or shutil.which(osascript) is None:
-        return
-
+def _run_detached(args: list[str]) -> None:
+    """Starts a program without waiting for it; does nothing if it cannot start."""
     try:
         child = subprocess.Popen(
-            [osascript, "-e", _NOTIFY_SCRIPT, title, text],
+            args,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -255,3 +251,32 @@ def macos_notify(title: str, text: str, osascript: str = "/usr/bin/osascript") -
         return
     # Collect its exit status in the background so it does not linger.
     threading.Thread(target=child.wait, daemon=True).start()
+
+
+def macos_notify(title: str, text: str, osascript: str = "/usr/bin/osascript") -> None:
+    """Shows a macOS notification without waiting for it. The title and text
+    are passed as arguments, never put inside the script. Does nothing on
+    other systems or when osascript is missing."""
+    if sys.platform != "darwin" or shutil.which(osascript) is None:
+        return
+    _run_detached([osascript, "-e", _NOTIFY_SCRIPT, title, text])
+
+
+def linux_notify(title: str, text: str, notify_send: str | None = None) -> None:
+    """Shows a notification with `notify-send` (found in the system's own
+    folders unless given) without waiting for it. The title and text come
+    after `--`, so text starting with "-" is not read as an option. Does
+    nothing when notify-send is missing."""
+    program = notify_send if notify_send is not None else find_system_program("notify-send")
+    if program is None:
+        return
+    _run_detached([program, "--app-name=squawk", "--", title, text])
+
+
+def desktop_notify(title: str, text: str) -> None:
+    """Shows a desktop notification: through osascript on macOS, through
+    notify-send everywhere else."""
+    if sys.platform == "darwin":
+        macos_notify(title, text)
+    else:
+        linux_notify(title, text)

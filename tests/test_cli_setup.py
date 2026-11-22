@@ -21,7 +21,11 @@ from squawk.cli_setup import (
     with_squawk_hooks,
     without_squawk_hooks,
 )
+from squawk.confirm import DialogProgram
 from squawk.daemon_control import daemon_status, stop_daemon
+
+DIALOG = DialogProgram("zenity", "/usr/bin/zenity")
+"""The dialog program the tests' machine has, whatever this machine has."""
 
 
 @dataclass
@@ -80,10 +84,10 @@ class Machine:
         with open(self.settings_path, "w") as f:
             json.dump(data, f)
 
-    async def cli(self, *args: str) -> Result:
+    async def cli(self, *args: str, dialog: DialogProgram | None = DIALOG) -> Result:
         out: list[str] = []
         err: list[str] = []
-        io = CliIo(stdout=out.append, stderr=err.append, env=self.env)
+        io = CliIo(stdout=out.append, stderr=err.append, env=self.env, dialog=dialog)
         code = await run(list(args), io)
         return Result(code, "".join(out), "".join(err))
 
@@ -246,6 +250,15 @@ async def test_setup_refuses_to_touch_settings_that_are_not_valid_json(
     with open(machine.settings_path) as f:
         assert f.read() == "{ not json"
     assert not os.path.exists(machine.settings_path + ".squawk-backup")
+
+
+async def test_setup_warns_when_there_is_no_program_for_the_dialog(machine: Machine) -> None:
+    result = await machine.cli("setup", "--name", "A", "--no-claude", dialog=None)
+    assert result.code == 0
+    assert "Warning: squawk found neither zenity nor kdialog" in result.err
+    assert "`squawk send` will send nothing" in result.err
+    fine = await machine.cli("setup", "--no-claude")
+    assert "zenity" not in fine.err
 
 
 async def test_setup_without_claude_leaves_claude_code_alone(machine: Machine) -> None:

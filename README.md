@@ -19,11 +19,12 @@ Step-by-step guide for trying it with a colleague:
 
 ## Quickstart
 
-Requires macOS, [uv](https://docs.astral.sh/uv/) and Claude Code 2.1.224 or
-later. Both people do this on their own Mac; the Macs must be on the same
-network.
+Requires macOS or Linux, [uv](https://docs.astral.sh/uv/) and Claude Code
+2.1.224 or later. On Linux you also need zenity or kdialog for the
+confirmation dialog (see [Linux](#linux)). Both people do this on their own
+machine; the machines must be on the same network.
 
-1. Install and set up (once per Mac):
+1. Install and set up (once per machine):
 
    ```bash
    uv tool install git+https://github.com/ewasserman/squawk
@@ -62,7 +63,7 @@ example `api-server@main`. A message goes to:
    api-server@main ...`; `squawk sessions Bob` lists Bob's sessions);
 3. otherwise the session you chose for such messages
    (`squawk sessions --catch-all <label>`);
-4. otherwise no session: it waits in `squawk inbox` and your Mac shows a
+4. otherwise no session: it waits in `squawk inbox` and your computer shows a
    notification.
 
 Paired contacts can list your sessions' labels and branches;
@@ -86,7 +87,7 @@ person's assistant, never as instructions from you.
 ## Other commands
 
 ```bash
-squawk sessions          # this Mac's Claude Code sessions
+squawk sessions          # this machine's Claude Code sessions
 squawk inbox             # unread messages
 squawk tail --pretty     # unread messages, then new ones as they arrive
 squawk send Bob "text"   # send from the terminal (or pipe text in)
@@ -104,6 +105,36 @@ macOS may ask whether your terminal (or Python) may "find and connect to
 devices on your local network". Allow it, or squawk cannot reach other
 machines. To check later: System Settings → Privacy & Security → Local
 Network.
+
+## Linux
+
+Squawk works the same way on Linux, with these differences:
+
+- **Confirmation dialog.** It is shown by zenity or by kdialog (kdialog first
+  on KDE). Squawk looks for them in `/usr/bin`, `/bin`, `/usr/local/bin` and
+  `/run/current-system/sw/bin`, never on PATH, so another program cannot
+  stand in for the dialog. If `squawk setup` warns that it found neither,
+  install one, for example `sudo apt install zenity`. kdialog's Send button
+  is labelled OK.
+- **Notifications** for messages no session takes use `notify-send`
+  (`libnotify-bin` on Debian and Ubuntu, `libnotify` elsewhere). Without
+  it there is no notification; check `squawk inbox`.
+- **Firewall.** If a firewall blocks incoming connections (ufw, firewalld),
+  allow squawk's TCP port from your local network, or other people cannot
+  connect to you to pair or deliver messages. `squawk status` shows the
+  port; the service uses the same one again after a restart unless it is
+  taken. For example, with ufw (whose default rules already let mDNS
+  discovery through):
+
+  ```bash
+  sudo ufw allow from 192.168.1.0/24 to any port <port> proto tcp
+  ```
+
+  With firewalld: `sudo firewall-cmd --permanent --add-service=mdns
+  --add-port=<port>/tcp && sudo firewall-cmd --reload`.
+- **uv**: some distributions package it (`sudo pacman -S uv` on Arch);
+  otherwise use the installer in the [setup guide](docs/setup-guide.md).
+  uv uses an installed Python 3.12 or later, or downloads one.
 
 ## Development
 

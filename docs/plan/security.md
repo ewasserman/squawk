@@ -78,13 +78,17 @@ message asked for it.
 **Mitigations.**
 
 - Every `squawk send` and `squawk reply` shows the human the recipient and
-  the full message text in a macOS dialog, where they can edit it, then Send
-  or Cancel. The dialog is shown by squawk itself, so it appears whatever
-  permission mode Claude runs in. Nothing goes out without that step unless
-  the human has turned on `auto_send` for that contact, or as their default;
-  it is off by default. There is deliberately no environment variable or
-  option that skips the dialog, since an incoming message could ask Claude
-  to use it. If the dialog cannot be shown, nothing is sent.
+  the full message text in a dialog (osascript on macOS, zenity or kdialog
+  on Linux), where they can edit it, then Send or Cancel. The dialog is shown
+  by squawk itself, so it appears whatever permission mode Claude runs in.
+  Nothing goes out without that step unless the human has turned on
+  `auto_send` for that contact, or as their default; it is off by default.
+  There is deliberately no environment variable or option that skips the
+  dialog, since an incoming message could ask Claude to use it. The dialog
+  program is run from a fixed system path (`/usr/bin/osascript`, or zenity
+  or kdialog found in the system's own folders, never on PATH), so changing
+  PATH cannot put a program that answers Send in its place. If the dialog
+  cannot be shown, nothing is sent.
 - Messages are encrypted end to end, so nobody else on the network can read
   what was sent. *Tasks 4, 9.*
 

@@ -15,7 +15,7 @@ import sys
 
 from squawk.config import squawk_home
 from squawk.daemon import Daemon
-from squawk.inbox import macos_notify
+from squawk.inbox import desktop_notify
 from squawk.network import NetworkTransport
 from squawk.pairing import Pairing
 from squawk.timefmt import iso_from_ms, now_ms
@@ -55,7 +55,7 @@ async def run_daemon(home: str | None = None) -> None:
         preferred_port=read_last_port(home),
         discovery=False if os.environ.get("SQUAWK_NO_MDNS") == "1" else None,
     )
-    notify = None if os.environ.get("SQUAWK_NO_NOTIFY") == "1" else macos_notify
+    notify = None if os.environ.get("SQUAWK_NO_NOTIFY") == "1" else desktop_notify
     daemon = Daemon(home, transport=transport, notify=notify)
     await daemon.start()
     pairing = Pairing(daemon, transport)

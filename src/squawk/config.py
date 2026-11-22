@@ -1,8 +1,19 @@
-"""Where squawk keeps its files."""
+"""Where squawk keeps its files, and where it finds the system programs it runs."""
 
 import os
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
+
+SYSTEM_PROGRAM_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/run/current-system/sw/bin")
+"""Where squawk looks for kdialog, zenity and notify-send on Linux. These are
+the system's own folders, not PATH, so a program put earlier on PATH cannot
+stand in for one (the last folder is where NixOS keeps system programs)."""
+
+
+def find_system_program(name: str, dirs: tuple[str, ...] = SYSTEM_PROGRAM_DIRS) -> str | None:
+    """The full path of the program `name` in `dirs`, or None if it is not there."""
+    return shutil.which(name, path=os.pathsep.join(dirs))
 
 
 def squawk_home(env: Mapping[str, str] | None = None) -> str:
