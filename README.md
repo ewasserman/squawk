@@ -24,9 +24,16 @@ do steps 1–2 on their own Mac; the machines must be on the same network.
 1. Install and set up:
 
    ```bash
-   pnpm add -g github:ewasserman/squawk
+   git clone https://github.com/ewasserman/squawk.git
+   cd squawk
+   pnpm install && pnpm build
+   pnpm add -g "$PWD"
    squawk setup --name "Your Name"
    ```
+
+   (Installing straight from GitHub with `pnpm add -g github:ewasserman/squawk`
+   does not work: pnpm refuses to run the build step of a package fetched
+   from git. [docs/setup-guide.md](docs/setup-guide.md) has the details.)
 
    `setup` creates your key pair in `~/.config/squawk/`, starts the
    background service, registers `squawk mcp` with Claude Code, and prints the

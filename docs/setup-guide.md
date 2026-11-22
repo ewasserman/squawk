@@ -157,6 +157,7 @@ Restart any Claude sessions so they pick up the new version.
 
 | Problem | What to do |
 | --- | --- |
+| `pnpm add -g github:ewasserman/squawk` fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` | pnpm will not run the build step of a package fetched from git, and allowing it by name does not work. Install from a clone as in step 1. |
 | `squawk peers` shows nobody | Check both Macs are on the same network (not a guest network), the service is running on both (`squawk status`), and the Local Network permission is allowed (step 2). Then `squawk daemon stop && squawk daemon start` on both. |
 | `pair` says the other person "is not waiting to pair" | They need to run `squawk pair --accept` first; it waits for 2 minutes. |
 | `pair` cannot find the name | Use the exact name shown by `squawk peers`, in quotes if it has spaces. You can also give `host:port` from `squawk peers`. |
