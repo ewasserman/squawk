@@ -10,9 +10,9 @@ from collections.abc import AsyncIterator, Callable
 
 import pytest
 
-from squawk.daemon import Daemon
+from squawk.daemon import SHARE_SESSIONS_KEY, Daemon
 from squawk.identity import init_identity
-from squawk.network import Address, NetworkTransport
+from squawk.network import Address, LinkError, NetworkTransport
 from squawk.relay import RelayServer
 from squawk.relay.storage import DB_FILE
 from squawk.relay_client import (
@@ -230,3 +230,43 @@ def test_the_relay_client_comes_from_the_settings() -> None:
     settings[RELAY_ALLOW_PLAIN_KEY] = "on"
     client = relay_client_from_settings(settings.get)
     assert client is not None and client.url == "ws://localhost:8765"
+
+
+async def test_lists_a_contacts_sessions_through_the_relay(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alice = await setup.start(setup.make_home("alice"))
+    bob = await setup.start(setup.make_home("bob"))
+    pair(alice, bob)
+    await wait_for(lambda: setup.allow_list_of(bob.identity.id) == [alice.identity.id])
+    await wait_for(lambda: setup.allow_list_of(alice.identity.id) == [bob.identity.id])
+    monkeypatch.setattr(
+        bob,
+        "sessions_for_peer",
+        lambda: {"shared": True, "sessions": [{"label": "squawk@main", "branch": "main"}]},
+    )
+    result = await transport_of(alice).request_sessions(bob.identity.id)
+    assert result == {"shared": True, "sessions": [{"label": "squawk@main", "branch": "main"}]}
+
+    bob.store.set_setting(SHARE_SESSIONS_KEY, "off")
+    monkeypatch.undo()
+    result = await transport_of(alice).request_sessions(bob.identity.id)
+    assert result == {"shared": False, "sessions": []}
+
+
+async def test_says_when_a_contact_is_offline(setup: Setup) -> None:
+    alice = await setup.start(setup.make_home("alice"))
+    bob = await setup.start(setup.make_home("bob"))
+    pair(alice, bob)
+    await wait_for(lambda: setup.allow_list_of(bob.identity.id) == [alice.identity.id])
+    await setup.stop(bob)
+    with pytest.raises(LinkError, match="bob is offline"):
+        await transport_of(alice).request_sessions(bob.identity.id)
+
+
+async def test_says_when_a_contact_has_not_allowed_us_at_the_relay(setup: Setup) -> None:
+    alice = await setup.start(setup.make_home("alice"))
+    bob = await setup.start(setup.make_home("bob"))
+    alice.store.upsert_contact(bob.identity.id, "bob", trust="paired")
+    with pytest.raises(LinkError, match="does not list you as a contact"):
+        await transport_of(alice).request_sessions(bob.identity.id)

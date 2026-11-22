@@ -58,9 +58,11 @@ from squawk.discovery import Advertisement, DiscoveredPeer, Discovery
 from squawk.encoding import from_base64url, is_key_id, key_from_id, to_base64url
 from squawk.envelope import (
     MESSAGE_KINDS,
+    Envelope,
     EnvelopeError,
     EnvelopeValidationError,
     ReplayGuard,
+    create_envelope,
     open_sealed,
     parse_sealed,
     seal,
@@ -550,6 +552,9 @@ class NetworkTransport(Transport):
         relay: "RelayClient | None" = None,
     ) -> None:
         self.relay = relay
+        self._sessions_waiting: dict[str, tuple[str, asyncio.Future[PeerSessions]]] = {}
+        """Session list requests sent through the relay, by request id: the
+        contact asked and the future for the answer."""
         self._port_option = port
         self._preferred_port = preferred_port
         self._host = host
@@ -635,6 +640,7 @@ class NetworkTransport(Transport):
             await self.discovery.start()
         if self.relay is not None:
             self.relay.on_ready.append(self._relay_came_up)
+            self.relay.on_live = self._on_live
             await self.relay.start(daemon)
         self._timer = asyncio.ensure_future(self._tick())
         self.flush()
@@ -1018,7 +1024,13 @@ class NetworkTransport(Transport):
         contact = store.get_contact(key_id)
         if contact is None or contact.trust != "paired":
             raise LinkError("not a paired contact")
-        link = await self._link_to(key_id)
+        try:
+            link = await self._link_to(key_id)
+        except Exception as err:
+            if self._relay_route_for(contact) is None:
+                raise
+            direct_error = _error_text(err)
+            return await self._request_sessions_by_relay(contact, direct_error)
         request_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         answer: asyncio.Future[PeerSessions] = loop.create_future()
@@ -1048,6 +1060,84 @@ class NetworkTransport(Transport):
         finally:
             stop_frames()
             stop_close()
+
+    def _relay_route_for(self, contact: Contact) -> "RelayClient | None":
+        """The relay client, if messages to `contact` can go through it now."""
+        relay = self.relay
+        if relay is None or not relay.connected:
+            return None
+        if contact.relay_url is not None and contact.relay_url != relay.url:
+            return None
+        return relay
+
+    async def _request_sessions_by_relay(self, contact: Contact, direct_error: str) -> PeerSessions:
+        """Asks for a contact's sessions through the relay, as a sealed live
+        request that the relay passes on only if the contact is connected."""
+        from squawk.relay_client import RelayRefused
+
+        relay = self._relay_route_for(contact)
+        assert relay is not None
+        daemon = self._require_daemon()
+        request = create_envelope(
+            from_=daemon.identity.id, to=contact.public_key, body="", kind="sessions-request"
+        )
+        answer: asyncio.Future[PeerSessions] = asyncio.get_running_loop().create_future()
+        self._sessions_waiting[request["id"]] = (contact.public_key, answer)
+        try:
+            try:
+                await relay.forward(seal(request, daemon.identity))
+            except RelayRefused as err:
+                if err.reason == "offline":
+                    raise LinkError(
+                        f"{contact.name} is offline: their squawk service is not on this "
+                        f"network and not connected to the relay ({direct_error})"
+                    ) from None
+                if err.reason == "not-allowed":
+                    raise LinkError(
+                        f"{contact.name} cannot be reached through the relay: their squawk "
+                        "service has not connected to it since pairing, or does not list "
+                        "you as a contact"
+                    ) from None
+                raise
+            return await asyncio.wait_for(answer, self._sessions_timeout_ms / 1000)
+        except TimeoutError:
+            raise LinkError(f"{contact.name}'s squawk service did not answer in time") from None
+        finally:
+            self._sessions_waiting.pop(request["id"], None)
+
+    def _on_live(self, envelope: Envelope) -> None:
+        """A live request or answer from a paired contact, through the relay."""
+        if envelope["kind"] == "sessions-request":
+            self._spawn(self._answer_sessions_by_relay(envelope))
+        elif envelope["kind"] == "sessions":
+            waiting = self._sessions_waiting.get(envelope.get("in_reply_to") or "")
+            if waiting is None or waiting[0] != envelope["from"] or waiting[1].done():
+                return
+            try:
+                parsed = jsontext.parse(envelope["body"])
+            except ValueError:
+                return
+            if isinstance(parsed, dict):
+                waiting[1].set_result(parse_sessions_answer(parsed))
+
+    async def _answer_sessions_by_relay(self, request: Envelope) -> None:
+        relay = self.relay
+        if relay is None:
+            return
+        daemon = self._require_daemon()
+        result = daemon.sessions_for_peer()
+        answer = create_envelope(
+            from_=daemon.identity.id,
+            to=request["from"],
+            body=jsontext.stringify({"shared": result["shared"], "sessions": result["sessions"]}),
+            kind="sessions",
+            thread_id=request["thread_id"],
+            in_reply_to=request["id"],
+        )
+        try:
+            await relay.forward(seal(answer, daemon.identity))
+        except Exception as err:
+            _log(f"could not answer a session list request: {_error_text(err)}")
 
     def _answer_sessions(self, link: PeerLink, frame: Frame) -> None:
         request_id = frame.get("id")
