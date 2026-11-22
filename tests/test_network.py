@@ -270,6 +270,41 @@ async def test_does_not_hold_up_other_recipients_while_one_is_slow_to_answer(
         silent.close()
 
 
+async def test_a_recipient_with_many_due_messages_does_not_hold_up_the_others(
+    net: Net,
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    carol = await net.node("carol")
+    pair(alice, bob)
+    pair(alice, carol)
+    # Carol's address accepts connections but never answers, and more than
+    # 100 messages for her are due.
+    held: list[asyncio.StreamWriter] = []
+
+    async def silent_handler(_r: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    silent = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+    net.book[carol.id] = Address("127.0.0.1", silent.sockets[0].getsockname()[1])
+    try:
+        for n in range(150):
+            alice.daemon.store.queue_outgoing(
+                create_envelope(from_=alice.id, to=carol.id, body=f"for carol {n}")
+            )
+        alice.transport.kick()
+        await asyncio.sleep(0.1)
+        start = time.monotonic()
+        sent = await alice.daemon.send({"to": "bob", "body": "for bob"})
+        await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+        # Well under the 2 s handshake timeout Carol's dial is stuck in.
+        assert time.monotonic() - start < 1.5
+    finally:
+        for writer in held:
+            writer.close()
+        silent.close()
+
+
 async def test_retries_after_the_receiver_restarts(net: Net) -> None:
     alice = await net.node("alice")
     bob_home = net.make_home("bob")

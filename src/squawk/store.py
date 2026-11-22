@@ -14,7 +14,7 @@ squawk 0.1, so a database created by an earlier version opens unchanged.
 import os
 import re
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -845,6 +845,38 @@ class Store:
                 limit,
             )
         ]
+
+    def due_outbound_by_recipient(
+        self,
+        now: int | None = None,
+        *,
+        exclude: Collection[str] = (),
+        limit_per_recipient: int = 100,
+    ) -> dict[str, list[OutboundItem]]:
+        """Queue items whose next attempt time has come, grouped by
+        recipient, earliest first within each group, at most
+        `limit_per_recipient` per recipient. Recipients in `exclude` are left
+        out, so one recipient with many due items never hides the others."""
+        excluded = list(exclude)
+        placeholders = ", ".join("?" for _ in excluded)
+        not_excluded = f"AND recipient NOT IN ({placeholders})" if excluded else ""
+        rows = self._all(
+            f"""SELECT * FROM (
+                 SELECT *, row_number() OVER (
+                   PARTITION BY recipient ORDER BY next_attempt_at, message_id
+                 ) AS position
+                 FROM outbox WHERE next_attempt_at <= ? {not_excluded}
+               ) WHERE position <= ?
+               ORDER BY next_attempt_at, message_id""",
+            self._now() if now is None else now,
+            *excluded,
+            limit_per_recipient,
+        )
+        grouped: dict[str, list[OutboundItem]] = {}
+        for row in rows:
+            item = _to_outbound(row)
+            grouped.setdefault(item.recipient, []).append(item)
+        return grouped
 
     def get_outbound(self, message_id: str) -> OutboundItem | None:
         row = self._one("SELECT * FROM outbox WHERE message_id = ?", message_id)

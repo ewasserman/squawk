@@ -761,11 +761,10 @@ class NetworkTransport(Transport):
         daemon.store.fail_expired(self._max_queue_age_ms)
         if self._guard is not None:
             self._guard.prune()
-        by_recipient: dict[str, list[OutboundItem]] = {}
-        for item in daemon.store.due_outbound():
-            if item.recipient in self._delivering:
-                continue
-            by_recipient.setdefault(item.recipient, []).append(item)
+        # Recipients whose delivery is in progress are left out of the query
+        # itself, so their due items cannot take up the room of other
+        # recipients' items.
+        by_recipient = daemon.store.due_outbound_by_recipient(exclude=list(self._delivering))
         for recipient, items in by_recipient.items():
             task = asyncio.ensure_future(self._deliver_to(recipient, items))
             self._delivering[recipient] = task

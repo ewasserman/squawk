@@ -186,6 +186,35 @@ def test_queues_a_message_and_returns_it_when_due(store: Store, clock: Clock) ->
     assert store.count_outbound() == 1
 
 
+def test_due_items_by_recipient_are_limited_per_recipient_and_skip_excluded_ones(
+    store: Store, clock: Clock
+) -> None:
+    carol = identity_from_secret_key("carol", ed25519_random_secret_key())
+    for n in range(5):
+        store.queue_outgoing(outgoing(clock, f"to bob {n}"))
+    to_carol = outgoing(clock, "to carol", to=carol.id)
+    store.queue_outgoing(to_carol)
+
+    grouped = store.due_outbound_by_recipient(limit_per_recipient=3)
+    assert sorted(grouped) == sorted([bob.id, carol.id])
+    assert len(grouped[bob.id]) == 3
+    assert [i.message_id for i in grouped[carol.id]] == [to_carol["id"]]
+    assert store.due_outbound_by_recipient(exclude=[bob.id]) == {carol.id: grouped[carol.id]}
+
+
+def test_mark_failed_takes_a_message_out_of_the_queue_with_the_reason(
+    store: Store, clock: Clock
+) -> None:
+    env = outgoing(clock)
+    store.queue_outgoing(env)
+    assert store.mark_failed(env["id"], "refused: bad_signature") is True
+    assert store.get_outbound(env["id"]) is None
+    message = store.get_message(env["id"])
+    assert message is not None
+    assert (message.state, message.error) == ("failed", "refused: bad_signature")
+    assert store.mark_failed(env["id"], "again") is False
+
+
 def test_backs_off_after_a_failed_attempt(store: Store, clock: Clock) -> None:
     env = outgoing(clock)
     store.queue_outgoing(env)
