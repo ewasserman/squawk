@@ -1,0 +1,15 @@
+.git
+.venv
+.beads
+.claude
+.agents
+.codex
+.cursor
+.github
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+tests
+docs
+dist

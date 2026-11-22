@@ -21,7 +21,7 @@ from enum import Enum
 from typing import Literal, TypeVar, cast
 
 from squawk import jsontext
-from squawk.envelope import Envelope, MessageKind, parse_envelope
+from squawk.envelope import MESSAGE_KINDS, Envelope, MessageKind, parse_envelope, parse_receipt
 from squawk.timefmt import iso_from_ms, ms_from_datetime, now_ms, parse_iso_ms
 
 MIGRATIONS: tuple[str, ...] = (
@@ -626,6 +626,9 @@ class Store:
         state: MessageState,
         received_at: str | None,
     ) -> bool:
+        if envelope["kind"] not in MESSAGE_KINDS:
+            # Receipts and live requests are handled where they arrive, never stored.
+            raise ValueError(f"cannot store an envelope of kind {envelope['kind']}")
         peer = envelope["to"] if direction == "out" else envelope["from"]
         created_at = _iso(envelope["created_at"])
         result = self._run(
@@ -689,6 +692,19 @@ class Store:
         if thread is not None and thread.peer != envelope["from"]:
             return "thread id already in use"
         return None
+
+    def receipt_target(self, receipt: Envelope) -> StoredMessage | None:
+        """The message a receipt answers, if it is one this machine sent to the
+        receipt's signer; otherwise None, and the receipt must be ignored.
+
+        So a contact can only acknowledge (or refuse) messages that were sent
+        to it, never messages sent to someone else. Raises `EnvelopeError`
+        ("malformed") if `receipt` is not a receipt.
+        """
+        message = self.get_message(parse_receipt(receipt)["of"])
+        if message is None or message.direction != "out" or message.peer != receipt["from"]:
+            return None
+        return message
 
     def save_outgoing(self, envelope: Envelope, state: MessageState = "queued") -> bool:
         """Saves a message this machine is sending, without queueing it."""

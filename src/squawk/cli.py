@@ -2,9 +2,9 @@
 
 The subcommands live in tables: setup and uninstall (cli_setup.py), the
 contact commands (cli_contacts.py), the identity and service commands
-(here), the message commands (cli_messages.py) and the session commands
-(cli_sessions.py). `main` finds a command by name and `squawk help`
-lists them all in that order. cli_io.py explains how to add one.
+(here), the message commands (cli_messages.py), the session commands
+(cli_sessions.py) and the relay commands (cli_relay.py). `main` finds a
+command by name and `squawk help` lists them all in that order. cli_io.py explains how to add one.
 """
 
 import asyncio
@@ -15,6 +15,7 @@ from squawk.cli_args import Opt, ParseArgsError, parse_args, string_value
 from squawk.cli_contacts import CONTACT_COMMANDS
 from squawk.cli_io import CliIo, Command, quiet_stdout
 from squawk.cli_messages import MESSAGE_COMMANDS, format_service_status
+from squawk.cli_relay import RELAY_COMMANDS
 from squawk.cli_sessions import SESSION_COMMANDS
 from squawk.cli_setup import SETUP_COMMANDS, SetupError
 from squawk.config import squawk_home
@@ -97,6 +98,7 @@ COMMANDS: dict[str, Command] = {
     "daemon": Command("control the background service (start | stop | status | run)", _daemon),
     **MESSAGE_COMMANDS,
     **SESSION_COMMANDS,
+    **RELAY_COMMANDS,
 }
 """Every subcommand, in the order `squawk help` lists them."""
 

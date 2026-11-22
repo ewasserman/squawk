@@ -74,8 +74,8 @@ class CliIo:
     ask: Callable[[str], Awaitable[str]] = _ask_on_stdin
     """Shows a prompt and returns the line the person typed (`pair`)."""
     stop: asyncio.Event | None = None
-    """Setting it stops `tail`, which then exits with code 0. When None,
-    `tail` stops on SIGINT or SIGTERM."""
+    """Setting it stops `tail` or `relay serve`, which then exit with code 0.
+    When None, they stop on SIGINT or SIGTERM."""
     confirm: "ConfirmFn | None" = None
     """Test hook: asks whether to send a message instead of the macOS dialog.
     Only tests set it; there is deliberately no environment variable for this,

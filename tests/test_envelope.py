@@ -14,8 +14,10 @@ from squawk.envelope import (
     ReplayGuard,
     Sealed,
     create_envelope,
+    create_receipt,
     open_sealed,
     parse_envelope,
+    parse_receipt,
     seal,
 )
 from squawk.identity import Identity, identity_from_secret_key
@@ -261,6 +263,94 @@ class TestReplayGuard:
         guard = ReplayGuard(now=lambda: now)
         env = message()
         guard.accept(env)
-        now += 10 * 60_000 + 1
+        # Kept long enough to refuse a replay through a relay (7 days).
+        now += 7 * DAY + 15 * 60_000
+        guard.prune()
+        assert guard.seen.has(f"{alice.id} {env['id']}")
+        now += 1
         guard.prune()
         assert not guard.seen.has(f"{alice.id} {env['id']}")
+
+
+DAY = 24 * 60 * 60_000
+
+
+class TestRelayedMessages:
+    def test_accepts_a_6_day_old_message_that_came_through_a_relay(self) -> None:
+        guard = ReplayGuard(now=clock)
+        old = message(created_at=NOW - 6 * DAY)
+        opened = open_sealed(seal(old, alice), bob, guard, route="relay")
+        assert opened["id"] == old["id"]
+
+    def test_refuses_the_same_6_day_old_message_sent_directly(self) -> None:
+        guard = ReplayGuard(now=clock)
+        old = message(created_at=NOW - 6 * DAY)
+        expect_code(lambda: open_sealed(seal(old, alice), bob, guard), "stale")
+
+    def test_refuses_a_replay_of_a_relayed_message_on_either_route(self) -> None:
+        now = NOW
+        guard = ReplayGuard(now=lambda: now)
+        sealed = seal(message(created_at=NOW - 6 * DAY), alice)
+        guard.record(open_sealed(sealed, bob, guard, route="relay"))
+        # A day later, after pruning, the relay delivers it again.
+        now += DAY - 60_000
+        guard.prune()
+        expect_code(lambda: open_sealed(sealed, bob, guard, route="relay"), "replay")
+
+    def test_refuses_a_relayed_message_older_than_the_relay_keeps_them(self) -> None:
+        guard = ReplayGuard(now=clock)
+        edge = message(created_at=NOW - 7 * DAY - 10 * 60_000)
+        assert open_sealed(seal(edge, alice), bob, guard, route="relay")["id"] == edge["id"]
+        too_old = message(created_at=NOW - 7 * DAY - 10 * 60_000 - 1)
+        with pytest.raises(EnvelopeError, match="longer ago than a relay keeps") as info:
+            open_sealed(seal(too_old, alice), bob, guard, route="relay")
+        assert info.value.code == "stale"
+
+    def test_refuses_a_relayed_message_from_the_future(self) -> None:
+        guard = ReplayGuard(now=clock)
+        future = message(created_at=NOW + 5 * 60_000 + 1)
+        expect_code(lambda: open_sealed(seal(future, alice), bob, guard, route="relay"), "stale")
+
+
+class TestAcceptRoute:
+    def test_accept_uses_the_relay_allowance_when_told(self) -> None:
+        guard = ReplayGuard(now=clock)
+        old = message(created_at=NOW - 6 * DAY)
+        guard.accept(old, route="relay")
+        expect_code(lambda: guard.accept(old, route="relay"), "replay")
+
+
+class TestReceipts:
+    def test_round_trips_an_ack(self) -> None:
+        original = message()
+        receipt = create_receipt(from_=bob.id, message=original, status="ack")
+        opened = open_sealed(seal(receipt, bob), alice, ReplayGuard(), "relay")
+        assert parse_receipt(opened) == {"of": original["id"], "status": "ack", "reason": ""}
+        assert opened["thread_id"] == original["thread_id"]
+        assert opened["to"] == alice.id
+
+    def test_a_nack_carries_the_reason(self) -> None:
+        receipt = create_receipt(
+            from_=bob.id, message=message(), status="nack", reason="bad_signature"
+        )
+        assert parse_receipt(receipt)["reason"] == "bad_signature"
+
+    def test_only_the_recipient_can_make_a_receipt(self) -> None:
+        expect_code(
+            lambda: create_receipt(from_=carol.id, message=message(), status="ack"),
+            "sender_mismatch",
+        )
+
+    def test_a_forged_ack_is_refused(self) -> None:
+        # The relay (or anyone else) makes an ack that claims to come from Bob,
+        # encrypted correctly to Alice, but can only sign with its own key.
+        forged = create_receipt(from_=bob.id, message=message(), status="ack")
+        posing_as_bob = replace(mallory, id=bob.id)
+        expect_code(lambda: open_sealed(seal(forged, posing_as_bob), alice), "bad_signature")
+
+    def test_a_message_that_is_not_a_receipt_is_refused_as_one(self) -> None:
+        expect_code(lambda: parse_receipt(message()), "malformed")
+
+    def test_an_ack_with_a_body_is_malformed(self) -> None:
+        receipt = create_receipt(from_=bob.id, message=message(), status="ack")
+        expect_code(lambda: parse_receipt({**receipt, "body": "hi"}), "malformed")

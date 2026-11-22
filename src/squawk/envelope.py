@@ -16,6 +16,19 @@ Sealing:
 Only the routing fields are readable on the wire; the envelope, including
 its body, is inside the ciphertext.
 
+Messages arrive by one of two routes (`Route`): directly from the sender's
+service on the local network, or through a relay that may hold them for up
+to 7 days. A message sent directly is sealed again with a fresh `sent_at` at
+each attempt, so it must be no more than 5 minutes from the local clock. A
+message held by a relay cannot be sealed again, so through the relay a
+`sent_at` up to 7 days (plus 10 minutes for clock differences) old is
+accepted. Seen ids are
+kept long enough to refuse a replay on either route. See docs/plan/relay.md.
+
+Besides the messages people write (`MessageKind`), an envelope can be a
+receipt (`ReceiptKind`): the recipient's signed answer saying it stored the
+message ("ack") or refused it for good ("nack"), sent back through the relay.
+
 Envelopes and sealed messages are plain dicts with the same field names as
 the JSON that travels (described by the `Envelope` and `Sealed` types). The
 `parse_*` functions check a value received from elsewhere and return a new
@@ -54,11 +67,41 @@ WIRE_VERSION = 1
 MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
 """Messages whose sent_at (or created_at) is further than this from the local clock are rejected."""
 
+RELAY_HOLD_MS = 7 * 24 * 60 * 60 * 1000
+"""How long a relay keeps a message waiting for its recipient: 7 days."""
+
+MAX_RELAYED_AGE_MS = RELAY_HOLD_MS + 2 * MAX_CLOCK_SKEW_MS
+"""A message that arrives through a relay is refused if its sent_at (or
+created_at) is more than this far in the past. It is still refused if it is
+more than MAX_CLOCK_SKEW_MS in the future. The allowance covers two clock
+differences, because the relay's hold starts by the relay's clock while
+sent_at is by the sender's and the age is measured by the recipient's."""
+
+SEEN_ID_RETENTION_MS = MAX_RELAYED_AGE_MS + MAX_CLOCK_SKEW_MS
+"""How long accepted message ids are remembered: longer than any copy of a
+message could still pass the time check on either route."""
+
+Route = Literal["direct", "relay"]
+"""How a message arrived: straight from the sender's service, or through a relay."""
+
 SIGNATURE_PREFIX = "squawk envelope v1\n"
 HKDF_INFO = b"squawk v1 xchacha20poly1305 key"
 
 MessageKind = Literal["text", "question", "answer"]
 MESSAGE_KINDS: tuple[MessageKind, ...] = ("text", "question", "answer")
+"""Kinds of message a person writes. Only these are stored and shown."""
+
+ReceiptKind = Literal["ack", "nack"]
+RECEIPT_KINDS: tuple[ReceiptKind, ...] = ("ack", "nack")
+"""Kinds of receipt: the recipient stored the message, or refused it for good."""
+
+LiveKind = Literal["sessions-request", "sessions"]
+LIVE_KINDS: tuple[LiveKind, ...] = ("sessions-request", "sessions")
+"""Kinds of request and answer passed through a relay only while both sides
+are online. Never stored or shown."""
+
+EnvelopeKind = MessageKind | ReceiptKind | LiveKind
+ENVELOPE_KINDS: tuple[EnvelopeKind, ...] = (*MESSAGE_KINDS, *RECEIPT_KINDS, *LIVE_KINDS)
 
 # The functional form is needed because "from" is a Python keyword.
 Envelope = TypedDict(
@@ -76,8 +119,10 @@ Envelope = TypedDict(
         # it stays within the receiver's freshness window however long it
         # waited. Absent means the same as created_at.
         "sent_at": NotRequired[str],
-        "kind": MessageKind,
-        # Markdown text.
+        # A message (MessageKind), a receipt (ReceiptKind) or a live request
+        # or answer (LiveKind). The last two travel only through a relay.
+        "kind": EnvelopeKind,
+        # Markdown text; for a receipt, empty ("ack") or the reason ("nack").
         "body": str,
     },
 )
@@ -217,8 +262,8 @@ def parse_envelope(value: object) -> Envelope:
     if "sent_at" in obj:
         checked["sent_at"] = _datetime(obj, "sent_at")
     kind = obj.get("kind")
-    if kind not in MESSAGE_KINDS:
-        raise EnvelopeValidationError(f"kind must be one of {', '.join(MESSAGE_KINDS)}")
+    if kind not in ENVELOPE_KINDS:
+        raise EnvelopeValidationError(f"kind must be one of {', '.join(ENVELOPE_KINDS)}")
     checked["kind"] = kind
     checked["body"] = _string(obj, "body")
     return cast(Envelope, checked)
@@ -259,7 +304,7 @@ def create_envelope(
     from_: str,
     to: str,
     body: str,
-    kind: MessageKind = "text",
+    kind: EnvelopeKind = "text",
     session: str | None = None,
     thread_id: str | None = None,
     in_reply_to: str | None = None,
@@ -329,14 +374,18 @@ def seal(envelope: Envelope, sender: Identity) -> Sealed:
 
 
 def open_sealed(
-    sealed: object, recipient: Identity, guard: "ReplayGuard | None" = None
+    sealed: object,
+    recipient: Identity,
+    guard: "ReplayGuard | None" = None,
+    route: Route = "direct",
 ) -> Envelope:
     """Decrypts and checks a sealed message addressed to `recipient`.
 
     Checks, in order: wire shape, outer recipient, decryption, envelope shape,
     signature by the claimed sender, that the signed `from`/`to` match the
     outer sender and the opener, and finally (when a guard is given) the
-    timestamp and that the id is new. It does not record the id: the caller
+    timestamp (with the allowance for `route`) and that the id is new. It
+    does not record the id: the caller
     calls `guard.record(envelope)` once the message is safely stored, so a
     message that failed to store can be accepted when the sender retries.
     Raises `EnvelopeError` on any failure.
@@ -382,7 +431,7 @@ def open_sealed(
         raise EnvelopeError("wrong_recipient", "signed recipient is not the opener")
 
     if guard is not None:
-        guard.check(envelope)
+        guard.check(envelope, route)
     return envelope
 
 
@@ -426,11 +475,15 @@ def _js_number(value: float) -> str:
 class ReplayGuard:
     """Rejects messages whose id was accepted before from the same sender
     (`replay`) or whose sent_at (or created_at, when there is no sent_at) is
-    more than `max_skew_ms` (default 5 minutes) away from the local clock in
-    either direction (`stale`).
+    too far from the local clock (`stale`). For a message that arrived
+    directly, too far means more than `max_skew_ms` (default 5 minutes) in
+    either direction. For one that arrived through a relay, it means more
+    than `max_skew_ms` in the future or more than `max_relayed_age_ms`
+    (default 7 days and 10 minutes) in the past.
 
     Because old messages are refused on time, the seen-id store only needs to
-    keep ids from the last few minutes; `prune` forgets the rest.
+    keep ids for `retention_ms` (default 7 days and 15 minutes, longer than
+    the relay allowance); `prune` forgets the rest.
 
     Ids are recorded per sender, because each sender chooses its own ids: one
     contact reusing an id must not make another contact's message look like a
@@ -445,12 +498,16 @@ class ReplayGuard:
         seen: SeenIdStore | None = None,
         now: Callable[[], int] | None = None,
         max_skew_ms: int = MAX_CLOCK_SKEW_MS,
+        max_relayed_age_ms: int = MAX_RELAYED_AGE_MS,
+        retention_ms: int = SEEN_ID_RETENTION_MS,
     ) -> None:
         self.seen: SeenIdStore = MemorySeenIds() if seen is None else seen
         self._now = now_ms if now is None else now
         self._max_skew_ms = max_skew_ms
+        self._max_relayed_age_ms = max_relayed_age_ms
+        self._retention_ms = max(retention_ms, 2 * max_skew_ms, max_relayed_age_ms + max_skew_ms)
 
-    def check(self, envelope: Mapping[str, Any]) -> None:
+    def check(self, envelope: Mapping[str, Any], route: Route = "direct") -> None:
         """Raises `stale` or `replay` if the envelope must be refused. Does not record it.
 
         Uses the envelope's "id", "from", "created_at" and "sent_at" fields.
@@ -458,7 +515,19 @@ class ReplayGuard:
         sent_at = envelope.get("sent_at")
         time = sent_at if sent_at is not None else envelope["created_at"]
         sent = parse_iso_ms(time) if isinstance(time, str) else None
-        if sent is None or abs(self._now() - sent) > self._max_skew_ms:
+        now = self._now()
+        if sent is None or sent - now > self._max_skew_ms:
+            raise EnvelopeError(
+                "stale",
+                f"sent at {time}, more than {_js_number(self._max_skew_ms / 1000)}s "
+                "from the local clock",
+            )
+        max_age_ms = self._max_relayed_age_ms if route == "relay" else self._max_skew_ms
+        if now - sent > max_age_ms:
+            if route == "relay":
+                raise EnvelopeError(
+                    "stale", f"sent at {time}, longer ago than a relay keeps messages"
+                )
             raise EnvelopeError(
                 "stale",
                 f"sent at {time}, more than {_js_number(self._max_skew_ms / 1000)}s "
@@ -471,16 +540,65 @@ class ReplayGuard:
         """Records the envelope's id as seen. Call after the message is stored."""
         self.seen.add(_seen_key(envelope), self._now())
 
-    def accept(self, envelope: Mapping[str, Any]) -> None:
+    def accept(self, envelope: Mapping[str, Any], route: Route = "direct") -> None:
         """Checks the envelope and, if it passes, records its id as seen."""
-        self.check(envelope)
+        self.check(envelope, route)
         self.record(envelope)
 
     def prune(self) -> None:
-        """Forgets ids recorded more than twice the allowed clock difference ago."""
-        self.seen.prune(self._now() - 2 * self._max_skew_ms)
+        """Forgets ids recorded more than `retention_ms` ago."""
+        self.seen.prune(self._now() - self._retention_ms)
 
 
 def _seen_key(envelope: Mapping[str, Any]) -> str:
     """The seen-id key: the sender's key and the message id."""
     return f"{envelope['from']} {envelope['id']}"
+
+
+# Receipts
+
+
+class Receipt(TypedDict):
+    """What a receipt says about one message this service sent."""
+
+    # The id of the message the receipt answers.
+    of: str
+    status: ReceiptKind
+    # Why the message was refused; empty for "ack".
+    reason: str
+
+
+def create_receipt(
+    *, from_: str, message: Envelope, status: ReceiptKind, reason: str = ""
+) -> Envelope:
+    """Makes the receipt that the recipient of `message` (whose key id is
+    `from_`) sends back to its sender. Seal it with `seal` like any envelope."""
+    if from_ != message["to"]:
+        raise EnvelopeError("sender_mismatch", "only the recipient of a message can answer it")
+    return create_envelope(
+        from_=from_,
+        to=message["from"],
+        body="" if status == "ack" else jsontext.js_slice(reason or "refused", 200),
+        kind=status,
+        thread_id=message["thread_id"],
+        in_reply_to=message["id"],
+    )
+
+
+def parse_receipt(envelope: Envelope) -> Receipt:
+    """Reads a receipt out of an opened envelope. Raises `EnvelopeError`
+    ("malformed") if the envelope is not a well-formed receipt.
+
+    This does not say whether the receipt is about a message this service
+    actually sent to its signer; the caller checks that against its store.
+    """
+    kind = envelope["kind"]
+    if kind not in RECEIPT_KINDS:
+        raise EnvelopeError("malformed", "not a receipt")
+    of = envelope.get("in_reply_to")
+    if of is None:
+        raise EnvelopeError("malformed", "receipt does not name a message")
+    if kind == "ack" and envelope["body"] != "":
+        raise EnvelopeError("malformed", "an ack has no body")
+    status: ReceiptKind = "ack" if kind == "ack" else "nack"
+    return {"of": of, "status": status, "reason": envelope["body"]}
