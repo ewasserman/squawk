@@ -749,7 +749,13 @@ class Daemon:
         """Creates, saves and queues a message to a contact, then tells the transport.
 
         Raises `RpcError` if `to` is not a known contact, or is a blocked one
-        (such a message could never be delivered).
+        (such a message could never be delivered), or if `thread_id` names a
+        conversation with a different contact: the recipient would refuse
+        every message in it, since a thread belongs to one contact.
+
+        A reply (`in_reply_to`) joins the thread of the message it answers
+        when that conversation is with the same contact; answering another
+        contact's message starts a new thread.
         """
         contact = self.resolve_contact(params["to"])
         if contact.trust != "paired":
@@ -758,12 +764,25 @@ class Daemon:
                 f'"{contact.name}" is blocked; run `squawk unblock {contact.name}` '
                 "before sending to them",
             )
-        # A reply joins the thread of the message it answers, unless told otherwise.
         thread = params.get("thread_id")
         in_reply_to = params.get("in_reply_to")
-        if thread is None and in_reply_to is not None:
+        if thread is not None:
+            other = self._thread_peer_other_than(thread, contact.public_key)
+            if other is not None:
+                raise RpcError(
+                    RpcErrorCode.APPLICATION_ERROR,
+                    f"thread {thread} is a conversation with {other}, not with "
+                    f"{contact.name}; leave out --thread to start a new conversation "
+                    f"with {contact.name}",
+                )
+        elif in_reply_to is not None:
+            # A reply joins the thread of the message it answers, if that
+            # conversation is with the same contact.
             answered = self.store.get_message(in_reply_to)
-            thread = None if answered is None else answered.thread_id
+            if answered is not None and (
+                self._thread_peer_other_than(answered.thread_id, contact.public_key) is None
+            ):
+                thread = answered.thread_id
         envelope = create_envelope(
             from_=self.identity.id,
             to=contact.public_key,
@@ -787,6 +806,15 @@ class Daemon:
             # The message is safely queued; the transport retries later.
             print(f"squawkd: transport failed: {err}", file=sys.stderr)
         return {"id": envelope["id"], "thread_id": envelope["thread_id"], "state": "queued"}
+
+    def _thread_peer_other_than(self, thread_id: str, key_id: str) -> str | None:
+        """The name (or key id) of the contact a stored thread is with, when
+        that is not `key_id`; None when the thread is with `key_id` or unknown."""
+        thread = self.store.get_thread(thread_id)
+        if thread is None or thread.peer == key_id:
+            return None
+        contact = self.store.get_contact(thread.peer)
+        return thread.peer if contact is None else contact.name
 
     def resolve_contact(self, to: str) -> Contact:
         """Finds a contact by key identifier, or else by name (exact, then

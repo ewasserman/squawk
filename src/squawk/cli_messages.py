@@ -278,6 +278,8 @@ SEND_USAGE = (
     'Usage: squawk send <peer> "<text>" [--session <label>] [--kind text|question|answer]'
     " [--thread <id>] [--reply-to <msg id>]\n"
     "       Reads the message from stdin when the text is missing or is -.\n"
+    "       --thread must be a conversation with the same person; --reply-to a message\n"
+    "       from someone else starts a new conversation.\n"
 )
 
 REPLY_USAGE = (

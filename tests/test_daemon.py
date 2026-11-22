@@ -433,6 +433,38 @@ async def test_a_reply_joins_the_thread_of_the_message_it_answers(env: Env) -> N
     assert reply["thread_id"] == first["thread_id"]
 
 
+async def test_a_thread_with_one_contact_is_not_reused_for_another(env: Env) -> None:
+    bob = identity_from_secret_key("bob", ed25519_random_secret_key())
+    env.daemon.store.upsert_contact(bob.id, "bob", trust="paired")
+    to_alice = await env.daemon.send({"to": "alice", "body": "for alice"})
+    from_alice = env.incoming("from alice")
+    await delivered(env.daemon.deliver_incoming(from_alice))
+
+    # Naming Alice's thread when writing to Bob is a mistake: refused, with a
+    # message that says what to do.
+    client = await env.connect()
+    with pytest.raises(RpcError) as refused:
+        await client.call(
+            "send", {"to": "bob", "body": "for bob", "thread_id": to_alice["thread_id"]}
+        )
+    assert refused.value.code == RpcErrorCode.APPLICATION_ERROR
+    assert "conversation with alice" in refused.value.message
+    assert "--thread" in refused.value.message
+    assert env.daemon.store.count_outbound() == 1
+
+    # Answering Alice's message while writing to Bob starts a new thread with Bob.
+    to_bob = await env.daemon.send({"to": "bob", "body": "fyi", "in_reply_to": from_alice["id"]})
+    assert to_bob["thread_id"] not in (from_alice["thread_id"], to_alice["thread_id"])
+    thread = env.daemon.store.get_thread(to_bob["thread_id"])
+    assert thread is not None and thread.peer == bob.id
+    item = env.daemon.store.get_outbound(to_bob["id"])
+    assert item is not None and item.envelope.get("in_reply_to") == from_alice["id"]
+
+    # Bob's own thread still works for Bob.
+    again = await env.daemon.send({"to": "bob", "body": "more", "thread_id": to_bob["thread_id"]})
+    assert again["thread_id"] == to_bob["thread_id"]
+
+
 async def test_send_to_an_unknown_contact_is_an_error_with_a_clear_message(env: Env) -> None:
     client = await env.connect()
     with pytest.raises(RpcError) as unknown:
