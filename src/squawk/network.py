@@ -624,9 +624,18 @@ class NetworkTransport(Transport):
             self.flush()
 
     async def stop(self) -> None:
+        """Stops at once: deliveries and dials in progress are cancelled (a
+        contact that does not answer could otherwise hold up the stop for
+        the whole connect timeout, for each address tried). Their messages
+        stay queued; a cancelled delivery records no attempt, and messages
+        already acknowledged were recorded when the acknowledgement came."""
         self._stopped = True
         if self._timer is not None:
             self._timer.cancel()
+        in_progress = [*self._delivering.values(), *self._dialing.values()]
+        for task in in_progress:
+            task.cancel()
+        await asyncio.gather(*in_progress, return_exceptions=True)
         if self.discovery is not None:
             await self.discovery.stop()
         for link in [*self._links.values(), *self._incoming_links]:
@@ -642,7 +651,6 @@ class NetworkTransport(Transport):
                 for connection in server.connections:
                     if connection.transport is not None:
                         connection.transport.abort()
-        await asyncio.gather(*self._delivering.values(), return_exceptions=True)
         for task in list(self._tasks):
             task.cancel()
 

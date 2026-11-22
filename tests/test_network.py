@@ -11,12 +11,14 @@ from typing import Any
 import pytest
 from websockets.asyncio.client import connect
 
+from squawk.config import db_path
 from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import Daemon
 from squawk.discovery import Advertisement, Discovery, RawService
 from squawk.envelope import create_envelope
 from squawk.identity import Identity, fingerprint, identity_from_secret_key, init_identity
 from squawk.network import Address, LinkError, NetworkTransport, PeerLink, dialable
+from squawk.store import Store
 
 
 async def wait_for[T](check: Callable[[], T | None], timeout: float = 8.0) -> T:
@@ -319,6 +321,40 @@ async def test_concurrent_callers_share_one_dial_to_a_contact(net: Net) -> None:
     assert len(bob.transport._incoming_links) == 1
     await net.stop_node(alice)
     await wait_for(lambda: first.closed)
+
+
+async def test_stops_promptly_while_a_contact_is_slow_to_answer(net: Net) -> None:
+    alice = await net.node("alice")
+    carol = await net.node("carol")
+    pair(alice, carol)
+    held: list[asyncio.StreamWriter] = []
+
+    async def silent_handler(_r: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    silent = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+    net.book[carol.id] = Address("127.0.0.1", silent.sockets[0].getsockname()[1])
+    try:
+        sent = await alice.daemon.send({"to": "carol", "body": "for carol"})
+        await wait_for(lambda: held)
+        start = time.monotonic()
+        await net.stop_node(alice)
+        # Well under the 2 s handshake timeout the dial is stuck in.
+        assert time.monotonic() - start < 1.0
+    finally:
+        for writer in held:
+            writer.close()
+        silent.close()
+    # The message is still queued, with no attempt recorded for the dial
+    # that was cut short.
+    store = Store.open(db_path(alice.home))
+    try:
+        item = store.get_outbound(sent["id"])
+        assert item is not None and item.attempts == 0 and item.last_error is None
+        message = store.get_message(sent["id"])
+        assert message is not None and message.state == "queued"
+    finally:
+        store.close()
 
 
 async def test_retries_after_the_receiver_restarts(net: Net) -> None:
