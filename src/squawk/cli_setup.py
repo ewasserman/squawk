@@ -179,7 +179,12 @@ def read_settings(path: str) -> dict[str, Any]:
 
 def write_settings(path: str, settings: dict[str, Any]) -> None:
     """Writes the settings file in one step, first copying the existing file
-    to settings.json.squawk-backup if no such copy exists yet."""
+    to settings.json.squawk-backup if no such copy exists yet.
+
+    When `path` is a symbolic link (settings kept in a dotfiles folder, for
+    example), the file it points to is written, and the backup and the
+    temporary file go next to that file, so the link stays a link."""
+    path = os.path.realpath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     mode = 0o600
     if os.path.exists(path):
