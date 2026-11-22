@@ -13,6 +13,11 @@ straight into the right Claude Code session through Claude Code's own
 messaging between sessions, so you start Claude as usual, with no extra
 flags.
 
+People on different networks can use a relay server instead: each service
+connects out to the relay, which holds sealed messages until the recipient
+fetches them. The relay cannot read them. When both people are on the same
+network, messages still go directly. See "Contacts on other networks" below.
+
 Security design: [docs/plan/security.md](docs/plan/security.md).
 Step-by-step guide for trying it with a colleague:
 [docs/setup-guide.md](docs/setup-guide.md).
@@ -57,6 +62,39 @@ network.
    like "ask Bob whether the staging build is green". Claude looks up Bob's
    open sessions, picks the one that fits, and a dialog shows you the message
    to edit, send or cancel. Bob's answer appears in your session by itself.
+
+## Contacts on other networks
+
+When your colleague is not on your local network, both services connect to
+the same relay server and pair with a one-time invite code:
+
+```bash
+squawk relay set wss://relay.example.com   # both people, once
+squawk invite                              # Alice: prints a code
+squawk pair --code <code>                  # Bob, within 10 minutes
+```
+
+Alice reads the code to Bob on a phone or video call. Both screens then show
+a 6-digit code to compare, as in the Quickstart, but compare them on a call
+where you can hear or see each other, never in a chat message: the relay
+passed the pairing along and could be interfering.
+
+After pairing, messages, replies and `squawk sessions Bob` work as on the
+local network. Each message is tried over the local network first, then
+through the relay. If Bob's service is not running, the message waits at the
+relay for up to 7 days; `squawk send` says "waiting at the relay", and
+`squawk status` counts it under "Held at relay" until Bob's service fetches
+it and sends back a signed receipt.
+
+The relay stores only sealed messages it cannot open, and accepts messages
+for you only from your paired contacts. It does see who talks to whom and
+when, and your IP address. Details:
+[docs/plan/security.md](docs/plan/security.md) (threats 9 to 17) and the
+protocol in [docs/plan/relay.md](docs/plan/relay.md).
+
+There is no public relay yet. To try one on your own network, see "A relay
+for local testing" below and the relay section of the
+[setup guide](docs/setup-guide.md).
 
 ## Which session gets a message
 
@@ -140,6 +178,8 @@ squawk status            # service status, sessions, queues and relay connection
 squawk relay set <url>   # reach contacts on other networks through a relay (wss://)
 squawk relay set --off   # stop using a relay
 squawk relay status      # the relay, whether it is connected, messages waiting for it
+squawk invite            # a one-time code for pairing through the relay
+squawk pair --code <c>   # join someone's invite through the relay
 squawk daemon start|stop|status
 squawk uninstall         # remove the hooks and skill (--purge also deletes ~/.config/squawk)
 ```
@@ -178,7 +218,9 @@ docker compose up relay        # add -d to run it in the background
 curl localhost:8765/healthz    # {"status":"ok","version":"..."}
 ```
 
-It listens on `ws://localhost:8765` and keeps its data (its key, mailboxes
+It listens on `ws://localhost:8765`, on this machine only (start it with
+`SQUAWK_RELAY_BIND=0.0.0.0 docker compose up relay` to let other machines
+on the network use it), and keeps its data (its key, mailboxes
 and waiting messages) in the `relay-data` Docker volume, so it survives
 `docker compose restart relay`. `docker compose down -v` deletes the data.
 

@@ -3,7 +3,8 @@
 This guide is for someone who wants to run squawk on their own Mac, for
 example to try it with a colleague. It takes about 10 minutes. You need a
 colleague doing the same on another Mac on the same network; one Mac on its
-own has nobody to talk to.
+own has nobody to talk to. If your colleague is on another network, you
+also need a relay server that both of you can reach: see step 7.
 
 ## What you need
 
@@ -141,10 +142,98 @@ squawk auto-send --default on            # no dialog for anyone without their ow
 squawk contacts                          # shows each contact's settings
 ```
 
+## 7. Using a relay (colleague on another network)
+
+A relay lets two services that cannot reach each other directly exchange
+messages. Each service keeps a connection open to the relay; the relay holds
+sealed messages it cannot read until the recipient's service fetches them.
+When you and your colleague are on the same network, messages still go
+directly and the relay is not used.
+
+There is no public relay yet. For now, one of you runs a relay in Docker
+(below) and you both use it.
+
+**Set the relay**, both of you:
+
+```bash
+squawk relay set wss://relay.example.com
+squawk relay status        # "Connected: yes"
+```
+
+`squawk setup --relay <url>` does the same during setup. A relay URL must
+start with `wss://` (encrypted). Plain `ws://` is accepted only with
+`--allow-plain`, for testing on your own network.
+
+**Pair with an invite code** instead of `squawk pair --accept` (step 4):
+
+| Person A | Person B |
+| --- | --- |
+| `squawk invite` | |
+| Reads the invite code to B on a phone or video call | |
+| | `squawk pair --code <the code>` (within 10 minutes) |
+
+Both screens then show a 6-digit code. **Compare the codes on the call**,
+where you can hear or see each other. Do not send them as a chat message or
+email: the relay passed the pairing along and could be interfering. If they
+match, both answer `y`; if they differ, answer `n`. The invite code works
+once.
+
+After that, everything in steps 5 and 6 works the same. If your colleague's
+service is not running, a message waits at the relay for up to 7 days:
+`squawk send` says "waiting at the relay", and `squawk status` and `squawk
+relay status` count it under "Held at relay" until your colleague's service
+fetches it and returns a receipt. `squawk contacts` shows the route to each
+contact.
+
+`squawk relay set --off` stops using the relay.
+
+### Trying it with a relay in Docker
+
+This runs a test relay on one Mac, and has both Macs use it with discovery
+on the local network turned off, so that every message really goes through
+the relay. It needs Docker on the relay Mac and the squawk source:
+
+```bash
+# On the Mac that runs the relay (say Alice's):
+git clone https://github.com/ewasserman/squawk && cd squawk
+SQUAWK_RELAY_BIND=0.0.0.0 docker compose up -d relay
+curl localhost:8765/healthz              # {"status":"ok",...}
+ipconfig getifaddr en0                   # this Mac's address, e.g. 192.168.1.20
+```
+
+`SQUAWK_RELAY_BIND=0.0.0.0` lets other machines on the network connect;
+without it the relay is reachable only from the Mac it runs on. If macOS
+asks whether Docker may accept incoming connections, allow it.
+
+Then on both Macs, with the relay Mac's address:
+
+```bash
+squawk daemon stop
+SQUAWK_NO_MDNS=1 squawk daemon start     # no discovery on the local network
+squawk relay set ws://192.168.1.20:8765 --allow-plain
+squawk relay status                      # "Connected: yes"
+```
+
+`--allow-plain` is needed because the test relay uses plain `ws://`. The
+messages are still sealed end to end; what plain `ws://` exposes to the
+network is who talks to whom. Start the service this way before opening
+Claude Code: a session started first would start the service with
+discovery on.
+
+Now pair with `squawk invite` and `squawk pair --code` as above, and use
+squawk from Claude Code as in step 5. To see a message wait at the relay,
+have one person run `squawk daemon stop`, send them a message, then
+`squawk daemon start` again: it arrives within a few seconds.
+
+When you are done, on both Macs: `squawk relay set --off`, then
+`squawk daemon stop && squawk daemon start` to turn discovery back on. On
+the relay Mac: `docker compose down` (add `-v` to delete the relay's data).
+
 ## Useful commands
 
 ```bash
-squawk status                  # service status, sessions, queued messages
+squawk status                  # service status, sessions, queued messages, relay
+squawk relay status            # the relay and messages waiting there
 squawk inbox                   # unread messages
 squawk tail --pretty           # unread messages, then watch for new ones
 squawk send "Their Name" "hi"  # send from the terminal
@@ -173,6 +262,11 @@ Restart open Claude Code sessions so they pick up the new version.
 | `pair` cannot find the name | Use the exact name shown by `squawk peers`, in quotes if it has spaces. You can also give `host:port` from `squawk peers`. |
 | Your colleague sees none of your sessions, or a message naming one waits in `squawk inbox` | `squawk sessions` shows `no` under VISIBLE for sessions your allow and deny lists hide. Allow their project: `squawk sessions --allow '<owner>/*'`. |
 | `squawk sessions` lists no sessions | Restart Claude Code (sessions opened before `setup` are not registered). Check `claude --version` is 2.1.224 or later and that `/hooks` in Claude lists squawk's SessionStart hook. |
+| `squawk relay status` says "Connected: no" | Check the URL and that the relay is running (`curl <host>:8765/healthz` for the Docker relay, from the same Mac). The "Last error" line says why; the service keeps retrying. For the Docker relay on another Mac, it must have been started with `SQUAWK_RELAY_BIND=0.0.0.0`. |
+| `squawk relay set` refuses a `ws://` URL | Plain `ws://` is for testing only; add `--allow-plain`. |
+| `pair --code` says the invite is unknown or expired | Invite codes work once, for 10 minutes. Ask for a new one (`squawk invite`). Both of you must use the same relay. |
+| A message says "waiting at the relay" | The relay has it and your colleague's service has not fetched it yet, usually because it is not running. It is delivered when it starts, for up to 7 days. |
+| `squawk sessions <name>` says they are offline | Their service is not connected to the relay. Messages still wait for them. |
 | A message says "queued, not yet delivered" | The other service did not answer. It keeps retrying for up to 7 days; check `squawk peers` on both sides. |
 | No dialog appears when Claude sends | The dialog needs a logged-in screen session on the Mac. Check `squawk contacts`: with auto-send on, no dialog is shown. |
 | Claude says it cannot find `squawk` | Run `uv tool update-shell`, open a new terminal, and restart Claude Code. |
