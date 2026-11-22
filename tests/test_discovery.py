@@ -166,6 +166,47 @@ async def test_finds_other_services_ignores_itself_and_notices_when_one_leaves()
     await a.stop()
 
 
+def test_keeps_a_key_while_another_instance_still_advertises_it() -> None:
+    d = Discovery(make_ad("me", 1), backend=FakeBackend(FakeNetwork()))
+    downs: list[DiscoveredPeer] = []
+    d.on("down", downs.append)
+    old = RawService(name="alice (abcd)", host="old.local", port=4100, txt=base.txt)
+    # After a restart, mDNS renamed the new advertisement "(2)".
+    renamed = RawService(
+        name="alice (abcd) (2)",
+        host="new.local",
+        port=4101,
+        txt={**base.txt, "port": "4101"},
+    )
+    d._handle_up(old)
+    d._handle_up(renamed)
+    # The stale record expires; the renamed one is still there.
+    d._handle_down(RawService(name=old.name, host=old.host, port=0, txt={}))
+    found = d.peer(ad.key_id)
+    assert found is not None and found.host == "new.local" and found.port == 4101
+    assert downs == []
+    # A goodbye for a name never seen does not remove the key either.
+    d._handle_down(RawService(name="someone else", host="x.local", port=0, txt=base.txt))
+    assert d.peer(ad.key_id) is not None
+    d._handle_down(RawService(name=renamed.name, host=renamed.host, port=0, txt={}))
+    assert d.peer(ad.key_id) is None
+    assert [p.host for p in downs] == ["new.local"]
+
+
+def test_a_withdrawn_newer_advertisement_falls_back_to_the_one_still_there() -> None:
+    times = iter(range(1, 100))
+    d = Discovery(make_ad("me", 1), backend=FakeBackend(FakeNetwork()), now=lambda: next(times))
+    real = RawService(name="alice (abcd)", host="real.local", port=4100, txt=base.txt)
+    spoof = RawService(name="alice (abcd) (2)", host="spoof.local", port=4999, txt=base.txt)
+    d._handle_up(real)
+    d._handle_up(spoof)
+    found = d.peer(ad.key_id)
+    assert found is not None and found.host == "spoof.local"
+    d._handle_down(RawService(name=spoof.name, host=spoof.host, port=0, txt={}))
+    found = d.peer(ad.key_id)
+    assert found is not None and found.host == "real.local"
+
+
 def test_uses_a_unique_instance_name_built_from_the_name_and_fingerprint() -> None:
     advert = make_ad("alice", 1)
     d = Discovery(advert, backend=FakeBackend(FakeNetwork()))
