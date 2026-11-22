@@ -1,8 +1,7 @@
-import json
 import re
 import subprocess
 import sys
-from pathlib import Path
+from importlib.metadata import version
 
 import pytest
 
@@ -14,9 +13,8 @@ def test_is_a_semantic_version_string() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+", VERSION)
 
 
-def test_matches_the_node_package_version() -> None:
-    package = json.loads((Path(__file__).parent.parent / "package.json").read_text())
-    assert package["version"] == VERSION
+def test_matches_the_installed_package_version() -> None:
+    assert version("squawk") == VERSION
 
 
 def test_cli_prints_the_version(capsys: pytest.CaptureFixture[str]) -> None:

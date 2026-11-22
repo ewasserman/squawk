@@ -120,9 +120,3 @@ uv run squawk <command>   # the CLI from the sources
 
 Set `SQUAWK_HOME` to use a different directory than `~/.config/squawk`, for
 example to run two services on one machine.
-
-The original Node version (`src/*.ts`, tests in `test/`) is still in the
-repository while the Python version is checked; it will be removed.
-`tests/test_node_compat.py` and `tests/test_node_network.py` check that the
-two versions read each other's files and talk to each other, and run only
-when `node` and `node_modules` are present.

@@ -126,3 +126,17 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## Build & Test
+
+Python 3.12+, managed with uv. The package is in `src/squawk/`, tests in `tests/`.
+
+```bash
+uv sync
+uv run ruff check          # lint (uv run ruff format to auto-fix formatting)
+uv run ruff format --check
+uv run mypy                # type check
+uv run pytest
+```
+
+All four must pass before committing. CI runs the same commands.

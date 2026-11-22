@@ -2,6 +2,11 @@
 
 Date: 2026-11-21. Claude Code 2.1.330 (Sonnet 5.5), macOS.
 
+> Kept as a record. The Node version built on these results was replaced by
+> the Python version, which delivers messages through Claude Code's
+> cross-session messaging instead of channels and MCP; the spike's code
+> (`spikes/channels/`) has been removed.
+
 Question: can a local MCP server (1) push messages into a running, idle Claude
 Code session, (2) ask the human to approve, edit or cancel an outgoing message,
 and (3) as an alternative to channels, can a plain command whose output is
