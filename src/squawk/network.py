@@ -474,6 +474,10 @@ class NetworkTransport(Transport):
 
     Options:
       port: TCP port for the WebSocket listener; 0 picks a free one.
+      preferred_port: used only when `port` is 0: try this port first and
+        pick a free one if it is taken. The service passes the port it used
+        last time, so contacts' saved addresses keep working after a restart
+        even when mDNS is unreliable.
       host: interface to listen on; defaults to all.
       discovery: a `Discovery`, or False to turn mDNS off (tests); default is real mDNS.
       resolve: extra address lookup tried before discovery (tests use this).
@@ -489,6 +493,7 @@ class NetworkTransport(Transport):
         self,
         *,
         port: int = 0,
+        preferred_port: int = 0,
         host: str | None = None,
         discovery: Discovery | Literal[False] | None = None,
         resolve: Callable[[str], Address | None] | None = None,
@@ -499,6 +504,7 @@ class NetworkTransport(Transport):
         sessions_timeout_ms: int = 5_000,
     ) -> None:
         self._port_option = port
+        self._preferred_port = preferred_port
         self._host = host
         self._discovery_option = discovery
         self._resolve = resolve
@@ -534,6 +540,14 @@ class NetworkTransport(Transport):
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def _bind_listener(self) -> socket.socket:
+        if self._port_option == 0 and self._preferred_port != 0:
+            try:
+                return _listening_socket(self._host, self._preferred_port)
+            except OSError:
+                pass  # Taken (or not allowed): fall back to any free port.
+        return _listening_socket(self._host, self._port_option)
+
     async def start(self, daemon: "Daemon") -> None:
         self._daemon = daemon
         self._guard = ReplayGuard(seen=daemon.store.seen_ids())
@@ -543,7 +557,7 @@ class NetworkTransport(Transport):
                 return connection.respond(426, "squawk speaks WebSocket\n")
             return None
 
-        sock = _listening_socket(self._host, self._port_option)
+        sock = self._bind_listener()
         try:
             self._server = await serve(
                 self._accept_incoming,

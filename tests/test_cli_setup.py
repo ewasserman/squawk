@@ -273,3 +273,18 @@ def test_hook_entries_are_recognised_by_their_command() -> None:
     assert command == "'/opt/my bin/squawk' hook session-start"
     settings = with_squawk_hooks({}, {"SessionStart": command, "SessionEnd": command})
     assert without_squawk_hooks(settings) == {}
+
+
+def test_path_warning_only_when_squawk_is_not_on_the_path() -> None:
+    from squawk.cli_setup import squawk_path_warning
+
+    folder = tempfile.mkdtemp(prefix="sqp-", dir="/tmp")
+    try:
+        assert squawk_path_warning({"PATH": folder}) is not None
+        program = os.path.join(folder, "squawk")
+        with open(program, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(program, 0o755)
+        assert squawk_path_warning({"PATH": folder}) is None
+    finally:
+        shutil.rmtree(folder)

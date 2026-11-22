@@ -459,8 +459,23 @@ async def _setup(args: list[str], io: CliIo) -> int:
     _remove_old_mcp_registration(io)
     for warning in settings_warnings(updated):
         io.stderr(f"Warning: {warning}\n")
+    path_warning = squawk_path_warning(io.env)
+    if path_warning is not None:
+        io.stderr(f"Warning: {path_warning}\n")
     io.stdout(NEXT_STEPS)
     return 0
+
+
+def squawk_path_warning(env: Mapping[str, str]) -> str | None:
+    """A warning when `squawk` is not on the PATH. The hooks use its full path,
+    but Claude runs `squawk send` and `squawk reply` by name."""
+    if shutil.which("squawk", path=env.get("PATH")) is not None:
+        return None
+    return (
+        "the `squawk` command is not on your PATH, so Claude cannot run "
+        "`squawk send`. If you installed it with `uv tool install`, run "
+        "`uv tool update-shell`, then open a new terminal and restart Claude Code."
+    )
 
 
 async def _uninstall(args: list[str], io: CliIo) -> int:
