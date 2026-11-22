@@ -19,7 +19,7 @@ import pytest
 from squawk.cli import run
 from squawk.cli_io import NOT_RUNNING_MESSAGE, CliIo
 from squawk.cli_messages import MESSAGE_NOTE, tail
-from squawk.confirm import ConfirmResult, Draft
+from squawk.confirm import ConfirmResult, DialogKind, DialogProgram, Draft
 from squawk.daemon import Daemon
 from squawk.identity import init_identity
 from squawk.network import Address, NetworkTransport
@@ -640,20 +640,40 @@ async def test_auto_send_skips_the_question_per_contact_and_by_default(nodes: No
     await wait_for(lambda: len(bob.daemon.store.inbox()) == 4)
 
 
-def fake_osascript(directory: str, body: str) -> str:
-    """Writes a stand-in for osascript that saves its arguments as JSON in
-    args.json and then runs `body` (Python, with `args` bound)."""
-    path = os.path.join(directory, "osascript")
+def fake_dialog(directory: str, name: DialogKind, body: str) -> DialogProgram:
+    """Writes a stand-in for the dialog program `name` (osascript, kdialog or
+    zenity) that saves its arguments as JSON in args.json and its standard
+    input in stdin.txt, then runs `body` (Python, with `args` and `stdin_text`
+    bound)."""
+    path = os.path.join(directory, name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(
             f"#!{sys.executable}\n"
             "import json, sys\n"
             "args = sys.argv[1:]\n"
+            "stdin_text = sys.stdin.read()\n"
             f"json.dump(args, open({os.path.join(directory, 'args.json')!r}, 'w'))\n"
+            f"open({os.path.join(directory, 'stdin.txt')!r}, 'w').write(stdin_text)\n"
             f"{body}\n"
         )
     os.chmod(path, 0o755)
-    return path
+    return DialogProgram(name, path)
+
+
+def fake_osascript(directory: str, body: str) -> DialogProgram:
+    return fake_dialog(directory, "osascript", body)
+
+
+def dialog_args(home: str) -> list[str]:
+    with open(os.path.join(home, "args.json"), encoding="utf-8") as f:
+        args: list[str] = json.load(f)
+    return args
+
+
+def on_screen(c: Captured) -> Captured:
+    """Gives the command a graphical session, which kdialog and zenity need."""
+    c.io.env = {**c.io.env, "WAYLAND_DISPLAY": "wayland-test"}
+    return c
 
 
 async def test_no_dialog_means_nothing_is_sent_and_says_how_to_turn_on_auto_send(
@@ -665,15 +685,26 @@ async def test_no_dialog_means_nothing_is_sent_and_says_how_to_turn_on_auto_send
         alice.home,
         "sys.stderr.write('execution error: No user interaction allowed. (-1713)\\n')\nsys.exit(1)",
     )
-    for osascript in (failing, os.path.join(alice.home, "missing-osascript")):
-        c = Captured(alice.home, confirm=None, osascript=osascript)
+    missing = DialogProgram("osascript", os.path.join(alice.home, "missing-osascript"))
+    zenity_dir = os.path.join(alice.home, "zenity")
+    os.mkdir(zenity_dir)
+    zenity = fake_dialog(zenity_dir, "zenity", "print('never shown')")
+    cases = [
+        (failing, "No user interaction allowed"),
+        (missing, "missing-osascript"),
+        (None, "install zenity or kdialog"),
+        # zenity and kdialog need a screen session; without one they are not run.
+        (zenity, "neither WAYLAND_DISPLAY nor DISPLAY is set"),
+    ]
+    for program, reason in cases:
+        c = Captured(alice.home, confirm=None, dialog=program)
         assert await run(["send", "bob", "hello"], c.io) == 1
         assert c.stdout == ""
         assert c.stderr.startswith("squawk send: not sent: ")
+        assert reason in c.stderr
         assert "`squawk auto-send bob on`" in c.stderr
         assert "`squawk auto-send --default on`" in c.stderr
-        if osascript == failing:
-            assert "No user interaction allowed" in c.stderr
+    assert not os.path.exists(os.path.join(zenity_dir, "args.json"))
     assert alice.daemon.store.count_outbound() == 0
     assert bob.daemon.store.inbox() == []
 
@@ -684,7 +715,7 @@ async def test_the_dialog_gets_the_text_as_an_argument_and_its_answer_is_sent(
     alice, bob = await nodes.paired()
     text = '-e "quoted" & {braces}\nsecond line'
     osascript = fake_osascript(alice.home, "print('SEND\\nedited ' + args[5])")
-    c = Captured(alice.home, confirm=None, osascript=osascript)
+    c = Captured(alice.home, confirm=None, dialog=osascript)
     assert await run(["send", "bob", "--", text], c.io) == 0, c.stderr
     with open(os.path.join(alice.home, "args.json"), encoding="utf-8") as f:
         args = json.load(f)
@@ -704,10 +735,89 @@ async def test_the_dialog_gets_the_text_as_an_argument_and_its_answer_is_sent(
 async def test_the_dialog_cancel_answer_sends_nothing(nodes: Nodes) -> None:
     alice, _ = await nodes.paired()
     osascript = fake_osascript(alice.home, "print('CANCEL')")
-    c = Captured(alice.home, confirm=None, osascript=osascript)
+    c = Captured(alice.home, confirm=None, dialog=osascript)
     assert await run(["send", "bob", "hello"], c.io) == 1
     assert c.stdout == "Not sent: cancelled.\n"
     assert alice.daemon.store.count_outbound() == 0
+
+
+async def test_zenity_gets_the_text_on_standard_input_and_its_answer_is_sent(
+    nodes: Nodes,
+) -> None:
+    alice, bob = await nodes.paired()
+    text = '--title=evil "quoted"\nsecond line'
+    # zenity prints the field's text exactly, with no newline of its own.
+    zenity = fake_dialog(alice.home, "zenity", "sys.stdout.write('edited ' + stdin_text)")
+    c = on_screen(Captured(alice.home, confirm=None, dialog=zenity))
+    assert await run(["send", "bob", "--", text], c.io) == 0, c.stderr
+    args = dialog_args(alice.home)
+    assert args[:2] == ["--text-info", "--editable"]
+    assert "--title=squawk: Claude wants to send this message to bob" in args
+    assert "--ok-label=Send" in args
+    assert "--timeout=300" in args
+    # The text is never an argument.
+    assert not any(text in arg for arg in args)
+    with open(os.path.join(alice.home, "stdin.txt"), encoding="utf-8") as f:
+        assert f.read() == text
+    match = SENT.match(c.stdout)
+    assert match is not None
+    received = await wait_for(lambda: bob.daemon.store.get_message(match.group(3)))
+    assert received.body == "edited " + text
+
+
+async def test_zenity_timeout_and_cancel_send_nothing(nodes: Nodes) -> None:
+    alice, _ = await nodes.paired()
+    # When its timeout runs out zenity still prints the text, but exits with 5.
+    timed_out = fake_dialog(alice.home, "zenity", "sys.stdout.write(stdin_text)\nsys.exit(5)")
+    c = on_screen(Captured(alice.home, confirm=None, dialog=timed_out))
+    assert await run(["send", "bob", "hello"], c.io) == 1
+    assert c.stdout == "Not sent: nobody answered the confirmation dialog in time.\n"
+    cancelled = fake_dialog(alice.home, "zenity", "sys.exit(1)")
+    c = on_screen(Captured(alice.home, confirm=None, dialog=cancelled))
+    assert await run(["send", "bob", "hello"], c.io) == 1
+    assert c.stdout == "Not sent: cancelled.\n"
+    assert alice.daemon.store.count_outbound() == 0
+
+
+# kdialog reads "\n" in its arguments as a line break and "\\" as one
+# backslash, then prints the field's text and a newline.
+KDIALOG_ACCEPT = r"""
+def unescape(s):
+    out, escaped = [], False
+    for ch in s:
+        if escaped:
+            escaped = False
+            out.append("\\" if ch == "\\" else "\n" if ch == "n" else "\\" + ch)
+        elif ch == "\\":
+            escaped = True
+        else:
+            out.append(ch)
+    return "".join(out)
+print(unescape(args[args.index("--") + 1]))
+"""
+
+
+async def test_kdialog_shows_the_text_unchanged_and_its_answer_is_sent(nodes: Nodes) -> None:
+    alice, bob = await nodes.paired()
+    text = '-e "quoted" C:\\new\\temp \\\\share\nsecond line'
+    kdialog = fake_dialog(alice.home, "kdialog", KDIALOG_ACCEPT)
+    c = on_screen(Captured(alice.home, confirm=None, dialog=kdialog))
+    assert await run(["send", "bob", "--", text], c.io) == 0, c.stderr
+    args = dialog_args(alice.home)
+    # --title squawk --textinputbox <prompt> -- <text> <width> <height>
+    assert args[:3] == ["--title", "squawk", "--textinputbox"]
+    assert "to bob" in args[3]
+    assert "click OK" in args[3]
+    assert args[4] == "--"
+    match = SENT.match(c.stdout)
+    assert match is not None
+    received = await wait_for(lambda: bob.daemon.store.get_message(match.group(3)))
+    assert received.body == text
+
+    cancelled = fake_dialog(alice.home, "kdialog", "print()\nsys.exit(1)")
+    c = on_screen(Captured(alice.home, confirm=None, dialog=cancelled))
+    assert await run(["send", "bob", "hello"], c.io) == 1
+    assert c.stdout == "Not sent: cancelled.\n"
 
 
 async def test_reports_a_message_that_is_still_queued(nodes: Nodes) -> None:

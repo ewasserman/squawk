@@ -5,12 +5,19 @@ example to try it with a colleague. It takes about 10 minutes. You need a
 colleague doing the same on another Mac on the same network; one Mac on its
 own has nobody to talk to.
 
+Squawk also runs on Linux, and a Linux machine and a Mac can talk to each
+other. On Linux, follow the same steps; "Mac" means your machine, and the
+macOS network permission in step 2 does not apply. Read
+[On Linux](#on-linux) first.
+
 ## What you need
 
-- macOS, on the same local network as your colleague (same office Wi-Fi or
-  wired network; guest networks often block devices from seeing each other).
+- macOS or Linux, on the same local network as your colleague (same office
+  Wi-Fi or wired network; guest networks often block devices from seeing
+  each other).
 - uv: `uv --version`. If missing:
-  `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`).
+  `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`;
+  on Linux your distribution may package it, such as `sudo pacman -S uv`).
   uv downloads a suitable Python by itself; you do not need to install one.
 - Claude Code 2.1.224 or later, signed in: `claude --version`.
 
@@ -51,6 +58,30 @@ machines, macOS may ask whether your terminal (or Python) may "find and
 connect to devices on your local network". Choose **Allow**. If you missed
 the prompt, open System Settings → Privacy & Security → Local Network, turn
 your terminal app on, then run `squawk daemon stop && squawk daemon start`.
+
+### On Linux
+
+Before step 3, check three things:
+
+1. **A dialog program.** Squawk shows you each message in a zenity or
+   kdialog dialog before it is sent (kdialog first on KDE; its Send button
+   says OK). If `setup` warned that it found neither, install zenity
+   (`sudo apt install zenity`, `sudo dnf install zenity` or
+   `sudo pacman -S zenity`). Without one, `squawk send` sends nothing.
+2. **Your firewall.** If ufw or firewalld blocks incoming connections, your
+   colleague cannot connect to you. Find squawk's port with `squawk status`
+   (the line `Port:`), then allow it from your local network, for example:
+
+   ```bash
+   sudo ufw allow from 192.168.1.0/24 to any port <port> proto tcp
+   ```
+
+   ufw's default rules already let mDNS discovery through. With firewalld:
+   `sudo firewall-cmd --permanent --add-service=mdns --add-port=<port>/tcp && sudo firewall-cmd --reload`.
+   The service uses the same port again after a restart unless it is taken.
+3. **Notifications** (optional) need `notify-send` (`libnotify-bin` on
+   Debian and Ubuntu). Without it, unrouted messages wait in `squawk inbox`
+   with no notification.
 
 ## 3. Check you can see each other
 
@@ -163,6 +194,8 @@ Restart open Claude Code sessions so they pick up the new version.
 | `squawk sessions` lists no sessions | Restart Claude Code (sessions opened before `setup` are not registered). Check `claude --version` is 2.1.224 or later and that `/hooks` in Claude lists squawk's SessionStart hook. |
 | A message says "queued, not yet delivered" | The other service did not answer. It keeps retrying for up to 7 days; check `squawk peers` on both sides. |
 | No dialog appears when Claude sends | The dialog needs a logged-in screen session on the Mac. Check `squawk contacts`: with auto-send on, no dialog is shown. |
+| Linux: `send` says there is no program to show the confirmation dialog | Install zenity or kdialog (see [On Linux](#on-linux)). |
+| Linux: you see your colleague in `squawk peers` but pairing or messages to you fail | Your firewall blocks squawk's port; allow it (see [On Linux](#on-linux)). |
 | Claude says it cannot find `squawk` | Run `uv tool update-shell`, open a new terminal, and restart Claude Code. |
 | Messages never appear in a session | Check `squawk sessions` shows it as reachable. Sessions started with `--dangerously-skip-permissions` hold each message for your approval, and the setting `crossSessionInbound: "refuse"` blocks them; messages then wait in `squawk inbox`. |
 | Anything else | The service log is `~/.config/squawk/run/squawkd.log`; the hooks log to `~/.config/squawk/run/hook.log`. |

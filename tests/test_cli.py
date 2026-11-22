@@ -255,7 +255,7 @@ def test_reports_bad_arguments_as_node_does(
 
 
 # The confirmation dialog's helpers (the dialog itself is tested through
-# `squawk send` with a stand-in osascript in test_cli_messages.py).
+# `squawk send` with stand-in dialog programs in test_cli_messages.py).
 
 
 def draft(**changes: str) -> Draft:

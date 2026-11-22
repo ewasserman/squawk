@@ -15,6 +15,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from squawk.confirm import DialogProgram, find_dialog
+
 if TYPE_CHECKING:
     from squawk.confirm import ConfirmFn
 
@@ -77,12 +79,13 @@ class CliIo:
     """Setting it stops `tail`, which then exits with code 0. When None,
     `tail` stops on SIGINT or SIGTERM."""
     confirm: "ConfirmFn | None" = None
-    """Test hook: asks whether to send a message instead of the macOS dialog.
+    """Test hook: asks whether to send a message instead of the dialog.
     Only tests set it; there is deliberately no environment variable for this,
     so a command line cannot skip the dialog."""
-    osascript: str = "/usr/bin/osascript"
-    """The program that shows the confirmation dialog. Tests point it at a
-    stand-in script."""
+    dialog: DialogProgram | None = field(default_factory=find_dialog)
+    """The program that shows the confirmation dialog (osascript, kdialog or
+    zenity), or None when this machine has none. Tests point it at a stand-in
+    script."""
     ack_wait_s: float = 3.0
     """How long `send` and `reply` wait for the recipient's service to
     acknowledge a message before reporting it as still queued."""

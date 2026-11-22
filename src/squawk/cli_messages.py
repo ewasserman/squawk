@@ -356,7 +356,7 @@ async def _confirm_and_send(command: str, client: RpcClient, draft: Draft, io: C
     elif io.confirm is not None:
         decision = await io.confirm(draft)
     else:
-        decision = await dialog_confirm(draft, osascript=io.osascript)
+        decision = await dialog_confirm(draft, program=io.dialog, env=io.env)
     if decision.action == "cancel":
         io.stdout("Not sent: cancelled.\n")
         return 1

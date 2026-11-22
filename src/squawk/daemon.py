@@ -389,7 +389,7 @@ class Daemon:
         unreachable_grace_ms: int = 10 * 60_000,
     ) -> None:
         """`notify` shows a desktop notification for a message no session
-        took (default: none; the service process passes the macOS one).
+        took (default: none; the service process passes `desktop_notify`).
         Sessions are checked every `session_check_interval_s` seconds; one
         whose socket file is there but refuses connections for longer than
         `unreachable_grace_ms` is forgotten."""
