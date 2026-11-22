@@ -181,8 +181,10 @@ async def test_auto_send_default_applies_to_contacts_without_their_own_setting(
 
     listed = await cli(alice.home, "contacts")
     assert lines(listed.out) == [
-        "bob  paired  FP  policy=show_first (default)  auto_send=off (default)",
-        "carol  paired  FP  policy=show_first (default)  auto_send=off (default)",
+        "bob  paired  FP  policy=show_first (default)  auto_send=off (default)"
+        "  route=local network",
+        "carol  paired  FP  policy=show_first (default)  auto_send=off (default)"
+        "  route=local network",
     ]
 
     on = await cli(alice.home, "auto-send", "--default", "on")
@@ -194,8 +196,8 @@ async def test_auto_send_default_applies_to_contacts_without_their_own_setting(
     assert (await cli(alice.home, "auto-send", "carol", "off")).code == 0
     listed = await cli(alice.home, "contacts")
     assert lines(listed.out) == [
-        "bob  paired  FP  policy=show_first (default)  auto_send=on (default)",
-        "carol  paired  FP  policy=show_first (default)  auto_send=off",
+        "bob  paired  FP  policy=show_first (default)  auto_send=on (default)  route=local network",
+        "carol  paired  FP  policy=show_first (default)  auto_send=off  route=local network",
     ]
     contacts: list[dict[str, Any]] = json.loads((await cli(alice.home, "contacts", "--json")).out)
     assert [(c["name"], c["auto_send"], c["auto_send_is_default"]) for c in contacts] == [

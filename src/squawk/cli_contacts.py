@@ -156,11 +156,18 @@ async def _contacts(args: list[str], io: CliIo) -> int:
             io.stdout(
                 f"{c['name']}  {c['trust']}  {c['fingerprint']}  "
                 f"policy={c['inbound_policy']}{policy_default}  "
-                f"auto_send={'on' if c['auto_send'] else 'off'}{auto_default}\n"
+                f"auto_send={'on' if c['auto_send'] else 'off'}{auto_default}  "
+                f"route={format_route(c.get('relay_url'))}\n"
             )
         return 0
 
     return await _with_service(io, work)
+
+
+def format_route(relay_url: str | None) -> str:
+    """How messages reach a contact, for `squawk contacts`: through the relay
+    the contact uses, when it is known, otherwise over the local network."""
+    return "local network" if relay_url is None else f"relay {relay_url}"
 
 
 AUTO_SEND_USAGE = (

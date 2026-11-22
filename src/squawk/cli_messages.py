@@ -26,6 +26,7 @@ from squawk.daemon import (
     MessageInfo,
     MessageNotification,
     Peer,
+    RelayStatus,
     SessionInfo,
     StatusResult,
 )
@@ -249,7 +250,25 @@ def format_service_status(status: StatusResult) -> str:
         *(f"  {format_session_line(s)}" for s in status["sessions"]),
         f"Catch-all:       {format_catch_all(status.get('catch_all'), status['sessions'])}",
     ]
+    # Services from before the relay do not report these.
+    if "relay" in status:
+        lines.append(f"Relay:           {format_relay_connection(status.get('relay'))}")
+    if "relayed_outbound" in status:
+        lines.append(
+            f"Held at relay:   {status['relayed_outbound']} (queued outbound messages the "
+            "relay holds until the recipient's receipt arrives)"
+        )
     return "\n".join(lines) + "\n"
+
+
+def format_relay_connection(relay: RelayStatus | None) -> str:
+    """The relay and whether the service is connected to it, for `status`."""
+    if relay is None:
+        return "none (local network only; `squawk relay set <url>` sets one)"
+    if relay["connected"]:
+        return f"{relay['url']}  connected"
+    error = relay["last_error"]
+    return f"{relay['url']}  NOT connected" + ("" if error is None else f" ({error})")
 
 
 def format_session_line(session: SessionInfo) -> str:
@@ -564,6 +583,7 @@ MESSAGE_COMMANDS: dict[str, Command] = {
     ),
     "peers": Command("list squawk services found on the network (--json)", _peers),
     "status": Command(
-        "print the service's name, fingerprint, port, sessions and queues (--json)", _status
+        "print the service's name, fingerprint, port, sessions, queues and relay (--json)",
+        _status,
     ),
 }

@@ -645,6 +645,25 @@ class NetworkTransport(Transport):
         self._timer = asyncio.ensure_future(self._tick())
         self.flush()
 
+    async def use_relay(self, relay: "RelayClient | None") -> None:
+        """Switches to another relay, or to none, while running: stops the
+        current relay client and starts `relay`. Callbacks that others set
+        on the current client (`on_ready`, `on_live`) are moved to the new
+        one. Messages the old relay already holds stay there."""
+        old = self.relay
+        self.relay = relay
+        if old is not None:
+            await old.stop()
+        if relay is None:
+            return
+        if old is not None:
+            relay.on_ready.extend(f for f in old.on_ready if f != self._relay_came_up)
+            if relay.on_live is None:
+                relay.on_live = old.on_live
+        if self._daemon is not None and not self._stopped:
+            relay.on_ready.append(self._relay_came_up)
+            await relay.start(self._daemon)
+
     def _relay_came_up(self) -> None:
         """Messages waiting for a route may go through the relay now."""
         if self._daemon is not None and not self._stopped:

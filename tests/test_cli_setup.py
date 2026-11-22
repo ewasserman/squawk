@@ -9,6 +9,7 @@ import stat
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,7 @@ from squawk.cli_setup import (
     without_squawk_hooks,
 )
 from squawk.daemon_control import daemon_status, stop_daemon
+from squawk.relay import RelayServer
 
 
 @dataclass
@@ -254,6 +256,48 @@ async def test_setup_without_claude_leaves_claude_code_alone(machine: Machine) -
     assert "Skipped the Claude Code hooks and skill" in result.out
     assert not os.path.exists(machine.claude_dir)
     assert not os.path.exists(machine.claude_log)
+
+
+async def test_setup_with_a_relay_stores_it_and_the_service_connects(
+    machine: Machine, tmp_path: Path
+) -> None:
+    relay = RelayServer(str(tmp_path / "relay"), port=0)
+    await relay.start()
+    try:
+        url = f"ws://127.0.0.1:{relay.port}"
+        result = await machine.cli(
+            "setup", "--name", "A", "--no-claude", "--relay", url, "--allow-plain"
+        )
+        assert result.code == 0, result.err
+        assert f"Relay set to {url}." in result.out
+        assert f"Connected. Relay key: {relay.key_id}" in result.out
+        status = await daemon_status(machine.squawk)
+        assert status is not None
+        assert status.get("relay") == {
+            "url": url,
+            "connected": True,
+            "relay_key": relay.key_id,
+            "last_error": None,
+        }
+    finally:
+        await stop_daemon(machine.squawk)
+        await relay.stop()
+
+
+async def test_setup_checks_the_relay_url_before_changing_anything(machine: Machine) -> None:
+    plain = await machine.cli("setup", "--name", "A", "--relay", "ws://localhost:8765")
+    assert plain.code == 1
+    assert "--allow-plain" in plain.err
+    assert not os.path.exists(machine.squawk)
+    alone = await machine.cli("setup", "--name", "A", "--allow-plain")
+    assert alone.code == 2
+    assert "--allow-plain goes with --relay" in alone.err
+
+
+def test_the_skill_tells_how_to_pair_across_networks() -> None:
+    assert "squawk invite" in SKILL_TEXT
+    assert "squawk pair --code <code>" in SKILL_TEXT
+    assert "squawk relay status" in SKILL_TEXT
 
 
 async def test_a_new_settings_file_is_private(machine: Machine) -> None:
