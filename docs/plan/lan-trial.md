@@ -31,12 +31,12 @@ Claude Code with plain `claude` in any project folder.
 
 | Step | Worked? | Notes |
 | --- | --- | --- |
-| 1 | | |
-| 2 | | |
-| 3 | | |
-| 4 | | |
-| 5 | | |
+| 1 | yes | |
+| 2 | yes | |
+| 3 | yes | |
+| 4 | yes | |
+| 5 | yes | |
 
-Setup problems, confusing wording, or anything else:
-
--
+Run on 2026-11-21 by Eric and a colleague on two Macs, squawk 0.1.0 from
+main (badf710). Eric reported that all five steps worked; no problems were
+reported.
