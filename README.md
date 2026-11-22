@@ -134,9 +134,12 @@ squawk inbox             # unread messages
 squawk tail --pretty     # unread messages, then new ones as they arrive
 squawk send Bob "text"   # send from the terminal (or pipe text in)
 squawk reply <msg id> "text"
-squawk contacts          # paired and blocked contacts
+squawk contacts          # paired and blocked contacts, and the route to each
 squawk block Bob         # refuse Bob's connections and messages
-squawk status            # service status, sessions and queues
+squawk status            # service status, sessions, queues and relay connection
+squawk relay set <url>   # reach contacts on other networks through a relay (wss://)
+squawk relay set --off   # stop using a relay
+squawk relay status      # the relay, whether it is connected, messages waiting for it
 squawk daemon start|stop|status
 squawk uninstall         # remove the hooks and skill (--purge also deletes ~/.config/squawk)
 ```
@@ -186,3 +189,8 @@ The local relay is plain `ws://`, not encrypted with TLS. A service refuses
 a `ws://` relay URL unless you allow it explicitly with `--allow-plain` when
 setting the relay. Messages are still sealed end to end; what plain `ws://`
 exposes is who talks to whom. A deployed relay uses `wss://`.
+
+Point a service at the local relay with
+`uv run squawk relay set ws://localhost:8765 --allow-plain` (or
+`squawk setup --relay ws://localhost:8765 --allow-plain`), then check the
+connection with `uv run squawk relay status`.

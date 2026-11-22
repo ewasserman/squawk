@@ -37,9 +37,16 @@ directly (task 6).
 
 Each contact record stores the relay URL the contact uses, learned during
 pairing. In this epic a service connects only to its own relay, so both
-people must use the same relay; a message to a contact whose saved relay
-differs is not sent through the relay. Depositing at a contact's different
-relay is a later step.
+people must use the same relay. A message is still tried through our relay
+when the contact's saved URL differs (the saved URL can be out of date); the
+relay refuses it with `not-allowed` if the contact has no mailbox there, and
+the message stays queued. Depositing at a contact's different relay is a
+later step.
+
+When the service switches to another relay, or a contact shows up on the
+local network, messages the relay was holding for them are queued again for
+every route, in case the relay lost them; a recipient that receives a second
+copy only acknowledges it again.
 
 ## Transport
 

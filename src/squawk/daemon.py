@@ -64,6 +64,7 @@ from squawk.project import (
     is_visible,
     session_project,
 )
+from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcClient, RpcConnection, RpcError, RpcErrorCode, RpcHandler, RpcServer
 from squawk.store import (
     DEFAULT_AUTO_SEND_KEY,
@@ -78,6 +79,7 @@ from squawk.store import (
 from squawk.timefmt import iso_from_ms, now_ms
 
 if TYPE_CHECKING:
+    from squawk.relay_client import RelayClient
     from squawk.store import _Unset
 
 
@@ -154,6 +156,14 @@ class Transport:
     async def request_sessions(self, key_id: str) -> PeerSessions:
         """Asks a contact's service for its list of sessions."""
         raise RpcError(RpcErrorCode.APPLICATION_ERROR, "this service has no network transport")
+
+    relay: "RelayClient | None" = None
+    """The client for the relay this service uses, if any."""
+
+    async def use_relay(self, relay: "RelayClient | None") -> None:
+        """Switches to another relay (or to none) while running. This base
+        class has no network, so it does nothing; the relay set in the
+        settings is used the next time the service starts with a network."""
 
 
 no_transport = Transport()
@@ -241,6 +251,10 @@ class ContactInfo(TypedDict):
     """The policy that applies to this contact's messages (their own or the default)."""
     policy_is_default: bool
     """True when the contact has no policy of its own and follows the default."""
+    relay_url: str | None
+    """The relay the contact uses, learned during pairing, or None when it is
+    not known (messages to them then go over the local network, or through
+    this service's relay). Not sent by squawk 0.1."""
 
 
 class SessionInfo(TypedDict):
@@ -273,6 +287,28 @@ class StatusResult(TypedDict):
     """TCP port for other hosts, or None when the service has no network transport."""
     catch_all: str | None
     """The label chosen to take messages no other session takes, if any."""
+    relay: NotRequired["RelayStatus | None"]
+    """The relay this service is set to use, or None when there is none.
+    Not sent by squawk 0.1 or by services from before the relay."""
+    relayed_outbound: NotRequired[int]
+    """How many of the `queued_outbound` messages a relay holds, waiting for
+    the recipient's receipt. Not sent by squawk 0.1 or by services from
+    before the relay."""
+
+
+class RelayStatus(TypedDict):
+    """The connection to the relay, as the `status` method reports it."""
+
+    url: str
+    connected: bool
+    """True while the connection is up and the relay accepted this service's key."""
+    relay_key: str | None
+    """The relay's key id, from the last time it connected; None if it never has."""
+    last_error: str | None
+    """Why the last connection attempt failed or the connection dropped, if it did."""
+    in_use: NotRequired[bool]
+    """False when the relay is set but the service is not using it (it has no
+    network, or the stored URL no longer passes the checks). Absent means True."""
 
 
 # Checking params. Unknown fields are ignored, an optional field may be left
@@ -361,6 +397,31 @@ def parse_send_params(params: Any) -> SendParams:
         if value is not None:
             result[key] = value
     return cast(SendParams, result)
+
+
+def store_relay_settings(store: Store, url: str | None, *, allow_plain: bool = False) -> None:
+    """Stores the relay a service uses in its settings, or removes it when
+    `url` is None. Plain ws:// is accepted only with `allow_plain`, and that
+    choice is stored with the URL. Raises `RelayUrlError` (and stores
+    nothing) if `url` cannot be used. A running service does not notice the
+    change by itself; `Daemon.set_relay` stores it and switches over."""
+    # Imported here because relay_client imports network, which imports this module.
+    from squawk.relay_client import RELAY_ALLOW_PLAIN_KEY, RELAY_URL_KEY
+
+    checked = None if url is None else check_relay_url(url, allow_plain=allow_plain)
+
+    def save() -> None:
+        if checked is None:
+            store.delete_setting(RELAY_URL_KEY)
+            store.delete_setting(RELAY_ALLOW_PLAIN_KEY)
+            return
+        store.set_setting(RELAY_URL_KEY, checked)
+        if allow_plain:
+            store.set_setting(RELAY_ALLOW_PLAIN_KEY, "on")
+        else:
+            store.delete_setting(RELAY_ALLOW_PLAIN_KEY)
+
+    store.transaction(save)
 
 
 class DaemonRunningError(Exception):
@@ -986,6 +1047,7 @@ class Daemon:
                     "auto_send_is_default": auto_send_is_default,
                     "inbound_policy": self.store.inbound_policy_for(c.public_key),
                     "policy_is_default": c.inbound_policy is None,
+                    "relay_url": c.relay_url,
                 }
             )
         return sorted(infos, key=lambda c: _name_sort_key(c["name"]))
@@ -1006,7 +1068,43 @@ class Daemon:
             "queued_outbound": self.store.count_outbound(),
             "port": self.transport.port,
             "catch_all": self.catch_all_label(),
+            "relay": self.relay_status(),
+            "relayed_outbound": self.store.count_relayed(),
         }
+
+    def relay_status(self) -> RelayStatus | None:
+        """The relay this service uses and whether it is connected, or None
+        when no relay is set."""
+        relay = self.transport.relay
+        if relay is not None:
+            return {
+                "url": relay.url,
+                "connected": relay.connected,
+                "relay_key": relay.relay_key,
+                "last_error": relay.last_error,
+            }
+        from squawk.relay_client import RELAY_URL_KEY
+
+        url = self.store.get_setting(RELAY_URL_KEY)
+        if not url:
+            return None
+        # Set, but not in use: the service has no network, or the stored
+        # URL no longer passes the checks.
+        return {
+            "url": url,
+            "connected": False,
+            "relay_key": None,
+            "last_error": "the service is not using this relay",
+            "in_use": False,
+        }
+
+    async def set_relay(self, url: str | None, *, allow_plain: bool = False) -> None:
+        """Stores the relay this service uses (None: no relay) and switches the
+        running service to it. Raises `RelayUrlError` if `url` cannot be used."""
+        from squawk.relay_client import relay_client_from_settings
+
+        store_relay_settings(self.store, url, allow_plain=allow_plain)
+        await self.transport.use_relay(relay_client_from_settings(self.store.get_setting))
 
     def _register_methods(self, server: RpcServer) -> None:
         def register_session(params: Any, _connection: RpcConnection) -> dict[str, Any]:
@@ -1129,6 +1227,19 @@ class Daemon:
             await self.check_sessions()
             return self.status()
 
+        async def set_relay(params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            obj = _params_object(params)
+            assert obj is not None
+            if "url" not in obj:
+                raise _invalid("url: required")
+            url = _optional_string(obj, "url", 2048)
+            allow_plain = _bool_field(obj, "allow_plain") is True
+            try:
+                await self.set_relay(url, allow_plain=allow_plain)
+            except RelayUrlError as err:
+                raise RpcError(RpcErrorCode.APPLICATION_ERROR, str(err)) from err
+            return {"relay": self.relay_status()}
+
         async def send(params: Any, _connection: RpcConnection) -> SendResult:
             return await self.send(parse_send_params(params))
 
@@ -1237,6 +1348,7 @@ class Daemon:
         server.handle("inbox", inbox)
         server.handle("subscribe", subscribe)
         server.handle("status", status)
+        server.handle("set_relay", set_relay)
         server.handle("stop", stop)
 
     def _spawn_stop(self) -> None:

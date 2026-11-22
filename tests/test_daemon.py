@@ -826,6 +826,7 @@ async def test_contacts_lists_contacts_with_their_fingerprint_and_policy(env: En
             "auto_send_is_default": True,
             "inbound_policy": "auto_answer",
             "policy_is_default": False,
+            "relay_url": None,
         }
     ]
 
@@ -861,6 +862,8 @@ async def test_status_and_peers_report_the_service_state(env: Env) -> None:
     assert [s["label"] for s in status["sessions"]] == ["a"]
     assert status["sessions"][0]["reachable"] is True
     assert status["catch_all"] is None
+    assert status["relay"] is None
+    assert status["relayed_outbound"] == 0
     assert await client.call("peers") == {"peers": []}
 
 

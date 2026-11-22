@@ -1,8 +1,9 @@
 """The `squawk relay` command and its subcommands.
 
-`squawk relay serve` runs the relay server in the foreground. Later
-subcommands (setting which relay this service uses, and its status) are
-added to `RELAY_SUBCOMMANDS`.
+`squawk relay serve` runs the relay server in the foreground.
+`squawk relay set <url>` chooses the relay this machine's service uses to
+reach contacts on other networks (`--off` removes it), and
+`squawk relay status` shows whether the service is connected to it.
 """
 
 import asyncio
@@ -10,11 +11,22 @@ import contextlib
 import os
 import signal
 from collections.abc import Mapping
+from typing import cast
 
 from squawk.cli_args import Opt, ParseArgsError, parse_args, string_value
 from squawk.cli_io import CliIo, Command
-from squawk.config import squawk_home
+from squawk.config import db_path, squawk_home
+from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
+from squawk.daemon_control import connect_to_daemon
 from squawk.relay import RelayServer
+from squawk.relay_client import RELAY_URL_KEY
+from squawk.relay_url import RelayUrlError, check_relay_url
+from squawk.rpc import RpcError
+from squawk.store import Store
+
+CONNECT_WAIT_S = 5.0
+"""How long `squawk relay set` and `squawk setup --relay` wait to see
+whether the service connects to the new relay."""
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -76,7 +88,195 @@ async def _serve(args: list[str], io: CliIo) -> int:
     return 0
 
 
+async def save_relay(home: str, url: str | None, *, allow_plain: bool = False) -> bool:
+    """Stores the relay the service in `home` uses (None: no relay). If the
+    service is running, it is told to switch to the new relay at once;
+    otherwise the setting is written to its database and used when it
+    starts. Returns whether the service is running.
+
+    Raises `RelayUrlError` if `url` cannot be used, or `RpcError` if the
+    running service refuses it."""
+    if url is not None:
+        check_relay_url(url, allow_plain=allow_plain)
+    client = await connect_to_daemon(home)
+    if client is None:
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        store = Store.open(db_path(home))
+        try:
+            store_relay_settings(store, url, allow_plain=allow_plain)
+        finally:
+            store.close()
+        return False
+    try:
+        await client.call("set_relay", {"url": url, "allow_plain": allow_plain})
+    finally:
+        await client.close()
+    return True
+
+
+async def wait_for_relay(home: str, timeout_s: float = CONNECT_WAIT_S) -> RelayStatus | None:
+    """Asks the running service about its relay until it is connected, an
+    attempt has failed, or `timeout_s` seconds have passed, and returns the
+    last answer (None if no relay is set or the service is not running)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    client = await connect_to_daemon(home)
+    if client is None:
+        return None
+    try:
+        while True:
+            status = cast(StatusResult, await client.call("status"))
+            relay = status.get("relay")
+            if (
+                relay is None
+                or relay["connected"]
+                or relay["last_error"] is not None
+                or relay.get("in_use") is False
+            ):
+                return relay
+            if loop.time() >= deadline:
+                return relay
+            await asyncio.sleep(0.1)
+    finally:
+        await client.close()
+
+
+def describe_new_relay(url: str, running: bool, relay: RelayStatus | None) -> str:
+    """What `squawk relay set` and `squawk setup --relay` say after storing a relay."""
+    lines = [f"Relay set to {url}."]
+    if url.startswith("ws://"):
+        lines.append(
+            "This relay is not encrypted (ws://): use it only for testing on this machine "
+            "or your own network."
+        )
+    if not running:
+        lines.append(
+            "The squawk service is not running; it connects to the relay when it starts "
+            "(`squawk daemon start`)."
+        )
+    elif relay is not None and relay.get("in_use") is False:
+        lines.append(
+            "The running service is not using it (it has no network connection, or the URL "
+            "no longer passes the checks). Restart it with `squawk daemon stop` and "
+            "`squawk daemon start`."
+        )
+    elif relay is not None and relay["connected"]:
+        lines.append(f"Connected. Relay key: {relay['relay_key']}")
+    elif relay is not None and relay["last_error"] is not None:
+        lines.append(
+            f"Not connected yet: {relay['last_error']}. The service keeps trying; "
+            "`squawk relay status` shows the connection."
+        )
+    else:
+        lines.append("Still connecting; `squawk relay status` shows the connection.")
+    return "\n".join(lines) + "\n"
+
+
+SET_USAGE = "Usage: squawk relay set <url> [--allow-plain] | squawk relay set --off\n"
+
+
+async def _set(args: list[str], io: CliIo) -> int:
+    values, positionals = parse_args(
+        args, {"allow-plain": Opt("boolean"), "off": Opt("boolean")}, allow_positionals=True
+    )
+    off = values.get("off") is True
+    allow_plain = values.get("allow-plain") is True
+    if len(positionals) > 1 or off == bool(positionals) or (off and allow_plain):
+        io.stderr(SET_USAGE)
+        return 2
+    home = squawk_home(io.env)
+    url = None if off else positionals[0]
+    try:
+        running = await save_relay(home, url, allow_plain=allow_plain)
+    except (RelayUrlError, RpcError) as err:
+        io.stderr(f"squawk relay set: {err}\n")
+        return 1
+    if url is None:
+        io.stdout("Relay removed. Messages go only over the local network.\n")
+        return 0
+    relay = await wait_for_relay(home) if running else None
+    io.stdout(describe_new_relay(check_relay_url(url, allow_plain=allow_plain), running, relay))
+    return 0
+
+
+def format_relay_status(
+    relay: RelayStatus | None, queued: int, relayed: int, *, running: bool
+) -> str:
+    """The report `squawk relay status` prints."""
+    if relay is None:
+        lines = [
+            "Relay:           none (messages go only over the local network; "
+            "`squawk relay set <url>` sets one)"
+        ]
+    else:
+        if relay["connected"]:
+            connected = "yes"
+        elif not running:
+            connected = "no (the squawk service is not running)"
+        else:
+            connected = "no"
+        lines = [
+            f"Relay:           {relay['url']}",
+            f"Connected:       {connected}",
+            f"Relay key:       {relay['relay_key'] or 'unknown (not connected yet)'}",
+        ]
+        if not relay["connected"] and running and relay["last_error"] is not None:
+            lines.append(f"Last error:      {relay['last_error']}")
+    lines.append(f"Queued outbound: {queued}")
+    lines.append(f"Held at relay:   {relayed} (waiting for the recipient's receipt)")
+    return "\n".join(lines) + "\n"
+
+
+async def _status(args: list[str], io: CliIo) -> int:
+    parse_args(args)
+    home = squawk_home(io.env)
+    client = await connect_to_daemon(home)
+    if client is not None:
+        try:
+            status = cast(StatusResult, await client.call("status"))
+        except RpcError as err:
+            io.stderr(f"squawk relay status: {err}\n")
+            return 1
+        finally:
+            await client.close()
+        io.stdout(
+            format_relay_status(
+                status.get("relay"),
+                status["queued_outbound"],
+                status.get("relayed_outbound", 0),
+                running=True,
+            )
+        )
+        return 0
+    # The service is not running: report what its database says.
+    relay: RelayStatus | None = None
+    queued = relayed = 0
+    path = db_path(home)
+    if os.path.exists(path):
+        store = Store.open(path)
+        try:
+            url = store.get_setting(RELAY_URL_KEY)
+            if url:
+                relay = {"url": url, "connected": False, "relay_key": None, "last_error": None}
+            queued = store.count_outbound()
+            relayed = store.count_relayed()
+        finally:
+            store.close()
+    io.stdout(format_relay_status(relay, queued, relayed, running=False))
+    return 0
+
+
 RELAY_SUBCOMMANDS: dict[str, Command] = {
+    "set": Command(
+        "use a relay to reach contacts on other networks: set <url> (wss://; --allow-plain "
+        "also accepts ws:// for testing), or set --off to stop using one",
+        _set,
+    ),
+    "status": Command(
+        "show the relay this service uses, whether it is connected, and the messages "
+        "waiting for it",
+        _status,
+    ),
     "serve": Command(
         "run the relay server (--host, --port, --data, --trust-forwarded-for)", _serve
     ),
@@ -96,5 +296,9 @@ async def _relay(args: list[str], io: CliIo) -> int:
 
 
 RELAY_COMMANDS: dict[str, Command] = {
-    "relay": Command("run the relay server (serve)", _relay),
+    "relay": Command(
+        "choose and check the relay for contacts on other networks, or run one "
+        "(set | status | serve)",
+        _relay,
+    ),
 }
