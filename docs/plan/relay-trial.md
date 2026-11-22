@@ -10,6 +10,15 @@ in the epic.
 
 ## Before you start
 
+Until the relay work is merged, both people install squawk from its
+branch, so that `squawk --version` prints 0.3.0 on both Macs:
+
+```bash
+uv tool install --reinstall git+https://github.com/ewasserman/squawk@feature/gh-28-squawk-relay
+squawk --version                         # 0.3.0
+squawk daemon stop && squawk daemon start   # if the service was already running
+```
+
 Both people follow [the setup guide](../setup-guide.md) steps 1–3 (install
 and `squawk setup`; skip `squawk peers`, which shows nobody with discovery
 off), then the part of step 7 called "Trying it with a relay in Docker":
@@ -65,4 +74,4 @@ relay it uses.
 | 6 | | |
 | 7 | | |
 
-Run on (date) by (who) on two Macs, squawk (version) from (branch and commit).
+Run on (date) by (who) on two Macs, squawk 0.3.0 from (branch and commit).

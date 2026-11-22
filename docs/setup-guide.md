@@ -19,7 +19,7 @@ also need a relay server that both of you can reach: see step 7.
 
 ```bash
 uv tool install git+https://github.com/ewasserman/squawk
-squawk --version     # prints 0.2.0
+squawk --version     # prints 0.3.0
 ```
 
 If the shell says `command not found: squawk`, uv's folder for commands is
