@@ -21,12 +21,6 @@ uv tool install git+https://github.com/ewasserman/squawk
 squawk --version     # prints 0.1.0
 ```
 
-Until squawk v1 is merged into `main`, install from its branch instead:
-
-```bash
-uv tool install "git+https://github.com/ewasserman/squawk@feature/gh-1-squawk-lan-v1"
-```
-
 If the shell says `command not found: squawk`, uv's folder for commands is
 not on your PATH. Run `uv tool update-shell`, open a new terminal, and try
 again.
