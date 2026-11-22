@@ -131,12 +131,17 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at TEXT NOT NULL
     );
     """,
+    # Why an outgoing message failed: the reason the recipient gave when it
+    # refused the message for good. squawk 0.1 ignores the extra column.
+    """
+    ALTER TABLE messages ADD COLUMN error TEXT;
+    """,
 )
 """Schema migrations, applied in order. The database's `PRAGMA user_version`
 holds how many have been applied. Never edit or reorder an entry that has
 shipped; add a new one at the end instead. The first three are the ones
-squawk 0.1 applied; the fourth was added later (squawk 0.1 opens such a
-database and ignores the extra tables)."""
+squawk 0.1 applied; the later ones were added since (squawk 0.1 opens such
+a database and ignores the extra tables and columns)."""
 
 Trust = Literal["paired", "blocked"]
 InboundPolicy = Literal["show_first", "auto_answer"]
@@ -198,6 +203,8 @@ class StoredMessage:
     delivered_at: str | None
     """Incoming only: when the background service pushed it to a local session."""
     state: MessageState
+    error: str | None = None
+    """Outgoing only: why the message failed, when the recipient refused it for good."""
 
 
 @dataclass(frozen=True)
@@ -287,6 +294,7 @@ def _to_message(row: sqlite3.Row) -> StoredMessage:
         read_at=row["read_at"],
         delivered_at=row["delivered_at"],
         state=row["state"],
+        error=row["error"],
     )
 
 
@@ -804,6 +812,25 @@ class Store:
                 self._run("DELETE FROM outbox WHERE message_id = ?", id)
                 self._run("UPDATE messages SET state = 'failed' WHERE id = ?", id)
             return ids
+
+        return self.transaction(run)
+
+    def mark_failed(self, message_id: str, error: str) -> bool:
+        """Gives up on a queued message: removes it from the outbound queue,
+        marks it failed and records `error` as the reason. Returns False if
+        it was not in the queue."""
+
+        def run() -> bool:
+            removed = self._run("DELETE FROM outbox WHERE message_id = ?", message_id)
+            if removed.rowcount == 0:
+                return False
+            self._run(
+                """UPDATE messages SET state = 'failed', error = ?
+                 WHERE id = ? AND direction = 'out'""",
+                error,
+                message_id,
+            )
+            return True
 
         return self.transaction(run)
 

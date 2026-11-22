@@ -534,6 +534,7 @@ async def test_get_message_returns_a_stored_message_incoming_or_outgoing(env: En
         "body": "a question",
         "created_at": envelope["created_at"],
         "state": "unread",
+        "error": None,
     }
 
     sent = await client.call("send", {"to": "alice", "body": "out"})

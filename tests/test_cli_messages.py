@@ -721,3 +721,22 @@ async def test_reports_a_message_that_is_still_queued(nodes: Nodes) -> None:
         "Sent to carol: queued, not yet delivered (their service has not answered). "
         "Squawk keeps retrying for up to 7 days; you do not need to resend it. msg_id="
     )
+
+
+async def test_reports_a_message_the_recipient_refused_for_good(nodes: Nodes) -> None:
+    from squawk.crypto import ed25519_random_secret_key
+    from squawk.envelope import create_envelope
+    from squawk.identity import identity_from_secret_key
+
+    alice, bob = await nodes.paired()
+    # Bob already has this thread with Carol, so he refuses Alice's message in it.
+    carol = identity_from_secret_key("carol", ed25519_random_secret_key())
+    theirs = create_envelope(from_=carol.id, to=bob.id, body="from carol")
+    bob.daemon.store.save_incoming(theirs)
+    c = Captured(alice.home)
+    code = await run(["send", "bob", "hello", "--thread", theirs["thread_id"]], c.io)
+    assert code == 1
+    assert c.stdout.startswith(
+        "Not delivered: bob's squawk service refused the message "
+        "(refused: thread id already in use). It will not be retried. msg_id="
+    )

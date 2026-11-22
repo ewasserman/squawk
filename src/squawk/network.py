@@ -107,6 +107,35 @@ class LinkError(Exception):
     """Raised when a connection to another service fails or is refused."""
 
 
+class PermanentRefusal(LinkError):
+    """Raised when the recipient refused a message for a reason that sending
+    it again cannot change (see PERMANENT_NACK_REASONS)."""
+
+
+PERMANENT_NACK_REASONS = frozenset(
+    {
+        # Sent by `_receive` below.
+        "malformed",
+        "sender does not match the connection",
+        "id does not match the message",
+        # Sent from `Store.incoming_conflict`.
+        "message id already in use",
+        "thread id already in use",
+        # Error codes from opening the sealed message (squawk.envelope).
+        "tampered",
+        "wrong_recipient",
+        "bad_signature",
+        "sender_mismatch",
+        "replay",
+    }
+)
+"""Nack reasons that mean the recipient will never accept this message, so
+it is marked failed instead of retried. Other reasons can clear up and are
+retried: "stale" (the two clocks disagree), "not a paired contact" (the
+connection was admitted only for pairing), "error" (something went wrong on
+the receiving side) and any reason this version does not know."""
+
+
 def _log(text: str) -> None:
     print(f"squawkd: {text}", file=sys.stderr)
 
@@ -751,23 +780,31 @@ class NetworkTransport(Transport):
 
     async def _deliver_to(self, recipient: str, items: list[OutboundItem]) -> None:
         store = self._require_daemon().store
+
+        def retry_later(item: OutboundItem, error: str) -> None:
+            with contextlib.suppress(Exception):
+                if store.get_outbound(item.message_id) is not None:
+                    store.record_attempt(item.message_id, error=error)
+
         try:
             contact = store.get_contact(recipient)
             if contact is None or contact.trust != "paired":
                 raise LinkError("recipient is not a paired contact")
             link = await self._link_to(recipient)
-            results = await asyncio.gather(
-                *(self._send_one(link, item) for item in items), return_exceptions=True
-            )
-            failure = next((r for r in results if isinstance(r, BaseException)), None)
-            if failure is not None:
-                raise failure
         except Exception as err:
-            error = _error_text(err)
             for item in items:
+                retry_later(item, _error_text(err))
+            return
+        results = await asyncio.gather(
+            *(self._send_one(link, item) for item in items), return_exceptions=True
+        )
+        for item, result in zip(items, results, strict=True):
+            if isinstance(result, PermanentRefusal):
+                _log(f"message {item.message_id} failed: {result}")
                 with contextlib.suppress(Exception):
-                    if store.get_outbound(item.message_id) is not None:
-                        store.record_attempt(item.message_id, error=error)
+                    store.mark_failed(item.message_id, _error_text(result))
+            elif isinstance(result, BaseException):
+                retry_later(item, _error_text(result))
 
     async def _link_to(self, recipient: str) -> PeerLink:
         existing = self._links.get(recipient)
@@ -828,8 +865,13 @@ class NetworkTransport(Transport):
             if frame["t"] == "ack":
                 store.mark_acknowledged(item.message_id)
                 settle(None)
-            elif frame["t"] == "nack":
-                settle(f"refused: {_js_string(frame.get('error'))}")
+            elif frame["t"] == "nack" and not answer.done():
+                reason = frame.get("error")
+                text = f"refused: {_js_string(reason)}"
+                if isinstance(reason, str) and reason in PERMANENT_NACK_REASONS:
+                    answer.set_exception(PermanentRefusal(text))
+                else:
+                    settle(text)
 
         stop_frames = link.on_frame(on_frame)
         stop_close = link.on_close(lambda: settle("connection closed before acknowledgement"))

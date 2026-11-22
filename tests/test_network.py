@@ -159,14 +159,70 @@ async def test_refuses_an_incoming_id_that_belongs_to_a_message_from_someone_els
     carol.daemon.store.queue_outgoing(clash)
     carol.transport.kick()
 
+    # A refusal that cannot clear up: Carol's message fails at once, with the reason.
     def refused() -> bool:
-        item = carol.daemon.store.get_outbound(from_alice["id"])
-        return item is not None and "message id already in use" in (item.last_error or "")
+        mine = carol.daemon.store.get_message(from_alice["id"])
+        return mine is not None and mine.state == "failed"
 
     await wait_for(refused)
+    mine = carol.daemon.store.get_message(from_alice["id"])
+    assert mine is not None and mine.error == "refused: message id already in use"
+    assert carol.daemon.store.get_outbound(from_alice["id"]) is None
     stored = bob.daemon.store.get_message(from_alice["id"])
     assert stored is not None and stored.body == "from alice"
     assert carol.daemon.store.acked_at(from_alice["id"]) is None
+
+
+async def test_marks_a_message_failed_when_the_receiver_refuses_its_thread_for_good(
+    net: Net,
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    carol = await net.node("carol")
+    pair(alice, bob)
+    pair(carol, bob)
+
+    from_alice = await alice.daemon.send({"to": "bob", "body": "from alice"})
+    await wait_for(lambda: alice.daemon.store.acked_at(from_alice["id"]))
+    # Carol writes into the thread Bob has with Alice.
+    clash = create_envelope(
+        from_=carol.id, to=bob.id, body="from carol", thread_id=from_alice["thread_id"]
+    )
+    carol.daemon.store.queue_outgoing(clash)
+    carol.transport.kick()
+
+    def failed() -> bool:
+        mine = carol.daemon.store.get_message(clash["id"])
+        return mine is not None and mine.state == "failed"
+
+    await wait_for(failed)
+    # It is out of the queue, so it is not retried, and the reason is kept.
+    assert carol.daemon.store.get_outbound(clash["id"]) is None
+    assert carol.daemon.status()["queued_outbound"] == 0
+    stored = carol.daemon.store.get_message(clash["id"])
+    assert stored is not None
+    info = carol.daemon._message_info(stored)
+    assert info["state"] == "failed"
+    assert info["error"] == "refused: thread id already in use"
+    assert bob.daemon.store.get_message(clash["id"]) is None
+
+
+async def test_keeps_retrying_a_refusal_that_can_clear_up(
+    net: Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    # Alice's clock is an hour ahead of Bob's: Bob refuses the message as
+    # "stale", which clears up once the clock is set right.
+    ahead = int(time.time() * 1000) + 60 * 60_000
+    monkeypatch.setattr("squawk.network.now_ms", lambda: ahead)
+    sent = await alice.daemon.send({"to": "bob", "body": "from the future"})
+    await wait_for(lambda: attempts(alice, sent["id"]) >= 1)
+    item = alice.daemon.store.get_outbound(sent["id"])
+    assert item is not None and item.last_error == "refused: stale"
+    mine = alice.daemon.store.get_message(sent["id"])
+    assert mine is not None and mine.state == "queued" and mine.error is None
 
 
 async def test_falls_back_to_the_saved_address_when_the_advertised_one_is_someone_else(

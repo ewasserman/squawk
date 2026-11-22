@@ -23,7 +23,8 @@ Network transports (mDNS discovery, the WebSocket listener) plug in through
 messages to send), so routing does not depend on how a message travels.
 
 The methods squawk 0.1 also had take and return the same JSON as there; the
-session methods and `status`'s session list were added later.
+session methods, `status`'s session list and `get_message`'s "error" field
+were added later.
 """
 
 import asyncio
@@ -195,6 +196,10 @@ class MessageInfo(TypedDict):
     body: str
     created_at: str
     state: str
+    error: str | None
+    """For an outgoing message in state "failed", the reason the recipient
+    gave for refusing it, when it refused it for good; otherwise None. Not
+    sent by squawk 0.1."""
 
 
 class ContactInfo(TypedDict):
@@ -1114,6 +1119,7 @@ class Daemon:
             "body": message.body,
             "created_at": message.created_at,
             "state": message.state,
+            "error": message.error,
         }
 
     def _envelope_of(self, message: StoredMessage) -> Envelope:
