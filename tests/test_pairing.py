@@ -197,6 +197,50 @@ async def test_leaves_a_paired_contacts_message_connection_alone_while_waiting_t
         await waiting
 
 
+async def test_pairs_again_with_someone_already_saved_as_a_paired_contact(
+    nodes: Nodes,
+) -> None:
+    alice = await nodes.start("alice", 3000)
+    bob = await nodes.start("bob", 3000)
+    # An earlier pairing finished only on Bob's side: he has Alice saved,
+    # she does not have him.
+    bob.daemon.store.upsert_contact(alice.id, "alice", trust="paired")
+
+    bob_waits = asyncio.ensure_future(bob.pairing.accept())
+    await asyncio.sleep(0.02)
+    alice_offer = await asyncio.wait_for(alice.pairing.initiate(bob.address), 2)
+    bob_offer = await asyncio.wait_for(bob_waits, 2)
+    # The code is compared exactly as for a new pairing.
+    assert alice_offer["code"] == bob_offer["code"]
+    assert bob_offer["peer_key"] == alice.id
+
+    await asyncio.gather(
+        alice.pairing.confirm(alice_offer["pairing_id"], True),
+        bob.pairing.confirm(bob_offer["pairing_id"], True),
+    )
+    contact = alice.daemon.store.get_contact(bob.id)
+    assert contact is not None and contact.trust == "paired"
+    sent = await alice.daemon.send({"to": "bob", "body": "paired again"})
+    await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+
+
+async def test_re_pairing_saves_nothing_when_the_codes_do_not_match(nodes: Nodes) -> None:
+    alice = await nodes.start("alice", 3000)
+    bob = await nodes.start("bob", 3000)
+    bob.daemon.store.upsert_contact(alice.id, "alice", trust="paired")
+
+    bob_waits = asyncio.ensure_future(bob.pairing.accept())
+    await asyncio.sleep(0.02)
+    alice_offer = await asyncio.wait_for(alice.pairing.initiate(bob.address), 2)
+    bob_offer = await asyncio.wait_for(bob_waits, 2)
+    alice_done = asyncio.ensure_future(alice.pairing.confirm(alice_offer["pairing_id"], True))
+    with pytest.raises(PairingError, match="did not match"):
+        await bob.pairing.confirm(bob_offer["pairing_id"], False)
+    with pytest.raises(PairingError, match="cancelled"):
+        await alice_done
+    assert alice.daemon.store.get_contact(bob.id) is None
+
+
 async def test_refuses_an_unpaired_key_when_nobody_is_waiting_to_pair(nodes: Nodes) -> None:
     alice = await nodes.start("alice")
     bob = await nodes.start("bob")

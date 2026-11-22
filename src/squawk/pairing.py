@@ -26,6 +26,11 @@ other side's nonce, so it gets a single one-in-a-million guess at matching
 codes instead of trying keys until the codes happen to match. See
 docs/plan/security.md, threat 5.
 
+Pairing again with someone already saved as a paired contact (for example
+after a pairing that finished on only one side) runs the same steps: while
+`pair --accept` waits, a connection from a paired contact whose first frame
+is `pair-commit` is answered like any other pairing request.
+
 The pairing exchange is the same as in squawk 0.1, so services of either
 version can pair with each other.
 """
@@ -35,7 +40,7 @@ import hashlib
 import hmac
 import re
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar
 
@@ -199,14 +204,16 @@ class Pairing:
             return "pairing" if self._accepting is not None else False
 
         def on_link(link: PeerLink) -> None:
-            # Only links admitted for pairing: a paired contact connecting to
-            # deliver a message while we wait must be left alone.
-            if (
-                not link.outgoing
-                and self._accepting is not None
-                and link.authorization == "pairing"
-            ):
+            if link.outgoing or self._accepting is None:
+                return
+            if link.authorization == "pairing":
                 self._respond(link)
+            elif link.authorization == "paired":
+                # Someone already saved as a paired contact may be pairing
+                # again (an earlier pairing finished only on this side). Answer
+                # only if the first frame on the link is pair-commit; a contact
+                # connecting to deliver a message is left alone.
+                self._respond_if_pairing_again(link)
 
         self._transport.unpaired_policy = unpaired_policy
         self._transport.on_link = on_link
@@ -370,10 +377,29 @@ class Pairing:
         self._maybe_complete(session)
         return await asyncio.shield(session.done)
 
-    def _respond(self, link: PeerLink) -> None:
+    def _respond_if_pairing_again(self, link: PeerLink) -> None:
+        """Watches the first frame on a link from a paired contact: if it is
+        pair-commit, pairing runs exactly as for someone new (same code to
+        compare, same confirmation on both sides)."""
+
+        def first_frame(frame: Frame) -> None:
+            stop_watching()
+            if frame["t"] != "pair-commit" or self._accepting is None:
+                return
+            respond = self._respond(link)
+            if respond is not None:
+                # The responder's listener was added during this frame, so
+                # it has not seen the frame yet.
+                respond(frame)
+
+        stop_watching = link.on_frame(first_frame)
+
+    def _respond(self, link: PeerLink) -> Callable[[Frame], None] | None:
+        """Answers a pairing request on `link`. Returns the frame listener it
+        added (None if nobody is waiting to pair any more)."""
         waiting = self._accepting
         if waiting is None:
-            return
+            return None
         self_identity = self._daemon.identity
         session = self._new_session("responder", link, None)
 
@@ -428,6 +454,7 @@ class Pairing:
                 self._abort(session, err)
 
         link.on_frame(on_frame)
+        return on_frame
 
     def _new_session(
         self,
