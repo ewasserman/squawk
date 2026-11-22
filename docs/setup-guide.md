@@ -223,7 +223,8 @@ discovery on.
 Now pair with `squawk invite` and `squawk pair --code` as above, and use
 squawk from Claude Code as in step 5. To see a message wait at the relay,
 have one person run `squawk daemon stop`, send them a message, then
-`squawk daemon start` again: it arrives within a few seconds.
+`SQUAWK_NO_MDNS=1 squawk daemon start` (with discovery still off, so the
+message has to come through the relay): it arrives within a few seconds.
 
 When you are done, on both Macs: `squawk relay set --off`, then
 `squawk daemon stop && squawk daemon start` to turn discovery back on. On

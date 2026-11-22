@@ -171,7 +171,9 @@ async def test_two_people_on_different_networks_talk_through_the_relay(
     offline = await world.cli(alice, "sessions", "bob")
     assert offline.code != 0
     assert "bob is offline" in offline.err
-    assert "(local network: " in offline.err
+    # Discovery is off, so the local-network attempt only found nothing:
+    # the error does not repeat that in brackets.
+    assert "not on the network)" not in offline.err
     waiting = await world.cli(alice, "send", "bob", "ping while you were away")
     assert waiting.code == 0, waiting.err
     assert "waiting at the relay" in waiting.out
