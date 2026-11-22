@@ -157,6 +157,8 @@ async def test_two_people_on_different_networks_talk_through_the_relay(
     assert "delivered to their squawk service" in sent.out
     [received] = await wait_for(lambda: bob_api.messages or None)
     assert body_of(received) == "is the build green?"
+    # The text Bob's session gets does not claim a route the message did not take.
+    assert "local network" not in received
     replied = await world.cli(bob, "reply", msg_id_of(received), "yes, green", session=bob_api)
     assert replied.code == 0, replied.err
     assert "delivered to their squawk service" in replied.out
@@ -169,6 +171,7 @@ async def test_two_people_on_different_networks_talk_through_the_relay(
     offline = await world.cli(alice, "sessions", "bob")
     assert offline.code != 0
     assert "bob is offline" in offline.err
+    assert "(local network: " in offline.err
     waiting = await world.cli(alice, "send", "bob", "ping while you were away")
     assert waiting.code == 0, waiting.err
     assert "waiting at the relay" in waiting.out

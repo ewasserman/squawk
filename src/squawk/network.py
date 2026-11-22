@@ -1195,7 +1195,7 @@ class NetworkTransport(Transport):
                 if err.reason == "offline":
                     raise LinkError(
                         f"{contact.name} is offline: their squawk service is not on this "
-                        f"network and not connected to the relay ({direct_error})"
+                        f"network and not connected to the relay (local network: {direct_error})"
                     ) from None
                 if err.reason == "not-allowed":
                     raise LinkError(
