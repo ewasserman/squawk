@@ -6,7 +6,10 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+    "ifaddr>=0.2.0",
     "pynacl>=1.5",
+    "websockets>=17.4",
+    "zeroconf>=0.154.0",
 ]
 
 [project.scripts]
@@ -16,6 +19,7 @@ squawk = "squawk.cli:main"
 dev = [
     "mypy>=1.13",
     "pytest>=8.3",
+    "pytest-asyncio>=1.5.0",
     "ruff>=0.8",
 ]
 
@@ -44,3 +48,9 @@ mypy_path = "src"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+markers = [
+    "mdns: uses real multicast DNS on this machine; skipped when CI is set unless SQUAWK_TEST_MDNS=1",
+]
