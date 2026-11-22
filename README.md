@@ -120,3 +120,26 @@ uv run squawk <command>   # the CLI from the sources
 
 Set `SQUAWK_HOME` to use a different directory than `~/.config/squawk`, for
 example to run two services on one machine.
+
+### A relay for local testing
+
+Services on different networks exchange messages through a relay server
+(see [docs/plan/relay.md](docs/plan/relay.md)). To run one locally in
+Docker:
+
+```bash
+docker compose up relay        # add -d to run it in the background
+curl localhost:8765/healthz    # {"status":"ok","version":"..."}
+```
+
+It listens on `ws://localhost:8765` and keeps its data (its key, mailboxes
+and waiting messages) in the `relay-data` Docker volume, so it survives
+`docker compose restart relay`. `docker compose down -v` deletes the data.
+
+Without Docker, `uv run squawk relay serve` runs the same server from the
+sources (`--host`, `--port`, `--data`).
+
+The local relay is plain `ws://`, not encrypted with TLS. A service refuses
+a `ws://` relay URL unless you allow it explicitly with `--allow-plain` when
+setting the relay. Messages are still sealed end to end; what plain `ws://`
+exposes is who talks to whom. A deployed relay uses `wss://`.

@@ -1,0 +1,14 @@
+# A relay for local testing: `docker compose up relay`, then point services
+# at ws://localhost:8765 (plain ws:// must be allowed explicitly; see README).
+services:
+  relay:
+    build: .
+    image: squawk-relay:dev
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - relay-data:/data
+    restart: unless-stopped
+
+volumes:
+  relay-data:
