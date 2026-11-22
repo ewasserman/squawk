@@ -213,7 +213,7 @@ have a 7-day window instead (threat 11). A message
 waiting in the sender's queue is signed again with a new send time at each
 attempt, so a long wait does not make it undeliverable; a message still
 undelivered after 7 days is marked failed. Seen ids are stored in the
-database, so this survives a restart, and are kept for 7 days and 10
+database, so this survives a restart, and are kept for 7 days and 15
 minutes, longer than any copy could still pass the time check on either
 route. Ids are kept per sender, and an incoming message whose id or
 thread already belongs to another contact is refused, so one contact cannot
@@ -260,8 +260,8 @@ delivers it again later.
 
 **Mitigations.** A message held at the relay cannot be signed again before
 each delivery, so its signed send time can be up to 7 days old when it
-arrives; relayed messages are accepted up to 7 days and 5 minutes after
-that time. The recipient keeps the ids it has accepted for 7 days and 10
+arrives; relayed messages are accepted up to 7 days and 10 minutes after
+that time. The recipient keeps the ids it has accepted for 7 days and 15
 minutes, so a copy delivered again inside the window is refused as a
 replay and one delivered after it is refused as too old. The same seen ids
 apply to both routes, so a relayed message cannot be replayed through the
@@ -382,7 +382,7 @@ service. *Task 3.*
 | 8 | Replayed messages | Unique ids remembered for 7 days; 5-minute timestamp window on the local network | 4, 5 |
 | 9 | Relay reads messages | Sealed end to end; the relay holds no key that opens them | 1, 3 |
 | 10 | Relay forges messages or receipts | Signed by sender or recipient; recipient checks the signed sender is a contact | 2, 5 |
-| 11 | Relay replays messages | Ids remembered 7 days and 10 minutes; relayed messages older than 7 days refused | 2 |
+| 11 | Relay replays messages | Ids remembered 7 days and 15 minutes; relayed messages older than 7 days refused | 2 |
 | 12 | Relay drops or delays messages | Not preventable; signed receipts, *relayed* state, failure after 7 days, LAN first | 2, 6, 9 |
 | 13 | Relay in the middle of pairing | 6-digit code compared over a call; one-time 10-minute invite codes | 3, 8, 11 |
 | 14 | Strangers reaching you through the relay | Allow list of paired contacts; recipient refuses unknown keys | 3, 5 |

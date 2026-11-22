@@ -264,7 +264,7 @@ class TestReplayGuard:
         env = message()
         guard.accept(env)
         # Kept long enough to refuse a replay through a relay (7 days).
-        now += 7 * DAY + 10 * 60_000
+        now += 7 * DAY + 15 * 60_000
         guard.prune()
         assert guard.seen.has(f"{alice.id} {env['id']}")
         now += 1
@@ -299,9 +299,9 @@ class TestRelayedMessages:
 
     def test_refuses_a_relayed_message_older_than_the_relay_keeps_them(self) -> None:
         guard = ReplayGuard(now=clock)
-        edge = message(created_at=NOW - 7 * DAY - 5 * 60_000)
+        edge = message(created_at=NOW - 7 * DAY - 10 * 60_000)
         assert open_sealed(seal(edge, alice), bob, guard, route="relay")["id"] == edge["id"]
-        too_old = message(created_at=NOW - 7 * DAY - 5 * 60_000 - 1)
+        too_old = message(created_at=NOW - 7 * DAY - 10 * 60_000 - 1)
         with pytest.raises(EnvelopeError, match="longer ago than a relay keeps") as info:
             open_sealed(seal(too_old, alice), bob, guard, route="relay")
         assert info.value.code == "stale"
@@ -310,6 +310,14 @@ class TestRelayedMessages:
         guard = ReplayGuard(now=clock)
         future = message(created_at=NOW + 5 * 60_000 + 1)
         expect_code(lambda: open_sealed(seal(future, alice), bob, guard, route="relay"), "stale")
+
+
+class TestAcceptRoute:
+    def test_accept_uses_the_relay_allowance_when_told(self) -> None:
+        guard = ReplayGuard(now=clock)
+        old = message(created_at=NOW - 6 * DAY)
+        guard.accept(old, route="relay")
+        expect_code(lambda: guard.accept(old, route="relay"), "replay")
 
 
 class TestReceipts:

@@ -79,7 +79,16 @@ def _is_protocol_version(value: object) -> bool:
     )
 
 
-def _remote_ip(connection: ServerConnection) -> str:
+def _remote_ip(connection: ServerConnection, trust_forwarded_for: bool = False) -> str:
+    """The client's IP address, used for per-address limits. Behind a proxy
+    (for TLS) every connection comes from the proxy, so with
+    `trust_forwarded_for` the last address in the X-Forwarded-For header,
+    the one the proxy added, is used instead."""
+    if trust_forwarded_for and connection.request is not None:
+        forwarded = connection.request.headers.get("X-Forwarded-For", "")
+        last = forwarded.rsplit(",", 1)[-1].strip()
+        if last:
+            return last
     address = connection.remote_address
     if isinstance(address, tuple) and address:
         return str(address[0])
@@ -93,7 +102,9 @@ class _Client:
     """One authenticated connection. Frames to it go through a queue, so that
     a slow reader never holds up the code handling another connection."""
 
-    def __init__(self, ws: ServerConnection, key: str, ip: str) -> None:
+    def __init__(
+        self, ws: ServerConnection, key: str, ip: str, max_queued_bytes: int = 8 << 20
+    ) -> None:
         self.ws = ws
         self.key = key
         self.ip = ip
@@ -112,11 +123,24 @@ class _Client:
         self.dropped = False
         """True once the relay has stopped treating this as the key's connection."""
         self._queue: asyncio.Queue[str | tuple[int, str]] = asyncio.Queue()
+        self._queued_bytes = 0
+        self._max_queued_bytes = max_queued_bytes
         self._closing = False
 
     def send(self, frame: Frame) -> None:
-        if not self._closing:
-            self._queue.put_nowait(jsontext.stringify(frame))
+        if self._closing:
+            return
+        text = jsontext.stringify(frame)
+        self._queued_bytes += len(text)
+        if self._queued_bytes > self._max_queued_bytes:
+            # The client is not reading. Closing politely would wait behind
+            # everything already queued, so drop the connection at once.
+            self._closing = True
+            _log(f"dropping a connection that stopped reading ({self.key})")
+            if self.ws.transport is not None:
+                self.ws.transport.abort()
+            return
+        self._queue.put_nowait(text)
 
     def close(self, code: int, reason: str) -> None:
         """Closes the connection after the frames already queued."""
@@ -131,6 +155,7 @@ class _Client:
                 if isinstance(item, tuple):
                     await self.ws.close(*item)
                     return
+                self._queued_bytes -= len(item)
                 await self.ws.send(item)
 
 
@@ -169,8 +194,10 @@ class RelayServer:
         port: int = 8765,
         limits: RelayLimits | None = None,
         now: Callable[[], int] | None = None,
+        trust_forwarded_for: bool = False,
     ) -> None:
         self._data_dir = data_dir
+        self._trust_forwarded_for = trust_forwarded_for
         self._host = host
         self._port = port
         self.limits = RelayLimits() if limits is None else limits
@@ -296,7 +323,9 @@ class RelayServer:
         if request.headers.get("Upgrade", "").lower() != "websocket":
             return connection.respond(426, "the squawk relay speaks WebSocket\n")
         retry_after = self._rates.take(
-            _CONNECT, _remote_ip(connection), self.limits.connect_rate_per_ip
+            _CONNECT,
+            _remote_ip(connection, self._trust_forwarded_for),
+            self.limits.connect_rate_per_ip,
         )
         if retry_after is not None:
             response = connection.respond(429, "too many connections\n")
@@ -308,7 +337,9 @@ class RelayServer:
         key = await self._authenticate(ws)
         if key is None:
             return
-        client = _Client(ws, key, _remote_ip(ws))
+        client = _Client(
+            ws, key, _remote_ip(ws, self._trust_forwarded_for), self.limits.max_queued_bytes
+        )
         writer = asyncio.create_task(client.write_loop())
         try:
             self._admit(client)
@@ -387,9 +418,11 @@ class RelayServer:
         client.dropped = True
         if self._clients.get(client.key) is client:
             del self._clients[client.key]
-        if client.invite_hash is not None:
-            if self.store.invite_creator(client.invite_hash) == client.key:
-                self.store.delete_invites_of(client.key)
+        if client.invite_hash is not None and self._store is not None:
+            # (The store is gone if the relay is stopping; invites are all
+            # deleted at the next start anyway.)
+            if self._store.invite_creator(client.invite_hash) == client.key:
+                self._store.delete_invites_of(client.key)
             client.invite_hash = None
         for room_id in list(client.rooms):
             room = self._rooms.get(room_id)
@@ -470,7 +503,9 @@ class RelayServer:
             return
         store = self.store
         recipient = sealed["to"]
-        if not store.has_message(client.key, message_id):
+        if not store.has_message(client.key, message_id, recipient, self._oldest_kept()):
+            # A copy that expired or names another recipient is replaced.
+            store.delete_message_copies(client.key, message_id)
             text = jsontext.stringify(sealed)
             usage = store.usage(recipient, self._oldest_kept())
             if (

@@ -1,5 +1,6 @@
 # The squawk relay server. For local testing: `docker compose up relay`.
-# In production a proxy in front of it terminates TLS (wss://).
+# In production a proxy in front of it terminates TLS (wss://); then add
+# --trust-forwarded-for so per-address limits see the real client address.
 FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.5 /uv /usr/local/bin/uv

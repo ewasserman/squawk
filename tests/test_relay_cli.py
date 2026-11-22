@@ -68,3 +68,11 @@ async def test_relay_serve_refuses_a_bad_port(tmp_path: Any) -> None:
 def test_relay_data_directory_defaults() -> None:
     assert relay_data_dir({"SQUAWK_RELAY_DATA": "/srv/relay", "SQUAWK_HOME": "/h"}) == "/srv/relay"
     assert relay_data_dir({"SQUAWK_HOME": "/h"}) == os.path.join("/h", "relay")
+
+
+async def test_relay_serve_refuses_a_port_that_is_not_ascii_digits(tmp_path: Any) -> None:
+    out: list[str] = []
+    err: list[str] = []
+    io = CliIo(stdout=out.append, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", "--port", "\u00b2"], io) == 2
+    assert "is not a port number" in "".join(err)

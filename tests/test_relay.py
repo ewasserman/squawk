@@ -433,6 +433,25 @@ async def test_the_same_sender_and_id_is_stored_once(relay: RelayServer) -> None
     await b.close()
 
 
+async def test_a_repeat_of_an_expired_copy_is_stored_again(
+    relay: RelayServer, clock: Clock
+) -> None:
+    b = await login(relay, bob)
+    await b.allow(alice)
+    await b.close()
+    a = await login(relay, alice)
+    sealed = fake_sealed(alice, bob)
+    await a.deposit(bob, "again", sealed=sealed)
+    # Past the 7 days, but before the purge has deleted it.
+    clock.advance(7 * DAY_MS + 1)
+    assert (await a.deposit(bob, "again", sealed=sealed))["t"] == "deposited"
+    relay.purge()
+    b = await login(relay, bob)
+    assert b.ok["waiting"] == 1
+    await a.close()
+    await b.close()
+
+
 async def test_new_deposits_are_pushed_to_a_fetching_client(relay: RelayServer) -> None:
     b = await login(relay, bob)
     await b.allow(alice)
@@ -670,6 +689,42 @@ async def test_new_connections_from_one_address_are_rate_limited(
     clock.advance(MINUTE_MS)
     ws, _hello = await open_ws(relay)
     await ws.close()
+
+
+async def test_behind_a_proxy_the_forwarded_address_is_rate_limited(
+    data_dir: str, clock: Clock
+) -> None:
+    relay = RelayServer(
+        data_dir,
+        port=0,
+        limits=RelayLimits(connect_rate_per_ip=Rate(1, MINUTE_MS)),
+        now=clock,
+        trust_forwarded_for=True,
+    )
+    await relay.start()
+    try:
+        url = f"ws://127.0.0.1:{relay.port}"
+        for address in ("10.0.0.1", "10.0.0.2"):
+            ws = await connect(url, additional_headers={"X-Forwarded-For": f"1.1.1.1, {address}"})
+            await ws.close()
+        with pytest.raises(InvalidStatus):
+            await connect(url, additional_headers={"X-Forwarded-For": "10.0.0.1"})
+    finally:
+        await relay.stop()
+
+
+async def test_a_client_that_stops_reading_is_disconnected(start_relay: RelayFactory) -> None:
+    relay = await start_relay(RelayLimits(max_queued_bytes=2_000))
+    a = await login(relay, alice)
+    # Frames are queued faster than they can be written, as when the client
+    # stops reading; past the limit the relay drops the connection instead of
+    # queueing more.
+    client = relay._clients[alice.id]
+    for _ in range(40):
+        client.send({"t": "refused", "req": None, "reason": "malformed", "pad": "x" * 100})
+    with pytest.raises(ConnectionClosed):
+        while True:
+            await asyncio.wait_for(a.ws.recv(), 3)
 
 
 # Forward.

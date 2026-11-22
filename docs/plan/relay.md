@@ -293,9 +293,12 @@ one from the local network. The differences:
 - **Freshness.** On the local network a message whose signed send time is
   more than 5 minutes from the local clock is refused, and a waiting message
   is signed again at each attempt. A message held by the relay cannot be
-  signed again, so through the relay a send time up to **7 days and 5
+  signed again, so through the relay a send time up to **7 days and 10
   minutes** in the past (and at most 5 minutes in the future) is accepted.
-- **Replays.** Seen message ids are kept for 7 days and 10 minutes, for both
+  The 10 minutes allow for two clock differences: the relay's 7 days are
+  counted by the relay's clock, the send time by the sender's and the age
+  by the recipient's.
+- **Replays.** Seen message ids are kept for 7 days and 15 minutes, for both
   routes, so an id accepted once is refused for the whole time any copy of
   it could still be accepted. After that, a copy is too old to pass the
   freshness check.
@@ -338,6 +341,15 @@ All limits are enforced by the relay; the client keeps within them.
 
 Expired messages and invites are purged once a minute and when the relay
 starts.
+
+A client that stops reading while more than 8 MiB of frames wait to be
+written to it is disconnected.
+
+Limits "per IP address" use the address the connection comes from. Behind a
+proxy that terminates TLS, every connection comes from the proxy, so the
+relay is started with `--trust-forwarded-for` and uses the last address in
+the `X-Forwarded-For` header the proxy adds instead. Without a proxy that
+option must stay off, or a client could claim any address.
 
 ## What the relay stores
 

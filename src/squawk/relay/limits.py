@@ -53,6 +53,10 @@ class RelayLimits:
     max_allow_list: int = 1_000
     allow_rate: Rate = field(default_factory=lambda: Rate(30, MINUTE_MS))
     max_outstanding: int = 32
+    max_queued_bytes: int = 8 * (1 << 20)
+    """Frames waiting to be written to one connection. A client that stops
+    reading while more than this is waiting is disconnected, so it cannot
+    make the relay hold an ever-growing amount of memory."""
     """Deliveries sent on one connection and not yet deleted."""
     invite_create_rate: Rate = field(default_factory=lambda: Rate(10, HOUR_MS))
     invite_join_rate_per_connection: Rate = field(default_factory=lambda: Rate(10, MINUTE_MS))

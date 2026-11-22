@@ -196,11 +196,21 @@ class RelayStore:
 
     # Messages.
 
-    def has_message(self, sender: str, message_id: str) -> bool:
+    def has_message(self, sender: str, message_id: str, recipient: str, not_before: int) -> bool:
+        """True if a message from `sender` with this id waits for `recipient`
+        and arrived at or after `not_before` (so it has not expired)."""
         row = self.db.execute(
-            "SELECT 1 FROM messages WHERE sender = ? AND message_id = ?", (sender, message_id)
+            "SELECT 1 FROM messages WHERE sender = ? AND message_id = ?"
+            " AND recipient = ? AND arrived_at_ms >= ?",
+            (sender, message_id, recipient, not_before),
         ).fetchone()
         return row is not None
+
+    def delete_message_copies(self, sender: str, message_id: str) -> None:
+        """Deletes any stored message from `sender` with this id."""
+        self.db.execute(
+            "DELETE FROM messages WHERE sender = ? AND message_id = ?", (sender, message_id)
+        )
 
     def usage(self, recipient: str, not_before: int) -> MailboxUsage:
         """How many messages, and how many bytes of them, wait for `recipient`

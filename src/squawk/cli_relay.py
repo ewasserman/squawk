@@ -32,17 +32,28 @@ def relay_data_dir(env: Mapping[str, str]) -> str:
 
 async def _serve(args: list[str], io: CliIo) -> int:
     values, _ = parse_args(
-        args, {"host": Opt("string"), "port": Opt("string", "p"), "data": Opt("string")}
+        args,
+        {
+            "host": Opt("string"),
+            "port": Opt("string", "p"),
+            "data": Opt("string"),
+            "trust-forwarded-for": Opt("boolean"),
+        },
     )
     port_text = string_value(values, "port")
     port = DEFAULT_PORT
     if port_text is not None:
-        if not port_text.isdigit() or int(port_text) > 65535:
+        if not (port_text.isascii() and port_text.isdigit()) or int(port_text) > 65535:
             raise ParseArgsError(f'"{port_text}" is not a port number (0-65535)')
         port = int(port_text)
     host = string_value(values, "host") or DEFAULT_HOST
     data_dir = string_value(values, "data") or relay_data_dir(io.env)
-    relay = RelayServer(data_dir, host=host, port=port)
+    relay = RelayServer(
+        data_dir,
+        host=host,
+        port=port,
+        trust_forwarded_for=values.get("trust-forwarded-for") is True,
+    )
     await relay.start()
     stop = io.stop if io.stop is not None else asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -66,7 +77,9 @@ async def _serve(args: list[str], io: CliIo) -> int:
 
 
 RELAY_SUBCOMMANDS: dict[str, Command] = {
-    "serve": Command("run the relay server (--host, --port, --data)", _serve),
+    "serve": Command(
+        "run the relay server (--host, --port, --data, --trust-forwarded-for)", _serve
+    ),
 }
 
 
