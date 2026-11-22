@@ -36,8 +36,8 @@ def _write_stdout(text: str) -> None:
         sys.stdout.flush()
     except BrokenPipeError:
         # Output goes to a program that stopped reading (such as
-        # `squawk tail | head`): exit at once and quietly, as the Node
-        # version does. Raising would not work everywhere, because some
+        # `squawk tail | head`): exit at once and quietly.
+        # Raising would not work everywhere, because some
         # output is written from inside the socket client's callbacks.
         quiet_stdout()
         os._exit(0)

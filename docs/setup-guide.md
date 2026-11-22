@@ -18,7 +18,7 @@ own has nobody to talk to.
 
 ```bash
 uv tool install git+https://github.com/ewasserman/squawk
-squawk --version     # prints 0.1.0
+squawk --version     # prints 0.2.0
 ```
 
 If the shell says `command not found: squawk`, uv's folder for commands is

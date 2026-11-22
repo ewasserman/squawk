@@ -18,10 +18,9 @@ def to_base64url(data: bytes) -> str:
 def from_base64url(text: str) -> bytes:
     """Decodes a base64url string (padding optional) to bytes.
 
-    This decodes the way Node's `Buffer.from(text, "base64url")` does, so the
-    two versions of squawk read the same text as the same bytes: decoding
-    stops at the first "=", characters outside the base64 alphabets are
-    skipped, both the "+/" and "-_" alphabets are accepted, a single
+    The decoding rules are fixed, so every squawk peer reads the same text as
+    the same bytes: decoding stops at the first "=", characters outside the
+    base64 alphabets are skipped, both the "+/" and "-_" alphabets are accepted, a single
     leftover character at the end is ignored, and unused low bits in the last
     character are ignored.
     """

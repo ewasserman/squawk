@@ -1,11 +1,12 @@
-"""Timestamps in the same text form as the Node version.
+"""Timestamps in squawk's text form.
 
-Squawk writes times as ISO 8601 text in UTC with milliseconds, exactly as
-JavaScript's `Date.prototype.toISOString` does ("2026-11-21T12:00:00.000Z"),
-and reads them back to milliseconds since the epoch as `Date.parse` does.
-The arithmetic is done on whole numbers rather than with `datetime`, so that
-years `datetime` cannot hold (such as year 0, which an offset can produce)
-give the same result as in JavaScript.
+Squawk writes times as ISO 8601 text in UTC, always with exactly three
+digits of milliseconds and a "Z" ("2026-11-21T12:00:00.000Z"; this is the
+format of JavaScript's `Date.prototype.toISOString`), and reads them back to
+milliseconds since the epoch. The exact text matters because signatures
+cover it and stored timestamps are compared as text. The arithmetic is done
+on whole numbers rather than with `datetime`, so that years `datetime`
+cannot hold (such as year 0, which an offset can produce) still work.
 """
 
 import re
@@ -16,8 +17,7 @@ _MS_PER_DAY = 86_400_000
 
 # The form envelopes allow for created_at and sent_at: a date and a time with
 # seconds, optional fractional seconds, and "Z" or a "+hh:mm"/"-hh:mm" offset.
-# The same pattern as zod's `z.iso.datetime({ offset: true })`, which
-# also checks month lengths and leap days.
+# The pattern also checks month lengths and leap days.
 _DATE = (
     r"(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29"
     r"|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)"
@@ -65,7 +65,7 @@ def parse_iso_ms(text: str) -> int | None:
     """Milliseconds since the epoch for an ISO date and time, or None if it is not one.
 
     Accepts the form `is_iso_datetime` describes. Fractional seconds beyond
-    milliseconds are dropped, as `Date.parse` does.
+    milliseconds are dropped (not rounded).
     """
     if not is_iso_datetime(text):
         return None
@@ -86,7 +86,7 @@ def parse_iso_ms(text: str) -> int | None:
 
 
 def iso_from_ms(ms: int) -> str:
-    """The text `new Date(ms).toISOString()` gives, e.g. "2026-11-21T12:00:00.000Z"."""
+    """`ms` as squawk's timestamp text, e.g. "2026-11-21T12:00:00.000Z"."""
     days, rest = divmod(ms, _MS_PER_DAY)
     year, month, day = _civil_from_days(days)
     seconds, millis = divmod(rest, 1000)
@@ -109,5 +109,5 @@ def ms_from_datetime(value: datetime) -> int:
 
 
 def now_ms() -> int:
-    """The current time in milliseconds since the epoch, like JavaScript's `Date.now()`."""
+    """The current time in whole milliseconds since the epoch."""
     return time.time_ns() // 1_000_000

@@ -60,25 +60,17 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-Node 24, pnpm, TypeScript (ESM, run directly by Node with type stripping in development).
-
-```bash
-pnpm install
-pnpm lint        # Biome (pnpm format to auto-fix)
-pnpm typecheck   # tsc --noEmit
-pnpm test        # Vitest
-```
-
-All three must pass before committing. CI runs the same three commands.
-
-The Python port (src/squawk/, tests in tests/) uses uv:
+Python 3.12+, managed with uv. The package is in `src/squawk/`, tests in `tests/`.
 
 ```bash
 uv sync
-uv run ruff check && uv run ruff format --check && uv run mypy && uv run pytest
+uv run ruff check          # lint (uv run ruff format to auto-fix formatting)
+uv run ruff format --check
+uv run mypy                # type check
+uv run pytest
 ```
 
-These must pass too; CI runs them in a separate job.
+All four must pass before committing. CI runs the same commands.
 
 ## Architecture Overview
 

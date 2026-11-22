@@ -35,6 +35,7 @@ import threading
 from collections.abc import Callable, Iterable
 from typing import Literal
 
+from squawk import jsontext
 from squawk.envelope import Envelope
 from squawk.store import InboundPolicy, SessionRecord
 
@@ -107,15 +108,32 @@ def find_session(sessions: Iterable[SessionRecord], wanted: str | None) -> Sessi
     return by_repo[0] if len(by_repo) == 1 else None
 
 
-def unique_label(base: str, taken: Iterable[str]) -> str:
-    """`base`, or `base-2`, `base-3`, ... if it is already in `taken`."""
+def _shortened(text: str, max_length: int) -> str:
+    """`text` cut to at most `max_length` UTF-16 code units, without leaving
+    half of a character that takes two units."""
+    if jsontext.js_length(text) <= max_length:
+        return text
+    units = text.encode("utf-16-le", "surrogatepass")[: 2 * max_length]
+    if units and 0xD800 <= int.from_bytes(units[-2:], "little") <= 0xDBFF:
+        units = units[:-2]
+    return units.decode("utf-16-le", "surrogatepass")
+
+
+def unique_label(base: str, taken: Iterable[str], max_length: int = 256) -> str:
+    """`base`, or `base-2`, `base-3`, ... if it is already in `taken`. When
+    the number would make the label longer than `max_length` (counted in
+    UTF-16 code units, like every squawk length limit), `base` is shortened
+    so that the whole label fits."""
     used = set(taken)
     if base not in used:
         return base
     n = 2
-    while f"{base}-{n}" in used:
+    while True:
+        suffix = f"-{n}"
+        label = _shortened(base, max_length - len(suffix)) + suffix
+        if label not in used:
+            return label
         n += 1
-    return f"{base}-{n}"
 
 
 # The text a session receives

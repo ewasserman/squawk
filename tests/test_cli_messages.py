@@ -1,6 +1,5 @@
-"""Tests for `squawk send`, `reply`, `tail`, `peers` and `status` (the Python
-version of test/cli-messages.test.ts, plus `reply`, the confirmation step and
-the delivery report, which are new in the Python version)."""
+"""Tests for `squawk send`, `reply`, `tail`, `peers` and `status`,
+including the confirmation step and the delivery report."""
 
 import asyncio
 import json
@@ -216,7 +215,7 @@ async def test_prints_a_sent_message_as_one_json_line_in_the_other_services_tail
         "session": "review",
         "body": "hi bob",
     }
-    # The keys come in the Node version's order.
+    # The keys come in a fixed order.
     assert list(json.loads(tailing.out[0])) == [
         "type",
         "note",
@@ -721,4 +720,23 @@ async def test_reports_a_message_that_is_still_queued(nodes: Nodes) -> None:
     assert c.stdout.startswith(
         "Sent to carol: queued, not yet delivered (their service has not answered). "
         "Squawk keeps retrying for up to 7 days; you do not need to resend it. msg_id="
+    )
+
+
+async def test_reports_a_message_the_recipient_refused_for_good(nodes: Nodes) -> None:
+    from squawk.crypto import ed25519_random_secret_key
+    from squawk.envelope import create_envelope
+    from squawk.identity import identity_from_secret_key
+
+    alice, bob = await nodes.paired()
+    # Bob already has this thread with Carol, so he refuses Alice's message in it.
+    carol = identity_from_secret_key("carol", ed25519_random_secret_key())
+    theirs = create_envelope(from_=carol.id, to=bob.id, body="from carol")
+    bob.daemon.store.save_incoming(theirs)
+    c = Captured(alice.home)
+    code = await run(["send", "bob", "hello", "--thread", theirs["thread_id"]], c.io)
+    assert code == 1
+    assert c.stdout.startswith(
+        "Not delivered: bob's squawk service refused the message "
+        "(refused: thread id already in use). It will not be retried. msg_id="
     )

@@ -1,5 +1,4 @@
-"""Tests for `squawk pair`, `contacts`, `auto-send`, `block` and `unblock`
-(the Python version of test/cli-contacts.test.ts, plus `auto-send --default`)."""
+"""Tests for `squawk pair`, `contacts`, `auto-send`, `block` and `unblock`."""
 
 import asyncio
 import json

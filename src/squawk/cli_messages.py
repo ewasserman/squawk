@@ -49,7 +49,7 @@ MESSAGE_NOTE = (
 def to_tail_line(notification: MessageNotification) -> dict[str, Any]:
     """Converts a `message` notification from the service into a tail line.
 
-    Every key is always present, in the Node version's order. `from_name`,
+    Every key is always present, in a fixed order. `from_name`,
     `in_reply_to` and `session` are None (null in JSON) when they have no
     value: the sender is not a contact, the message is not a reply, or no
     session was addressed.
@@ -278,6 +278,8 @@ SEND_USAGE = (
     'Usage: squawk send <peer> "<text>" [--session <label>] [--kind text|question|answer]'
     " [--thread <id>] [--reply-to <msg id>]\n"
     "       Reads the message from stdin when the text is missing or is -.\n"
+    "       --thread must be a conversation with the same person; --reply-to a message\n"
+    "       from someone else starts a new conversation.\n"
 )
 
 REPLY_USAGE = (
@@ -312,19 +314,20 @@ def _find_contact(contacts: list[ContactInfo], to: str) -> ContactInfo | str:
     )
 
 
-async def _wait_for_ack(client: RpcClient, id: str, wait_s: float) -> bool:
-    """Waits up to `wait_s` seconds for the recipient to acknowledge a sent message."""
+async def _wait_for_ack(client: RpcClient, id: str, wait_s: float) -> MessageInfo | None:
+    """Waits up to `wait_s` seconds for the recipient to acknowledge a sent
+    message, or refuse it for good. Returns the message as it then is, or
+    None if it could not be read."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait_s
     while True:
         try:
             result = await client.call("get_message", {"id": id})
         except (RpcError, ConnectionError):
-            return False
-        if cast(MessageInfo, result["message"])["state"] == "acked":
-            return True
-        if loop.time() >= deadline:
-            return False
+            return None
+        message = cast(MessageInfo, result["message"])
+        if message["state"] in ("acked", "failed") or loop.time() >= deadline:
+            return message
         await asyncio.sleep(0.1)
 
 
@@ -384,22 +387,32 @@ async def _confirm_and_send(command: str, client: RpcClient, draft: Draft, io: C
     if from_socket:
         params["from_socket"] = from_socket
     sent = await client.call("send", params)
-    delivered = await _wait_for_ack(client, sent["id"], io.ack_wait_s)
+    message = await _wait_for_ack(client, sent["id"], io.ack_wait_s)
+    state = None if message is None else message["state"]
     name = draft.to_name
-    status = (
-        f"Sent to {name} and delivered to their squawk service "
-        "(they have not necessarily read it yet)."
-        if delivered
-        else f"Sent to {name}: queued, not yet delivered (their service has not answered). "
-        "Squawk keeps retrying for up to 7 days; you do not need to resend it."
-    )
+    if state == "acked":
+        status = (
+            f"Sent to {name} and delivered to their squawk service "
+            "(they have not necessarily read it yet)."
+        )
+    elif state == "failed":
+        reason = None if message is None else message.get("error")
+        status = (
+            f"Not delivered: {name}'s squawk service refused the message"
+            f"{f' ({reason})' if reason else ''}. It will not be retried."
+        )
+    else:
+        status = (
+            f"Sent to {name}: queued, not yet delivered (their service has not answered). "
+            "Squawk keeps retrying for up to 7 days; you do not need to resend it."
+        )
     edited = (
         ""
         if decision.text == draft.text
         else " Your user edited the text before sending; what was sent is:\n" + decision.text
     )
     io.stdout(f"{status} msg_id={sent['id']} thread={sent['thread_id']}.{edited}\n")
-    return 0
+    return 1 if state == "failed" else 0
 
 
 async def _send(args: list[str], io: CliIo) -> int:

@@ -288,3 +288,34 @@ def test_path_warning_only_when_squawk_is_not_on_the_path() -> None:
         assert squawk_path_warning({"PATH": folder}) is None
     finally:
         shutil.rmtree(folder)
+
+
+def test_writing_settings_through_a_symlink_keeps_the_link() -> None:
+    from squawk.cli_setup import BACKUP_SUFFIX, write_settings
+
+    root = tempfile.mkdtemp(prefix="sql-", dir="/tmp")
+    try:
+        dotfiles = os.path.join(root, "dotfiles")
+        claude_dir = os.path.join(root, "claude")
+        os.makedirs(dotfiles)
+        os.makedirs(claude_dir)
+        real = os.path.join(dotfiles, "settings.json")
+        with open(real, "w") as f:
+            json.dump({"theme": "dark"}, f)
+        os.chmod(real, 0o640)
+        link = os.path.join(claude_dir, "settings.json")
+        os.symlink(real, link)
+
+        write_settings(link, {"theme": "light"})
+
+        assert os.path.islink(link)
+        assert os.readlink(link) == real
+        with open(real) as f:
+            assert json.load(f) == {"theme": "light"}
+        assert stat.S_IMODE(os.stat(real).st_mode) == 0o640
+        with open(real + BACKUP_SUFFIX) as f:
+            assert json.load(f) == {"theme": "dark"}
+        assert sorted(os.listdir(claude_dir)) == ["settings.json"]
+        assert sorted(os.listdir(dotfiles)) == ["settings.json", "settings.json" + BACKUP_SUFFIX]
+    finally:
+        shutil.rmtree(root)

@@ -26,13 +26,13 @@ outbound queue and are retried with backoff.
 A dialling side may also send `sessions-req` (with a request id); the
 receiver answers `sessions` with the labels and branches of the Claude Code
 sessions open on its machine, or an empty list if its person turned sharing
-off. Paths and inbox tokens are never sent. This exchange is new in the
-Python version; a Node service does not answer it.
+off. Paths and inbox tokens are never sent. This exchange was added after
+squawk 0.1; a squawk 0.1 service does not answer it.
 
 Other frame types (used by pairing) can be added with `on_frame`.
 
-This is the Python version of src/network.ts and speaks the same protocol,
-so Node and Python services can send to each other.
+The protocol is the same as in squawk 0.1, so services of either version can
+send to each other.
 """
 
 import asyncio
@@ -105,6 +105,35 @@ NOT_PAIRED = "not a paired contact"
 
 class LinkError(Exception):
     """Raised when a connection to another service fails or is refused."""
+
+
+class PermanentRefusal(LinkError):
+    """Raised when the recipient refused a message for a reason that sending
+    it again cannot change (see PERMANENT_NACK_REASONS)."""
+
+
+PERMANENT_NACK_REASONS = frozenset(
+    {
+        # Sent by `_receive` below.
+        "malformed",
+        "sender does not match the connection",
+        "id does not match the message",
+        # Sent from `Store.incoming_conflict`.
+        "message id already in use",
+        "thread id already in use",
+        # Error codes from opening the sealed message (squawk.envelope).
+        "tampered",
+        "wrong_recipient",
+        "bad_signature",
+        "sender_mismatch",
+        "replay",
+    }
+)
+"""Nack reasons that mean the recipient will never accept this message, so
+it is marked failed instead of retried. Other reasons can clear up and are
+retried: "stale" (the two clocks disagree), "not a paired contact" (the
+connection was admitted only for pairing), "error" (something went wrong on
+the receiving side) and any reason this version does not know."""
 
 
 def _log(text: str) -> None:
@@ -406,7 +435,7 @@ def address_setting_key(key_id: str) -> str:
 
 def _listening_socket(host: str | None, port: int) -> socket.socket:
     """A bound TCP socket for the listener. With no host it accepts IPv4 and
-    IPv6 on one port (as Node does), falling back to IPv4 only."""
+    IPv6 on one port, falling back to IPv4 only."""
     if host is not None:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
@@ -521,6 +550,9 @@ class NetworkTransport(Transport):
         self._links: dict[str, PeerLink] = {}
         self._delivering: dict[str, asyncio.Task[None]] = {}
         """Deliveries in progress, by recipient key."""
+        self._dialing: dict[str, asyncio.Task[PeerLink]] = {}
+        """Connections being opened to contacts, by key; callers that need the
+        same contact meanwhile wait for the same one."""
         self._stopped = False
         self._incoming_links: set[PeerLink] = set()
         self._listen_port = 0
@@ -592,9 +624,18 @@ class NetworkTransport(Transport):
             self.flush()
 
     async def stop(self) -> None:
+        """Stops at once: deliveries and dials in progress are cancelled (a
+        contact that does not answer could otherwise hold up the stop for
+        the whole connect timeout, for each address tried). Their messages
+        stay queued; a cancelled delivery records no attempt, and messages
+        already acknowledged were recorded when the acknowledgement came."""
         self._stopped = True
         if self._timer is not None:
             self._timer.cancel()
+        in_progress = [*self._delivering.values(), *self._dialing.values()]
+        for task in in_progress:
+            task.cancel()
+        await asyncio.gather(*in_progress, return_exceptions=True)
         if self.discovery is not None:
             await self.discovery.stop()
         for link in [*self._links.values(), *self._incoming_links]:
@@ -610,7 +651,6 @@ class NetworkTransport(Transport):
                 for connection in server.connections:
                     if connection.transport is not None:
                         connection.transport.abort()
-        await asyncio.gather(*self._delivering.values(), return_exceptions=True)
         for task in list(self._tasks):
             task.cancel()
 
@@ -641,6 +681,9 @@ class NetworkTransport(Transport):
             if link.peer_key == key_id:
                 link.close(REFUSED_CODE, "blocked")
         self._links.pop(key_id, None)
+        dialing = self._dialing.pop(key_id, None)
+        if dialing is not None:
+            dialing.cancel()
 
     def find_peer(self, name_or_key: str) -> DiscoveredPeer | None:
         """A discovered peer by name or key id, for pairing."""
@@ -732,11 +775,10 @@ class NetworkTransport(Transport):
         daemon.store.fail_expired(self._max_queue_age_ms)
         if self._guard is not None:
             self._guard.prune()
-        by_recipient: dict[str, list[OutboundItem]] = {}
-        for item in daemon.store.due_outbound():
-            if item.recipient in self._delivering:
-                continue
-            by_recipient.setdefault(item.recipient, []).append(item)
+        # Recipients whose delivery is in progress are left out of the query
+        # itself, so their due items cannot take up the room of other
+        # recipients' items.
+        by_recipient = daemon.store.due_outbound_by_recipient(exclude=list(self._delivering))
         for recipient, items in by_recipient.items():
             task = asyncio.ensure_future(self._deliver_to(recipient, items))
             self._delivering[recipient] = task
@@ -751,28 +793,59 @@ class NetworkTransport(Transport):
 
     async def _deliver_to(self, recipient: str, items: list[OutboundItem]) -> None:
         store = self._require_daemon().store
+
+        def retry_later(item: OutboundItem, error: str) -> None:
+            with contextlib.suppress(Exception):
+                if store.get_outbound(item.message_id) is not None:
+                    store.record_attempt(item.message_id, error=error)
+
         try:
             contact = store.get_contact(recipient)
             if contact is None or contact.trust != "paired":
                 raise LinkError("recipient is not a paired contact")
             link = await self._link_to(recipient)
-            results = await asyncio.gather(
-                *(self._send_one(link, item) for item in items), return_exceptions=True
-            )
-            failure = next((r for r in results if isinstance(r, BaseException)), None)
-            if failure is not None:
-                raise failure
         except Exception as err:
-            error = _error_text(err)
             for item in items:
+                retry_later(item, _error_text(err))
+            return
+        results = await asyncio.gather(
+            *(self._send_one(link, item) for item in items), return_exceptions=True
+        )
+        for item, result in zip(items, results, strict=True):
+            if isinstance(result, PermanentRefusal):
+                _log(f"message {item.message_id} failed: {result}")
                 with contextlib.suppress(Exception):
-                    if store.get_outbound(item.message_id) is not None:
-                        store.record_attempt(item.message_id, error=error)
+                    store.mark_failed(item.message_id, _error_text(result))
+            elif isinstance(result, BaseException):
+                retry_later(item, _error_text(result))
 
     async def _link_to(self, recipient: str) -> PeerLink:
+        """An open, authenticated connection to a paired contact: the one
+        already open, the one being opened, or a new one. Only one dial per
+        contact runs at a time, so every connection opened ends up in
+        `_links`, where stop() and disconnect() find it."""
         existing = self._links.get(recipient)
         if existing is not None and existing.open:
             return existing
+        if self._stopped:
+            raise LinkError("the service is stopping")
+        dialing = self._dialing.get(recipient)
+        if dialing is None:
+            dialing = asyncio.ensure_future(self._open_link(recipient))
+            self._dialing[recipient] = dialing
+
+            def done(task: "asyncio.Task[PeerLink]") -> None:
+                if self._dialing.get(recipient) is task:
+                    del self._dialing[recipient]
+                # Nobody may be waiting any more; mark a failure as seen.
+                if not task.cancelled():
+                    task.exception()
+
+            dialing.add_done_callback(done)
+        # One caller giving up (cancelled) does not stop the dial the others wait for.
+        return await asyncio.shield(dialing)
+
+    async def _open_link(self, recipient: str) -> PeerLink:
         addresses = self.candidates(recipient)
         if not addresses:
             raise LinkError("recipient is not on the network")
@@ -792,6 +865,9 @@ class NetworkTransport(Transport):
         if link.authorization != "paired":
             link.close()
             raise LinkError("recipient is not a paired contact")
+        if self._stopped:
+            link.close(1001, "shutting down")
+            raise LinkError("the service is stopping")
         self._links[recipient] = link
 
         def forget() -> None:
@@ -828,8 +904,13 @@ class NetworkTransport(Transport):
             if frame["t"] == "ack":
                 store.mark_acknowledged(item.message_id)
                 settle(None)
-            elif frame["t"] == "nack":
-                settle(f"refused: {_js_string(frame.get('error'))}")
+            elif frame["t"] == "nack" and not answer.done():
+                reason = frame.get("error")
+                text = f"refused: {_js_string(reason)}"
+                if isinstance(reason, str) and reason in PERMANENT_NACK_REASONS:
+                    answer.set_exception(PermanentRefusal(text))
+                else:
+                    settle(text)
 
         stop_frames = link.on_frame(on_frame)
         stop_close = link.on_close(lambda: settle("connection closed before acknowledgement"))
@@ -845,7 +926,7 @@ class NetworkTransport(Transport):
     async def request_sessions(self, key_id: str) -> PeerSessions:
         """Asks a paired contact's service which Claude Code sessions are open
         there. Raises `LinkError` if it cannot be reached or does not answer
-        in time (a Node service never answers)."""
+        in time (a squawk 0.1 service never answers)."""
         store = self._require_daemon().store
         contact = store.get_contact(key_id)
         if contact is None or contact.trust != "paired":
@@ -1015,7 +1096,8 @@ class NetworkTransport(Transport):
 
 
 def _js_string(value: object) -> str:
-    """`String(value)` as JavaScript writes it, for the common JSON values."""
+    """A JSON value as text for a message: None as "undefined", booleans as
+    "true" or "false", strings as they are and anything else as JSON."""
     if value is None:
         return "undefined"
     if isinstance(value, bool):

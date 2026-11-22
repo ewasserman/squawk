@@ -179,7 +179,12 @@ def read_settings(path: str) -> dict[str, Any]:
 
 def write_settings(path: str, settings: dict[str, Any]) -> None:
     """Writes the settings file in one step, first copying the existing file
-    to settings.json.squawk-backup if no such copy exists yet."""
+    to settings.json.squawk-backup if no such copy exists yet.
+
+    When `path` is a symbolic link (settings kept in a dotfiles folder, for
+    example), the file it points to is written, and the backup and the
+    temporary file go next to that file, so the link stays a link."""
+    path = os.path.realpath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     mode = 0o600
     if os.path.exists(path):
@@ -378,7 +383,7 @@ def _check_claude(io: CliIo) -> None:
 
 
 def _remove_old_mcp_registration(io: CliIo) -> None:
-    """Removes the MCP server the Node version of squawk registered, if any."""
+    """Removes the MCP server an earlier version of squawk registered, if any."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(
             [_claude_bin(io.env), "mcp", "remove", "--scope", "user", "squawk"],

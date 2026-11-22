@@ -32,6 +32,13 @@ class FakeInbox:
         inbox._server = await asyncio.start_unix_server(inbox._handle, inbox.path)
         return inbox
 
+    async def reopen(self) -> None:
+        """Listens again on the same path with the same token, as a session
+        does after a moment when it could not take connections."""
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.path)
+        self._server = await asyncio.start_unix_server(self._handle, self.path)
+
     @property
     def env(self) -> dict[str, str]:
         """The variables Claude Code gives the session's hooks and Bash commands."""

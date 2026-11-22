@@ -1,4 +1,4 @@
-"""Tests for squawk.network (the Python version of test/network.test.ts)."""
+"""Tests for squawk.network."""
 
 import asyncio
 import dataclasses
@@ -11,12 +11,14 @@ from typing import Any
 import pytest
 from websockets.asyncio.client import connect
 
+from squawk.config import db_path
 from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import Daemon
 from squawk.discovery import Advertisement, Discovery, RawService
 from squawk.envelope import create_envelope
 from squawk.identity import Identity, fingerprint, identity_from_secret_key, init_identity
 from squawk.network import Address, LinkError, NetworkTransport, PeerLink, dialable
+from squawk.store import Store
 
 
 async def wait_for[T](check: Callable[[], T | None], timeout: float = 8.0) -> T:
@@ -159,14 +161,70 @@ async def test_refuses_an_incoming_id_that_belongs_to_a_message_from_someone_els
     carol.daemon.store.queue_outgoing(clash)
     carol.transport.kick()
 
+    # A refusal that cannot clear up: Carol's message fails at once, with the reason.
     def refused() -> bool:
-        item = carol.daemon.store.get_outbound(from_alice["id"])
-        return item is not None and "message id already in use" in (item.last_error or "")
+        mine = carol.daemon.store.get_message(from_alice["id"])
+        return mine is not None and mine.state == "failed"
 
     await wait_for(refused)
+    mine = carol.daemon.store.get_message(from_alice["id"])
+    assert mine is not None and mine.error == "refused: message id already in use"
+    assert carol.daemon.store.get_outbound(from_alice["id"]) is None
     stored = bob.daemon.store.get_message(from_alice["id"])
     assert stored is not None and stored.body == "from alice"
     assert carol.daemon.store.acked_at(from_alice["id"]) is None
+
+
+async def test_marks_a_message_failed_when_the_receiver_refuses_its_thread_for_good(
+    net: Net,
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    carol = await net.node("carol")
+    pair(alice, bob)
+    pair(carol, bob)
+
+    from_alice = await alice.daemon.send({"to": "bob", "body": "from alice"})
+    await wait_for(lambda: alice.daemon.store.acked_at(from_alice["id"]))
+    # Carol writes into the thread Bob has with Alice.
+    clash = create_envelope(
+        from_=carol.id, to=bob.id, body="from carol", thread_id=from_alice["thread_id"]
+    )
+    carol.daemon.store.queue_outgoing(clash)
+    carol.transport.kick()
+
+    def failed() -> bool:
+        mine = carol.daemon.store.get_message(clash["id"])
+        return mine is not None and mine.state == "failed"
+
+    await wait_for(failed)
+    # It is out of the queue, so it is not retried, and the reason is kept.
+    assert carol.daemon.store.get_outbound(clash["id"]) is None
+    assert carol.daemon.status()["queued_outbound"] == 0
+    stored = carol.daemon.store.get_message(clash["id"])
+    assert stored is not None
+    info = carol.daemon._message_info(stored)
+    assert info["state"] == "failed"
+    assert info["error"] == "refused: thread id already in use"
+    assert bob.daemon.store.get_message(clash["id"]) is None
+
+
+async def test_keeps_retrying_a_refusal_that_can_clear_up(
+    net: Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    # Alice's clock is an hour ahead of Bob's: Bob refuses the message as
+    # "stale", which clears up once the clock is set right.
+    ahead = int(time.time() * 1000) + 60 * 60_000
+    monkeypatch.setattr("squawk.network.now_ms", lambda: ahead)
+    sent = await alice.daemon.send({"to": "bob", "body": "from the future"})
+    await wait_for(lambda: attempts(alice, sent["id"]) >= 1)
+    item = alice.daemon.store.get_outbound(sent["id"])
+    assert item is not None and item.last_error == "refused: stale"
+    mine = alice.daemon.store.get_message(sent["id"])
+    assert mine is not None and mine.state == "queued" and mine.error is None
 
 
 async def test_falls_back_to_the_saved_address_when_the_advertised_one_is_someone_else(
@@ -212,6 +270,91 @@ async def test_does_not_hold_up_other_recipients_while_one_is_slow_to_answer(
         for writer in held:
             writer.close()
         silent.close()
+
+
+async def test_a_recipient_with_many_due_messages_does_not_hold_up_the_others(
+    net: Net,
+) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    carol = await net.node("carol")
+    pair(alice, bob)
+    pair(alice, carol)
+    # Carol's address accepts connections but never answers, and more than
+    # 100 messages for her are due.
+    held: list[asyncio.StreamWriter] = []
+
+    async def silent_handler(_r: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    silent = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+    net.book[carol.id] = Address("127.0.0.1", silent.sockets[0].getsockname()[1])
+    try:
+        for n in range(150):
+            alice.daemon.store.queue_outgoing(
+                create_envelope(from_=alice.id, to=carol.id, body=f"for carol {n}")
+            )
+        alice.transport.kick()
+        await asyncio.sleep(0.1)
+        start = time.monotonic()
+        sent = await alice.daemon.send({"to": "bob", "body": "for bob"})
+        await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+        # Well under the 2 s handshake timeout Carol's dial is stuck in.
+        assert time.monotonic() - start < 1.5
+    finally:
+        for writer in held:
+            writer.close()
+        silent.close()
+
+
+async def test_concurrent_callers_share_one_dial_to_a_contact(net: Net) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    # A delivery and `squawk sessions bob` both need a connection at once.
+    first, second = await asyncio.gather(
+        alice.transport._link_to(bob.id), alice.transport._link_to(bob.id)
+    )
+    assert first is second
+    await wait_for(lambda: len(bob.transport._incoming_links) >= 1)
+    await asyncio.sleep(0.1)
+    assert len(bob.transport._incoming_links) == 1
+    await net.stop_node(alice)
+    await wait_for(lambda: first.closed)
+
+
+async def test_stops_promptly_while_a_contact_is_slow_to_answer(net: Net) -> None:
+    alice = await net.node("alice")
+    carol = await net.node("carol")
+    pair(alice, carol)
+    held: list[asyncio.StreamWriter] = []
+
+    async def silent_handler(_r: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    silent = await asyncio.start_server(silent_handler, "127.0.0.1", 0)
+    net.book[carol.id] = Address("127.0.0.1", silent.sockets[0].getsockname()[1])
+    try:
+        sent = await alice.daemon.send({"to": "carol", "body": "for carol"})
+        await wait_for(lambda: held)
+        start = time.monotonic()
+        await net.stop_node(alice)
+        # Well under the 2 s handshake timeout the dial is stuck in.
+        assert time.monotonic() - start < 1.0
+    finally:
+        for writer in held:
+            writer.close()
+        silent.close()
+    # The message is still queued, with no attempt recorded for the dial
+    # that was cut short.
+    store = Store.open(db_path(alice.home))
+    try:
+        item = store.get_outbound(sent["id"])
+        assert item is not None and item.attempts == 0 and item.last_error is None
+        message = store.get_message(sent["id"])
+        assert message is not None and message.state == "queued"
+    finally:
+        store.close()
 
 
 async def test_retries_after_the_receiver_restarts(net: Net) -> None:

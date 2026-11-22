@@ -180,7 +180,7 @@ class TestEnvelopeValidation:
         with pytest.raises(EnvelopeValidationError):
             parse_envelope({**message(), **change})
 
-    def test_counts_lengths_as_javascript_does(self) -> None:
+    def test_counts_lengths_in_utf16_code_units(self) -> None:
         # An emoji is two UTF-16 code units, so 64 of them are 128 units (allowed)
         # and 65 are 130 (refused), although Python counts them as 64 and 65.
         assert parse_envelope({**message(), "id": "\U0001f600" * 64})

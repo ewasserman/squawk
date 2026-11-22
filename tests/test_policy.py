@@ -1,5 +1,4 @@
-"""Tests for `squawk policy` and how the policy travels with incoming messages
-(the parts of test/policy.test.ts that do not need the MCP server)."""
+"""Tests for `squawk policy` and how the policy travels with incoming messages."""
 
 import asyncio
 import json

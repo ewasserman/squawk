@@ -186,6 +186,35 @@ def test_queues_a_message_and_returns_it_when_due(store: Store, clock: Clock) ->
     assert store.count_outbound() == 1
 
 
+def test_due_items_by_recipient_are_limited_per_recipient_and_skip_excluded_ones(
+    store: Store, clock: Clock
+) -> None:
+    carol = identity_from_secret_key("carol", ed25519_random_secret_key())
+    for n in range(5):
+        store.queue_outgoing(outgoing(clock, f"to bob {n}"))
+    to_carol = outgoing(clock, "to carol", to=carol.id)
+    store.queue_outgoing(to_carol)
+
+    grouped = store.due_outbound_by_recipient(limit_per_recipient=3)
+    assert sorted(grouped) == sorted([bob.id, carol.id])
+    assert len(grouped[bob.id]) == 3
+    assert [i.message_id for i in grouped[carol.id]] == [to_carol["id"]]
+    assert store.due_outbound_by_recipient(exclude=[bob.id]) == {carol.id: grouped[carol.id]}
+
+
+def test_mark_failed_takes_a_message_out_of_the_queue_with_the_reason(
+    store: Store, clock: Clock
+) -> None:
+    env = outgoing(clock)
+    store.queue_outgoing(env)
+    assert store.mark_failed(env["id"], "refused: bad_signature") is True
+    assert store.get_outbound(env["id"]) is None
+    message = store.get_message(env["id"])
+    assert message is not None
+    assert (message.state, message.error) == ("failed", "refused: bad_signature")
+    assert store.mark_failed(env["id"], "again") is False
+
+
 def test_backs_off_after_a_failed_attempt(store: Store, clock: Clock) -> None:
     env = outgoing(clock)
     store.queue_outgoing(env)
@@ -392,11 +421,10 @@ class TestSubject:
         assert subject_of("") == ""
         assert subject_of("\u00a0\n\ufeffhi\u3000") == "hi"
 
-    def test_shortens_long_subjects_counting_as_javascript_does(self) -> None:
+    def test_shortens_long_subjects_counting_utf16_code_units(self) -> None:
         assert subject_of("x" * 120) == "x" * 120
         assert subject_of("x" * 121) == "x" * 119 + "\u2026"
         # 60 emoji are 120 UTF-16 code units: kept whole.
         assert subject_of("\U0001f600" * 60) == "\U0001f600" * 60
-        # Cutting at 119 units splits an emoji; the leftover half becomes U+FFFD,
-        # as it does when the Node version writes it to the database.
+        # Cutting at 119 units splits an emoji; the leftover half becomes U+FFFD.
         assert subject_of("\U0001f600" * 61) == "\U0001f600" * 59 + "\ufffd\u2026"

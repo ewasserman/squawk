@@ -22,9 +22,9 @@ Network transports (mDNS discovery, the WebSocket listener) plug in through
 `deliver_incoming` (for messages that arrive) and the `Transport` class (for
 messages to send), so routing does not depend on how a message travels.
 
-This started as the Python version of src/daemon.ts. The methods both
-versions have take and return the same JSON, apart from the session methods
-and `status`'s session list, which are new.
+The methods squawk 0.1 also had take and return the same JSON as there; the
+session methods, `status`'s session list and `get_message`'s "error" field
+were added later.
 """
 
 import asyncio
@@ -196,6 +196,10 @@ class MessageInfo(TypedDict):
     body: str
     created_at: str
     state: str
+    error: str | None
+    """For an outgoing message in state "failed", the reason the recipient
+    gave for refusing it, when it refused it for good; otherwise None. Not
+    sent by squawk 0.1."""
 
 
 class ContactInfo(TypedDict):
@@ -210,7 +214,7 @@ class ContactInfo(TypedDict):
     (the contact's own setting, or the default)."""
     auto_send_is_default: bool
     """True when the contact has no auto-send setting of its own and follows
-    the default. Not in the Node version."""
+    the default. Not sent by squawk 0.1."""
     inbound_policy: InboundPolicy
     """The policy that applies to this contact's messages (their own or the default)."""
     policy_is_default: bool
@@ -245,11 +249,10 @@ class StatusResult(TypedDict):
     """The label chosen to take messages no other session takes, if any."""
 
 
-# Checking params. These follow the zod schemas in src/daemon.ts: unknown
-# fields are ignored, an optional field may be left out but not set to null
-# (unless it says so), and string lengths count UTF-16 code units. The error
-# texts are plain descriptions rather than zod's wording; clients rely only on
-# the error code.
+# Checking params. Unknown fields are ignored, an optional field may be left
+# out but not set to null (unless it says so), and string lengths count
+# UTF-16 code units. The error texts are plain descriptions; clients rely
+# only on the error code.
 
 _INBOUND_POLICIES = ("show_first", "auto_answer")
 
@@ -363,8 +366,8 @@ def _optional_string(obj: Mapping[str, Any], key: str, max_length: int) -> str |
 
 
 def _name_sort_key(name: str) -> tuple[str, str, str]:
-    """Orders names roughly as JavaScript's `localeCompare` does: ignoring
-    accents and case first, then accents, then lower case before upper case."""
+    """Orders names ignoring accents and case first, then by accents, then
+    with lower case before upper case."""
     decomposed = unicodedata.normalize("NFD", name)
     base = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return base.casefold(), decomposed.casefold(), name.swapcase()
@@ -718,7 +721,13 @@ class Daemon:
                     self._forget(target.session_id)
                 continue
             self.store.mark_delivered(message.id)
-            self.store.bind_thread(message.thread_id, target.session_id)
+            # The conversation moves to this session only if it had none, or
+            # its session has been forgotten. A session that is merely
+            # unreachable for a moment keeps it, so later messages go back
+            # to it once it answers again.
+            bound = self.store.thread_session(message.thread_id)
+            if bound is None or bound not in self._sessions:
+                self.store.bind_thread(message.thread_id, target.session_id)
             return target.label
 
     def session_infos(self) -> list[SessionInfo]:
@@ -751,7 +760,13 @@ class Daemon:
         """Creates, saves and queues a message to a contact, then tells the transport.
 
         Raises `RpcError` if `to` is not a known contact, or is a blocked one
-        (such a message could never be delivered).
+        (such a message could never be delivered), or if `thread_id` names a
+        conversation with a different contact: the recipient would refuse
+        every message in it, since a thread belongs to one contact.
+
+        A reply (`in_reply_to`) joins the thread of the message it answers
+        when that conversation is with the same contact; answering another
+        contact's message starts a new thread.
         """
         contact = self.resolve_contact(params["to"])
         if contact.trust != "paired":
@@ -760,12 +775,25 @@ class Daemon:
                 f'"{contact.name}" is blocked; run `squawk unblock {contact.name}` '
                 "before sending to them",
             )
-        # A reply joins the thread of the message it answers, unless told otherwise.
         thread = params.get("thread_id")
         in_reply_to = params.get("in_reply_to")
-        if thread is None and in_reply_to is not None:
+        if thread is not None:
+            other = self._thread_peer_other_than(thread, contact.public_key)
+            if other is not None:
+                raise RpcError(
+                    RpcErrorCode.APPLICATION_ERROR,
+                    f"thread {thread} is a conversation with {other}, not with "
+                    f"{contact.name}; leave out --thread to start a new conversation "
+                    f"with {contact.name}",
+                )
+        elif in_reply_to is not None:
+            # A reply joins the thread of the message it answers, if that
+            # conversation is with the same contact.
             answered = self.store.get_message(in_reply_to)
-            thread = None if answered is None else answered.thread_id
+            if answered is not None and (
+                self._thread_peer_other_than(answered.thread_id, contact.public_key) is None
+            ):
+                thread = answered.thread_id
         envelope = create_envelope(
             from_=self.identity.id,
             to=contact.public_key,
@@ -789,6 +817,15 @@ class Daemon:
             # The message is safely queued; the transport retries later.
             print(f"squawkd: transport failed: {err}", file=sys.stderr)
         return {"id": envelope["id"], "thread_id": envelope["thread_id"], "state": "queued"}
+
+    def _thread_peer_other_than(self, thread_id: str, key_id: str) -> str | None:
+        """The name (or key id) of the contact a stored thread is with, when
+        that is not `key_id`; None when the thread is with `key_id` or unknown."""
+        thread = self.store.get_thread(thread_id)
+        if thread is None or thread.peer == key_id:
+            return None
+        contact = self.store.get_contact(thread.peer)
+        return thread.peer if contact is None else contact.name
 
     def resolve_contact(self, to: str) -> Contact:
         """Finds a contact by key identifier, or else by name (exact, then
@@ -1082,6 +1119,7 @@ class Daemon:
             "body": message.body,
             "created_at": message.created_at,
             "state": message.state,
+            "error": message.error,
         }
 
     def _envelope_of(self, message: StoredMessage) -> Envelope:

@@ -11,9 +11,8 @@ command. A process sending multicast packets itself is often refused there
 (EHOSTUNREACH) by the Local Network privacy setting, while mDNSResponder is
 always allowed. Elsewhere the `zeroconf` package is used.
 
-This is the Python version of src/discovery.ts. It advertises the same
-service type, instance names and TXT fields, so Node and Python services
-find each other.
+The service type, instance names and TXT fields are fixed, so services of
+every squawk version since 0.1 find each other.
 """
 
 import asyncio
@@ -404,8 +403,8 @@ class DnsSdBackend:
 def default_backend(env: Mapping[str, str] | None = None) -> MdnsBackend:
     """Picks the mDNS backend for this machine.
 
-    SQUAWK_MDNS=zeroconf|dns-sd overrides ("bonjour", the Node version's name
-    for its library, also selects zeroconf).
+    SQUAWK_MDNS=zeroconf|dns-sd overrides ("bonjour", the value an earlier
+    version of squawk used, also selects zeroconf).
     """
     choice = (os.environ if env is None else env).get("SQUAWK_MDNS")
     if choice in ("zeroconf", "bonjour"):
@@ -418,7 +417,8 @@ def default_backend(env: Mapping[str, str] | None = None) -> MdnsBackend:
 
 
 def _js_number(text: str) -> float | None:
-    """Roughly what JavaScript's `Number(text)` gives for a port: None for NaN."""
+    """The port in a TXT record as a number: surrounding whitespace is ignored,
+    empty text counts as 0, and text that is not a number gives None."""
     stripped = jsontext.js_trim(text)
     if stripped == "":
         return 0
@@ -481,8 +481,14 @@ class Discovery:
         self.backend: MdnsBackend = default_backend() if backend is None else backend
         self._now = now_ms if now is None else now
         self._by_key: dict[str, DiscoveredPeer] = {}
-        self._key_by_instance: dict[str, str] = {}
-        """mDNS instance name -> key id, so a "down" (which may lack TXT) can be matched."""
+        """The peer for each key id: of the instances advertising that key,
+        the one seen most recently."""
+        self._by_instance: dict[str, DiscoveredPeer] = {}
+        """Every advertisement seen, by mDNS instance name, so a "down" (which
+        may lack TXT) can be matched. More than one instance can advertise the
+        same key: after a restart mDNS may rename the new advertisement
+        ("alice (2)") while the old record has not expired yet, or another
+        host may copy the key into its own advertisement."""
         self._listeners: dict[DiscoveryEvent, list[Callable[[DiscoveredPeer], None]]] = {
             "up": [],
             "down": [],
@@ -552,19 +558,28 @@ class Discovery:
         peer = peer_from_service(service, self._now())
         if peer is None or peer.key_id == self.self_ad.key_id:
             return
-        self._key_by_instance[service.name] = peer.key_id
+        previous = self._by_instance.get(service.name)
+        self._by_instance[service.name] = peer
         self._by_key[peer.key_id] = peer
+        if previous is not None and previous.key_id != peer.key_id:
+            # This instance now advertises another key.
+            self._update_key(previous.key_id)
         self._emit("up", peer)
 
     def _handle_down(self, service: RawService) -> None:
-        key_id = self._key_by_instance.get(service.name)
-        if key_id is None:
-            parsed = peer_from_service(service, self._now())
-            key_id = None if parsed is None else parsed.key_id
-        if not key_id:
+        # Only the instance that went away is removed. An instance never seen
+        # set nothing, so its goodbye changes nothing.
+        gone = self._by_instance.pop(service.name, None)
+        if gone is not None:
+            self._update_key(gone.key_id)
+
+    def _update_key(self, key_id: str) -> None:
+        """Points `key_id` at the most recently seen instance still advertising
+        it, or removes it (and emits "down") when none is left."""
+        remaining = [p for p in self._by_instance.values() if p.key_id == key_id]
+        if remaining:
+            self._by_key[key_id] = max(remaining, key=lambda p: p.last_seen)
             return
-        self._key_by_instance.pop(service.name, None)
         peer = self._by_key.pop(key_id, None)
-        if peer is None:
-            return
-        self._emit("down", peer)
+        if peer is not None:
+            self._emit("down", peer)

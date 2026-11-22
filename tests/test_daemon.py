@@ -1,4 +1,4 @@
-"""Tests for squawk.daemon (the Python version of test/daemon.test.ts)."""
+"""Tests for squawk.daemon."""
 
 import asyncio
 import os
@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from fake_inbox import FakeInbox, Inboxes
+from squawk import jsontext
 from squawk.config import pid_path, run_dir, socket_path
 from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import (
@@ -19,6 +20,7 @@ from squawk.daemon import (
     IncomingResult,
     MessageNotification,
     Transport,
+    parse_send_params,
 )
 from squawk.envelope import Envelope, create_envelope
 from squawk.identity import Identity, identity_from_secret_key, init_identity
@@ -264,6 +266,37 @@ async def test_a_conversation_stays_with_the_session_that_started_it(env: Env) -
     assert await delivered(env.daemon.deliver_incoming(late)) == "b"
 
 
+async def test_a_conversation_returns_to_its_session_after_a_moment_unreachable(
+    env: Env,
+) -> None:
+    a = await env.open_session("a")
+    b = await env.open_session("b")
+    sent = await env.daemon.send({"to": "alice", "body": "question", "from_socket": a.inbox.path})
+
+    def answer(body: str) -> Envelope:
+        return create_envelope(
+            from_=alice.id, to=env.me.id, body=body, thread_id=sent["thread_id"], session="b"
+        )
+
+    # Session a briefly refuses connections: the message goes to b instead.
+    await a.inbox.close(remove=False)
+    assert await delivered(env.daemon.deliver_incoming(answer("while away"))) == "b"
+    # a is back; the conversation is still a's.
+    await a.inbox.reopen()
+    await env.daemon.check_sessions()
+    assert await delivered(env.daemon.deliver_incoming(answer("back again"))) == "a"
+    await poll(lambda: a.bodies() == ["back again"])
+    assert b.bodies() == ["while away"]
+
+    # Once a is forgotten, the session that takes the conversation keeps it.
+    env.daemon.unregister_session(a.session_id)
+    assert await delivered(env.daemon.deliver_incoming(answer("a is gone"))) == "b"
+    follow_up = create_envelope(
+        from_=alice.id, to=env.me.id, body="still b", thread_id=sent["thread_id"]
+    )
+    assert await delivered(env.daemon.deliver_incoming(follow_up)) == "b"
+
+
 async def test_repeated_labels_get_a_number_and_a_session_keeps_its_label(env: Env) -> None:
     first = await env.open_session("squawk@main")
     second = await env.open_session("squawk@main")
@@ -280,6 +313,24 @@ async def test_repeated_labels_get_a_number_and_a_session_keeps_its_label(env: E
         "squawk@main-2",
         "squawk@main-3",
     ]
+
+
+async def test_a_numbered_label_stays_within_the_256_character_limit(env: Env) -> None:
+    longest = "x" * 256
+    first = await env.open_session(longest)
+    second = await env.open_session(longest)
+    assert first.label == longest
+    assert second.label.endswith("-2")
+    assert jsontext.js_length(second.label) <= 256
+    # Senders can name it: the send params and the envelope accept it.
+    parse_send_params({"to": "alice", "body": "hi", "session": second.label})
+    create_envelope(from_=alice.id, to=env.me.id, body="hi", session=second.label)
+    # Emoji count as two units; a cut never leaves a label over the limit.
+    emoji = "\U0001f600" * 128
+    one = await env.open_session(emoji)
+    two = await env.open_session(emoji)
+    assert one.label == emoji
+    assert jsontext.js_length(two.label) <= 256 and two.label.endswith("-2")
 
 
 async def test_falls_back_when_a_session_has_gone_away(env: Env) -> None:
@@ -413,6 +464,38 @@ async def test_a_reply_joins_the_thread_of_the_message_it_answers(env: Env) -> N
     assert reply["thread_id"] == first["thread_id"]
 
 
+async def test_a_thread_with_one_contact_is_not_reused_for_another(env: Env) -> None:
+    bob = identity_from_secret_key("bob", ed25519_random_secret_key())
+    env.daemon.store.upsert_contact(bob.id, "bob", trust="paired")
+    to_alice = await env.daemon.send({"to": "alice", "body": "for alice"})
+    from_alice = env.incoming("from alice")
+    await delivered(env.daemon.deliver_incoming(from_alice))
+
+    # Naming Alice's thread when writing to Bob is a mistake: refused, with a
+    # message that says what to do.
+    client = await env.connect()
+    with pytest.raises(RpcError) as refused:
+        await client.call(
+            "send", {"to": "bob", "body": "for bob", "thread_id": to_alice["thread_id"]}
+        )
+    assert refused.value.code == RpcErrorCode.APPLICATION_ERROR
+    assert "conversation with alice" in refused.value.message
+    assert "--thread" in refused.value.message
+    assert env.daemon.store.count_outbound() == 1
+
+    # Answering Alice's message while writing to Bob starts a new thread with Bob.
+    to_bob = await env.daemon.send({"to": "bob", "body": "fyi", "in_reply_to": from_alice["id"]})
+    assert to_bob["thread_id"] not in (from_alice["thread_id"], to_alice["thread_id"])
+    thread = env.daemon.store.get_thread(to_bob["thread_id"])
+    assert thread is not None and thread.peer == bob.id
+    item = env.daemon.store.get_outbound(to_bob["id"])
+    assert item is not None and item.envelope.get("in_reply_to") == from_alice["id"]
+
+    # Bob's own thread still works for Bob.
+    again = await env.daemon.send({"to": "bob", "body": "more", "thread_id": to_bob["thread_id"]})
+    assert again["thread_id"] == to_bob["thread_id"]
+
+
 async def test_send_to_an_unknown_contact_is_an_error_with_a_clear_message(env: Env) -> None:
     client = await env.connect()
     with pytest.raises(RpcError) as unknown:
@@ -451,6 +534,7 @@ async def test_get_message_returns_a_stored_message_incoming_or_outgoing(env: En
         "body": "a question",
         "created_at": envelope["created_at"],
         "state": "unread",
+        "error": None,
     }
 
     sent = await client.call("send", {"to": "alice", "body": "out"})
@@ -621,7 +705,7 @@ async def test_auto_send_follows_the_default_unless_the_contact_has_its_own_sett
         assert error.value.code == RpcErrorCode.INVALID_PARAMS
 
 
-async def test_a_contact_turned_on_by_the_node_version_keeps_auto_send_on(env: Env) -> None:
-    # The Node version sets only the contacts table's column.
+async def test_a_contact_turned_on_by_squawk_0_1_keeps_auto_send_on(env: Env) -> None:
+    # squawk 0.1 sets only the contacts table's column.
     env.daemon.store.update_contact(alice.id, auto_send=True)
     assert env.daemon.store.auto_send_for(alice.id) == (True, False)

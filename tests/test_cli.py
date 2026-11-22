@@ -1,5 +1,4 @@
-"""Tests for the `squawk` command itself: help, `init`, `whoami`, `daemon`
-(the command-line parts of test/identity.test.ts and test/daemon-cli.test.ts),
+"""Tests for the `squawk` command itself: help, `init`, `whoami`, `daemon`,
 the argument reader, and the confirmation dialog's helpers."""
 
 import json
@@ -189,7 +188,7 @@ def test_daemon_start_without_an_identity_fails_with_exit_code_1(home: str) -> N
     assert "squawk init" in result.stderr
 
 
-# The argument reader. The expected messages are what Node's util.parseArgs prints.
+# The argument reader. The expected messages are the fixed wording squawk 0.1 also used.
 
 OPTIONS = {"name": Opt("string", "n"), "json": Opt("boolean"), "unread": Opt("boolean", "u")}
 

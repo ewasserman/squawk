@@ -2,8 +2,8 @@
 
 Signing is ed25519, key agreement is x25519, keys are derived with
 HKDF-SHA256, and messages are encrypted with XChaCha20-Poly1305 (the IETF
-variant with a 24-byte nonce, ciphertext followed by the 16-byte tag). These
-match the @noble libraries the Node version uses, byte for byte.
+variant with a 24-byte nonce, ciphertext followed by the 16-byte tag). Every
+squawk peer must produce the same bytes, so these choices are fixed.
 """
 
 import hashlib
@@ -55,8 +55,7 @@ def ed25519_public_to_x25519(public_key: bytes) -> bytes:
 def ed25519_secret_to_x25519(secret_key: bytes) -> bytes:
     """The x25519 secret key that corresponds to a 32-byte ed25519 secret key.
 
-    This is the first half of SHA-512 of the secret key, clamped, the same
-    as @noble's `ed25519.utils.toMontgomerySecret`.
+    This is the first half of SHA-512 of the secret key, clamped.
     """
     public_key = ed25519_public_key(secret_key)
     # libsodium wants the 64-byte form: the secret key followed by the public key.
@@ -71,8 +70,7 @@ def x25519_public_key(secret_key: bytes) -> bytes:
 def x25519_shared_secret(secret_key: bytes, public_key: bytes) -> bytes:
     """The x25519 shared secret of our secret key and their public key.
 
-    Raises if the result is all zeros (their key has small order), as @noble
-    does.
+    Raises if the result is all zeros (their key has small order).
     """
     return nacl.bindings.crypto_scalarmult(secret_key, public_key)
 
