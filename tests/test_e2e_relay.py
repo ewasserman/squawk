@@ -1,0 +1,199 @@
+"""End to end through a relay on one machine: a real relay server and two
+services (Alice's and Bob's) with separate homes, discovery off and no
+direct route between them, so everything goes through the relay. People
+pair with `squawk invite` and `squawk pair --code`; messages go through the
+real `squawk send` and `squawk reply` commands into fake Claude Code
+sessions. Bob's service is stopped and started again, and so is the relay.
+"""
+
+import asyncio
+import os
+import re
+import shutil
+import tempfile
+from collections.abc import AsyncIterator
+
+import pytest
+
+from squawk.cli import run
+from squawk.cli_io import CliIo
+from squawk.daemon import Daemon
+from squawk.identity import init_identity
+from squawk.network import NetworkTransport
+from squawk.pairing import Pairing
+from squawk.relay import RelayServer
+from squawk.relay_client import RelayClient
+from test_e2e import Person, World, always_send, body_of, msg_id_of, wait_for
+
+
+class RelayWorld(World):
+    def __init__(self, relay_dir: str) -> None:
+        super().__init__()
+        self.relay_dir = relay_dir
+        self.relay: RelayServer | None = None
+        self.relay_port = 0
+
+    async def start_relay(self) -> None:
+        self.relay = RelayServer(self.relay_dir, port=self.relay_port)
+        await self.relay.start()
+        self.relay_port = self.relay.port
+
+    async def stop_relay(self) -> None:
+        assert self.relay is not None
+        await self.relay.stop()
+        self.relay = None
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.relay_port}"
+
+    async def person(self, name: str) -> Person:
+        home = tempfile.mkdtemp(prefix="sq-", dir="/tmp")
+        self.homes.append(home)
+        init_identity(home, name)
+        return await self.start_service(name, home)
+
+    async def start_service(self, name: str, home: str) -> Person:
+        notes: list[tuple[str, str]] = []
+        relay = RelayClient(
+            self.url,
+            allow_plain=True,
+            backoff_min_ms=50,
+            backoff_max_ms=200,
+            allow_check_interval_ms=50,
+        )
+        transport = NetworkTransport(
+            host="127.0.0.1",
+            discovery=False,
+            retry_interval_ms=50,
+            ack_timeout_ms=2000,
+            handshake_timeout_ms=2000,
+            relay=relay,
+        )
+        daemon = Daemon(
+            home, transport=transport, notify=lambda title, text: notes.append((title, text))
+        )
+        await daemon.start()
+        pairing = Pairing(daemon, transport, timeout_ms=5000)
+        pairing.start()
+        # No direct address: the other service can reach this one only through the relay.
+        person = Person(name, home, daemon, pairing, "", notes)
+        self.people.append(person)
+        await wait_for(lambda: relay.connected)
+        return person
+
+    async def stop_service(self, person: Person) -> None:
+        person.pairing.stop()
+        await person.daemon.stop()
+        self.people.remove(person)
+
+    async def restart_service(self, person: Person) -> Person:
+        await self.stop_service(person)
+        return await self.start_service(person.name, person.home)
+
+
+def relay_of(person: Person) -> RelayClient:
+    transport = person.daemon.transport
+    assert isinstance(transport, NetworkTransport) and transport.relay is not None
+    return transport.relay
+
+
+@pytest.fixture
+async def world(tmp_path: object) -> AsyncIterator[RelayWorld]:
+    w = RelayWorld(os.path.join(str(tmp_path), "relay"))
+    await w.start_relay()
+    try:
+        yield w
+    finally:
+        for person in list(w.people):
+            person.pairing.stop()
+            await person.daemon.stop()
+        await w.inboxes.close()
+        if w.relay is not None:
+            await w.relay.stop()
+        for home in w.homes:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+async def test_two_people_on_different_networks_talk_through_the_relay(
+    world: RelayWorld,
+) -> None:
+    alice = await world.person("alice")
+    bob = await world.person("bob")
+
+    # Pairing by invite: Alice reads her code to Bob, who joins with it.
+    out: list[str] = []
+    io = CliIo(
+        stdout=out.append,
+        stderr=out.append,
+        env={"SQUAWK_HOME": alice.home},
+        ask=lambda _prompt: _yes(),
+        confirm=always_send,
+    )
+    inviting = asyncio.ensure_future(run(["invite"], io))
+    found = await wait_for(lambda: re.search(r"Invite code: (\S+)", "".join(out)))
+    joined = await world.cli(bob, "pair", "--code", found.group(1))
+    assert joined.code == 0, joined.err
+    assert await inviting == 0, "".join(out)
+    assert 'Paired with "alice"' in joined.out
+    assert 'Paired with "bob"' in "".join(out)
+    contact = alice.daemon.store.get_contact(bob.daemon.identity.id)
+    assert contact is not None and contact.relay_url == world.url
+
+    bob_api, _ = await world.open_session(bob, "api", "/tmp/no-repo/api", "b-1")
+    alice_a, _ = await world.open_session(alice, "a", "/tmp/no-repo/work", "a-1")
+
+    # Alice lists Bob's sessions through the relay.
+    listed = await world.cli(alice, "sessions", "bob")
+    assert listed.code == 0, listed.err
+    assert listed.out == "bob's open sessions:\nLABEL  BRANCH\napi    -\n"
+
+    # A question to Bob's session and his reply, both through the relay.
+    sent = await world.cli(alice, "send", "bob", "is the build green?", "--session", "api",
+                           session=alice_a)  # fmt: skip
+    assert sent.code == 0, sent.err
+    assert "delivered to their squawk service" in sent.out
+    [received] = await wait_for(lambda: bob_api.messages or None)
+    assert body_of(received) == "is the build green?"
+    replied = await world.cli(bob, "reply", msg_id_of(received), "yes, green", session=bob_api)
+    assert replied.code == 0, replied.err
+    assert "delivered to their squawk service" in replied.out
+    [answer] = await wait_for(lambda: alice_a.messages or None)
+    assert body_of(answer) == "yes, green"
+
+    # Bob goes offline. Alice's next message waits at the relay.
+    bob_home_person = bob
+    await world.stop_service(bob)
+    offline = await world.cli(alice, "sessions", "bob")
+    assert offline.code != 0
+    assert "bob is offline" in offline.err
+    waiting = await world.cli(alice, "send", "bob", "ping while you were away")
+    assert waiting.code == 0, waiting.err
+    assert "waiting at the relay" in waiting.out
+    waiting_id = re.search(r"msg_id=(\S+)", waiting.out)
+    assert waiting_id is not None
+    held = alice.daemon.store.get_message(waiting_id.group(1))
+    assert held is not None and held.state == "sent"
+
+    # The relay restarts while the message waits, then Bob comes back: the
+    # message survives, reaches Bob, and Alice gets Bob's receipt.
+    await world.stop_relay()
+    await wait_for(lambda: not relay_of(alice).connected)
+    await world.start_relay()
+    await wait_for(lambda: relay_of(alice).connected)
+    bob = await world.start_service("bob", bob_home_person.home)
+    arrived = await wait_for(lambda: bob.daemon.store.get_message(waiting_id.group(1)))
+    assert arrived.body == "ping while you were away"
+    await wait_for(lambda: alice.daemon.store.acked_at(waiting_id.group(1)))
+    assert alice.daemon.store.count_relayed() == 0
+
+    # Bob, back online, can send again.
+    back = await world.cli(bob, "send", "alice", "back now")
+    assert back.code == 0, back.err
+    assert "delivered to their squawk service" in back.out
+    for inbox in (alice_a, bob_api):
+        assert inbox.problems == []
+
+
+async def _yes() -> str:
+    return "y"

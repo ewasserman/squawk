@@ -401,6 +401,12 @@ async def _confirm_and_send(command: str, client: RpcClient, draft: Draft, io: C
             f"Not delivered: {name}'s squawk service refused the message"
             f"{f' ({reason})' if reason else ''}. It will not be retried."
         )
+    elif state == "sent":
+        status = (
+            f"Sent to {name}: waiting at the relay until their squawk service fetches it "
+            "(it looks offline). The relay keeps it for up to 7 days; you do not need to "
+            "resend it."
+        )
     else:
         status = (
             f"Sent to {name}: queued, not yet delivered (their service has not answered). "
