@@ -18,13 +18,19 @@ forgotten. An incoming message goes to:
   4. otherwise no session: it waits unread, and a desktop notification tells
      the person. It is delivered later if a session it matches registers.
 
+The person's allow and deny lists (see squawk.project) hide sessions from
+paired contacts by project. A hidden session is left out of the list contacts
+may ask for, and for rules 2 and 3 it does not exist; rule 1 still applies,
+so answers to what a hidden session sent come back to it. With an empty
+allow list, every session is hidden.
+
 Network transports (mDNS discovery, the WebSocket listener) plug in through
 `deliver_incoming` (for messages that arrive) and the `Transport` class (for
 messages to send), so routing does not depend on how a message travels.
 
 The methods squawk 0.1 also had take and return the same JSON as there; the
-session methods, `status`'s session list and `get_message`'s "error" field
-were added later.
+session methods, `status`'s session list, `get_message`'s "error" field and
+the allow and deny lists were added later.
 """
 
 import asyncio
@@ -34,7 +40,7 @@ import os
 import sys
 import unicodedata
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
 from squawk import jsontext
@@ -50,6 +56,13 @@ from squawk.inbox import (
     notification_text,
     post_to_inbox,
     unique_label,
+)
+from squawk.project import (
+    MAX_PATTERNS,
+    PATTERN_MAX,
+    is_path_pattern,
+    is_visible,
+    session_project,
 )
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcClient, RpcConnection, RpcError, RpcErrorCode, RpcHandler, RpcServer
@@ -88,6 +101,15 @@ session takes (absent: none)."""
 SHARE_SESSIONS_KEY = "share_sessions"
 """Setting key holding "off" when paired contacts may not list this
 machine's sessions (absent or "on": they may)."""
+
+SESSION_ALLOW_KEY = "session_allow"
+"""Setting key holding the allow list: a JSON array of patterns (see
+squawk.project). Absent: empty, so every session is hidden from contacts."""
+
+SESSION_DENY_KEY = "session_deny"
+"""Setting key holding the deny list, a JSON array of patterns."""
+
+_PATTERN_LISTS = {"allow": SESSION_ALLOW_KEY, "deny": SESSION_DENY_KEY}
 
 
 class PeerSession(TypedDict):
@@ -241,7 +263,11 @@ class SessionInfo(TypedDict):
     label: str
     repo: str | None
     branch: str | None
+    project: str | None
+    """The path of the repository's `origin` remote, such as "owner/repo"."""
     cwd: str
+    visible: bool
+    """Whether the allow and deny lists let paired contacts see and address it."""
     reachable: bool
     """Whether its inbox socket accepted a connection at the last check."""
     catch_all: bool
@@ -504,6 +530,7 @@ class Daemon:
 
         self._store = Store.open(db_path(self.home), now=self._now)
         self._sessions = {s.session_id: s for s in self._store.list_sessions()}
+        self._fill_in_projects()
         server = RpcServer()
         self._register_methods(server)
         await server.listen(self.socket_path)
@@ -594,6 +621,64 @@ class Daemon:
     def shares_sessions(self) -> bool:
         return self.store.get_setting(SHARE_SESSIONS_KEY) != "off"
 
+    def session_patterns(self, which: Literal["allow", "deny"]) -> list[str]:
+        """The allow or the deny list (see squawk.project). A stored value
+        that cannot be read counts as an empty list."""
+        text = self.store.get_setting(_PATTERN_LISTS[which])
+        try:
+            value = [] if text is None else jsontext.parse(text)
+        except ValueError:
+            return []
+        if not isinstance(value, list):
+            return []
+        return [p for p in value if isinstance(p, str) and p != ""]
+
+    def change_session_patterns(
+        self, action: Literal["allow", "deny", "forget"], pattern: str
+    ) -> bool:
+        """Adds `pattern` to the allow or the deny list (taking it out of the
+        other one), or with "forget" takes it out of both. Returns False if
+        nothing changed. Delivers waiting messages, since sessions may have
+        become visible."""
+        changed = False
+        for which in ("allow", "deny"):
+            patterns = self.session_patterns(which)
+            if which == action and pattern not in patterns:
+                if len(patterns) >= MAX_PATTERNS:
+                    raise RpcError(
+                        RpcErrorCode.APPLICATION_ERROR,
+                        f"the {which} list already has {MAX_PATTERNS} patterns",
+                    )
+                patterns.append(pattern)
+            elif which != action and pattern in patterns:
+                patterns.remove(pattern)
+            else:
+                continue
+            changed = True
+            self.store.set_setting(_PATTERN_LISTS[which], jsontext.stringify(patterns))
+        if changed:
+            self._spawn(self._deliver_waiting())
+        return changed
+
+    def _is_visible(self, session: SessionRecord) -> bool:
+        return is_visible(session, self.session_patterns("allow"), self.session_patterns("deny"))
+
+    def _visible_sessions(self) -> list[SessionRecord]:
+        """Open sessions that paired contacts may see and address."""
+        allow, deny = self.session_patterns("allow"), self.session_patterns("deny")
+        return [s for s in self._open_sessions() if is_visible(s, allow, deny)]
+
+    def _fill_in_projects(self) -> None:
+        """Works out the project and root of sessions registered before squawk
+        recorded them, so that the allow and deny lists apply to them too. A
+        session git gave no answer for is tried again at the next start."""
+        for session in list(self._sessions.values()):
+            if session.root is None:
+                project, root = session_project(session.cwd)
+                updated = replace(session, project=project, root=root)
+                self.store.save_session(updated)
+                self._sessions[session.session_id] = updated
+
     def register_session(
         self,
         *,
@@ -604,13 +689,18 @@ class Daemon:
         base_label: str,
         repo: str | None = None,
         branch: str | None = None,
+        project: str | None = None,
+        root: str | None = None,
     ) -> SessionRecord:
         """Records a Claude Code session (or updates it, when the same session
         registers again) and starts delivering messages waiting for it.
 
         The label is `base_label`, with "-2", "-3", ... added when another
         open session already has it. A session registering again keeps its
-        label.
+        label. Only sessions that are visible to contacts, or only hidden
+        ones, are counted, whichever the new session is: a number on a
+        visible label would otherwise tell contacts that a hidden session
+        has the same name.
         """
         previous = self._sessions.get(session_id)
         # Another registration with the same socket is a session that ended
@@ -618,16 +708,9 @@ class Daemon:
         for other in list(self._sessions.values()):
             if other.socket_path == socket and other.session_id != session_id:
                 self._forget(other.session_id)
-        if previous is not None and previous.base_label == base_label:
-            label = previous.label
-        else:
-            label = unique_label(
-                base_label,
-                (s.label for s in self._sessions.values() if s.session_id != session_id),
-            )
         record = SessionRecord(
             session_id=session_id,
-            label=label,
+            label=base_label,
             base_label=base_label,
             repo=repo,
             branch=branch,
@@ -637,7 +720,19 @@ class Daemon:
             registered_at=previous.registered_at
             if previous is not None
             else iso_from_ms(self._now()),
+            project=project,
+            root=root,
         )
+        if previous is not None and previous.base_label == base_label:
+            record = replace(record, label=previous.label)
+        else:
+            visible = self._is_visible(record)
+            taken = (
+                s.label
+                for s in self._sessions.values()
+                if s.session_id != session_id and self._is_visible(s) == visible
+            )
+            record = replace(record, label=unique_label(base_label, taken))
         self.store.save_session(record)
         self._sessions[session_id] = record
         self._unreachable_since.pop(session_id, None)
@@ -707,15 +802,23 @@ class Daemon:
         self, message: StoredMessage, exclude: set[str] | None = None
     ) -> SessionRecord | None:
         """The session an incoming message goes to, or None (see the module
-        description). Sessions in `exclude` (by id) are not considered."""
-        candidates = [
-            s for s in self._open_sessions() if exclude is None or s.session_id not in exclude
-        ]
+        description). Sessions in `exclude` (by id) are not considered.
+
+        A session hidden by the allow and deny lists gets only the
+        conversations it already has: it is never found by name and never
+        the catch-all, exactly as if it were not open."""
+
+        def considered(sessions: list[SessionRecord]) -> list[SessionRecord]:
+            return [s for s in sessions if exclude is None or s.session_id not in exclude]
+
         bound = self.store.thread_session(message.thread_id)
         if bound is not None:
-            owner = next((s for s in candidates if s.session_id == bound), None)
+            owner = next(
+                (s for s in considered(self._open_sessions()) if s.session_id == bound), None
+            )
             if owner is not None:
                 return owner
+        candidates = considered(self._visible_sessions())
         named = find_session(candidates, message.session)
         if named is not None:
             return named
@@ -790,13 +893,16 @@ class Daemon:
 
     def session_infos(self) -> list[SessionInfo]:
         """The registered sessions, oldest first."""
-        catch_all = find_session(self._open_sessions(), self.catch_all_label())
+        catch_all = find_session(self._visible_sessions(), self.catch_all_label())
+        allow, deny = self.session_patterns("allow"), self.session_patterns("deny")
         return [
             {
                 "label": s.label,
                 "repo": s.repo,
                 "branch": s.branch,
+                "project": s.project,
                 "cwd": s.cwd,
+                "visible": is_visible(s, allow, deny),
                 "reachable": self._is_reachable(s.session_id),
                 "catch_all": catch_all is not None and catch_all.session_id == s.session_id,
                 "registered_at": s.registered_at,
@@ -806,12 +912,14 @@ class Daemon:
 
     def sessions_for_peer(self) -> PeerSessions:
         """What a paired contact may see of this machine's sessions: labels
-        and branches of reachable ones, or nothing if sharing is off."""
+        and branches of the reachable ones that the allow and deny lists do
+        not hide, or nothing if sharing is off. The answer is the same
+        whether a session is hidden or not open."""
         if not self.shares_sessions():
             return {"shared": False, "sessions": []}
         return {
             "shared": True,
-            "sessions": [{"label": s.label, "branch": s.branch} for s in self._open_sessions()],
+            "sessions": [{"label": s.label, "branch": s.branch} for s in self._visible_sessions()],
         }
 
     async def send(self, params: SendParams) -> SendResult:
@@ -1014,11 +1122,14 @@ class Daemon:
                 base_label=required("base_label", 256),
                 repo=_optional_string(obj, "repo", 256),
                 branch=_optional_string(obj, "branch", 256),
+                project=_optional_string(obj, "project", 256),
+                root=_optional_string(obj, "root", 4096),
             )
-            catch_all = find_session(self._open_sessions(), self.catch_all_label())
+            catch_all = find_session(self._visible_sessions(), self.catch_all_label())
             return {
                 "label": record.label,
                 "catch_all": catch_all is not None and catch_all.session_id == record.session_id,
+                "visible": self._is_visible(record),
             }
 
         def unregister_session(params: Any, _connection: RpcConnection) -> dict[str, bool]:
@@ -1034,6 +1145,8 @@ class Daemon:
                 "sessions": self.session_infos(),
                 "catch_all": self.catch_all_label(),
                 "share": self.shares_sessions(),
+                "allow": self.session_patterns("allow"),
+                "deny": self.session_patterns("deny"),
             }
 
         def set_catch_all(params: Any, _connection: RpcConnection) -> dict[str, Any]:
@@ -1043,8 +1156,40 @@ class Daemon:
                 raise _invalid("label: required")
             label = _optional_string(obj, "label", 256)
             self.set_catch_all(label or None)
-            match = find_session(self._open_sessions(), self.catch_all_label())
-            return {"catch_all": self.catch_all_label(), "open": match is not None}
+            match = find_session(self._visible_sessions(), self.catch_all_label())
+            hidden = match is None and (
+                find_session(self._open_sessions(), self.catch_all_label()) is not None
+            )
+            return {
+                "catch_all": self.catch_all_label(),
+                "open": match is not None,
+                "hidden": hidden,
+            }
+
+        def set_session_pattern(params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            obj = _params_object(params)
+            assert obj is not None
+            action = _enum_field(obj, "action", ("allow", "deny", "forget"))
+            if action is None:
+                raise _invalid("action: required")
+            pattern = _string_field(
+                obj, "pattern", required=True, min_length=1, max_length=PATTERN_MAX
+            )
+            assert pattern is not None
+            if pattern != pattern.strip() or any(ord(ch) < 32 for ch in pattern):
+                raise _invalid(
+                    "pattern: must not start or end with a space or hold control characters"
+                )
+            changed = self.change_session_patterns(
+                cast(Literal["allow", "deny", "forget"], action), pattern
+            )
+            return {
+                "changed": changed,
+                "path": is_path_pattern(pattern),
+                "allow": self.session_patterns("allow"),
+                "deny": self.session_patterns("deny"),
+                "sessions": self.session_infos(),
+            }
 
         def set_share_sessions(params: Any, _connection: RpcConnection) -> dict[str, bool]:
             obj = _params_object(params)
@@ -1181,6 +1326,7 @@ class Daemon:
         server.handle("sessions", sessions)
         server.handle("set_catch_all", set_catch_all)
         server.handle("set_share_sessions", set_share_sessions)
+        server.handle("set_session_pattern", set_session_pattern)
         server.handle("peer_sessions", peer_sessions)
         server.handle("send", send)
         server.handle("peers", lambda _p, _c: {"peers": self.peers()})

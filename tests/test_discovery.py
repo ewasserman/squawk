@@ -19,6 +19,7 @@ from squawk.discovery import (
     RawService,
     ZeroconfBackend,
     default_backend,
+    parse_dns_sd_address,
     parse_dns_sd_txt,
     peer_from_service,
 )
@@ -205,6 +206,85 @@ def test_a_withdrawn_newer_advertisement_falls_back_to_the_one_still_there() -> 
     d._handle_down(RawService(name=spoof.name, host=spoof.host, port=0, txt={}))
     found = d.peer(ad.key_id)
     assert found is not None and found.host == "real.local"
+
+
+async def test_lookup_finds_a_peer_whose_host_was_renamed() -> None:
+    net = FakeNetwork()
+    alice = Discovery(make_ad("alice", 4100), backend=FakeBackend(net))
+    bob_ad = make_ad("bob", 4200)
+    bob = Discovery(bob_ad, backend=FakeBackend(net))
+    await alice.start()
+    await bob.start()
+    first = alice.peer(bob_ad.key_id)
+    assert first is not None
+    # macOS renames Bob's host. The instance stays, so no new "up" is sent by itself.
+    owner, service = net.services[bob.instance_name()]
+    net.services[service.name] = (
+        owner,
+        RawService(
+            name=service.name,
+            host="bob-2.local",
+            port=service.port,
+            addresses=["192.168.1.6"],
+            txt=service.txt,
+        ),
+    )
+    assert alice.peer(bob_ad.key_id) == first
+
+    found = await alice.lookup(bob_ad.key_id, timeout=1)
+
+    assert found is not None
+    assert found.host == "bob-2.local"
+    assert found.addresses == ["192.168.1.6"]
+    assert alice.peer(bob_ad.key_id) == found
+    await alice.stop()
+    await bob.stop()
+
+
+class SilentBackend:
+    """A network where nobody answers."""
+
+    async def publish(self, instance_name: str, port: int, txt: dict[str, str]) -> None:
+        pass
+
+    async def browse(
+        self, on_up: Callable[[RawService], None], on_down: Callable[[RawService], None]
+    ) -> None:
+        pass
+
+    def query(self) -> None:
+        pass
+
+    async def destroy(self) -> None:
+        pass
+
+
+async def test_lookup_gives_up_after_the_timeout() -> None:
+    alice = Discovery(make_ad("alice", 4100), backend=SilentBackend())
+    await alice.start()
+    assert await alice.lookup(make_ad("bob", 4200).key_id, timeout=0.05) is None
+    await alice.stop()
+
+
+def test_parse_dns_sd_address_reads_the_addresses_dns_sd_prints() -> None:
+    def line(address: str) -> str:
+        return f"12:44:34.532  Add  40000002      15  hal-2.local.   {address}   4500"
+
+    assert parse_dns_sd_address(line("10.0.0.66")) == "10.0.0.66"
+    # dns-sd prints IPv6 in full, with "%<0>" after a global address.
+    assert (
+        parse_dns_sd_address(line("2601:0645:0082:1EC0:0000:0000:0000:7059%<0>"))
+        == "2601:645:82:1ec0::7059"
+    )
+    # A link-local address keeps its zone, which marks it as not dialable.
+    assert (
+        parse_dns_sd_address(line("FE80:0000:0000:0000:00A6:25DF:C73B:A7CD%en0"))
+        == "fe80::a6:25df:c73b:a7cd%en0"
+    )
+    assert parse_dns_sd_address(line("127.0.0.1")) is None
+    assert parse_dns_sd_address(line("0000:0000:0000:0000:0000:0000:0000:0001%<0>")) is None
+    assert parse_dns_sd_address("Timestamp     A/R  Flags  IF  Hostname  Address  TTL") is None
+    assert parse_dns_sd_address(line("not-an-address")) is None
 
 
 def test_uses_a_unique_instance_name_built_from_the_name_and_fingerprint() -> None:

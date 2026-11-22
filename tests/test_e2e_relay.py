@@ -74,6 +74,8 @@ class RelayWorld(World):
             home, transport=transport, notify=lambda title, text: notes.append((title, text))
         )
         await daemon.start()
+        # Contacts may see every session, as in test_e2e.py.
+        daemon.change_session_patterns("allow", "*")
         pairing = Pairing(daemon, transport, timeout_ms=5000)
         pairing.start()
         # No direct address: the other service can reach this one only through the relay.

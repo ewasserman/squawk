@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import json
 import os
-import subprocess
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -30,6 +29,7 @@ from squawk.cli_messages import (
 from squawk.config import identity_path, run_dir, squawk_home
 from squawk.daemon import MessageNotification, SessionInfo
 from squawk.daemon_control import connect_to_daemon, start_daemon
+from squawk.project import common_dir, git, session_project
 from squawk.rpc import RpcClient
 from squawk.timefmt import iso_from_ms, now_ms
 
@@ -40,7 +40,6 @@ END_BUDGET_S = 1.0
 """The most time `hook session-end` spends. Claude Code gives all SessionEnd
 hooks together 1.5 seconds unless a hook's timeout says otherwise."""
 
-GIT_TIMEOUT_S = 2.0
 HOOK_LOG_MAX_BYTES = 1_000_000
 
 
@@ -64,22 +63,6 @@ def hook_log(home: str, text: str) -> None:
         pass
 
 
-def _git(cwd: str, *args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, *args],
-            capture_output=True,
-            text=True,
-            timeout=GIT_TIMEOUT_S,
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    out = result.stdout.strip()
-    return out if result.returncode == 0 and out else None
-
-
 def session_label_parts(cwd: str) -> tuple[str, str | None, str | None]:
     """The base label, repository name and branch for a session started in `cwd`.
 
@@ -88,19 +71,18 @@ def session_label_parts(cwd: str) -> tuple[str, str | None, str | None]:
     repository has the same name. Outside git it is the folder's name.
     """
     folder = os.path.basename(os.path.normpath(cwd)) or "session"
-    common = _git(cwd, "rev-parse", "--git-common-dir")
+    common = common_dir(cwd)
     if common is None:
         return folder, None, None
-    common_dir = os.path.normpath(os.path.join(cwd, common))
-    if os.path.basename(common_dir) == ".git":
-        repo = os.path.basename(os.path.dirname(common_dir))
+    if os.path.basename(common) == ".git":
+        repo = os.path.basename(os.path.dirname(common))
     else:
         # A bare repository, such as "project.git".
-        repo = os.path.basename(common_dir).removesuffix(".git")
+        repo = os.path.basename(common).removesuffix(".git")
     repo = repo or folder
-    branch = _git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
+    branch = git(cwd, "symbolic-ref", "--short", "-q", "HEAD")
     if branch is None:
-        commit = _git(cwd, "rev-parse", "--short", "HEAD")
+        commit = git(cwd, "rev-parse", "--short", "HEAD")
         branch = None if commit is None else f"detached-{commit}"
     label = repo if branch is None else f"{repo}@{branch}"
     return label[:256], repo[:256], None if branch is None else branch[:256]
@@ -112,7 +94,7 @@ def service_env(env: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if not k.startswith("CLAUDE")}
 
 
-def session_note(label: str, catch_all: bool) -> str:
+def session_note(label: str, catch_all: bool, visible: bool = True) -> str:
     """What the SessionStart hook prints; Claude Code shows it to Claude."""
     lines = [
         "squawk: this session can exchange messages with other people's Claude Code "
@@ -122,6 +104,12 @@ def session_note(label: str, catch_all: bool) -> str:
     ]
     if catch_all:
         lines.append("This session also takes squawk messages not addressed to any session.")
+    if not visible:
+        lines.append(
+            "Your user's allow and deny lists hide this session from their contacts: "
+            "contacts cannot list it or address it. It can still send squawk messages, "
+            "and the answers come back here."
+        )
     lines.append("How to read, answer and send squawk messages: see the squawk skill.")
     return "\n".join(lines) + "\n"
 
@@ -161,6 +149,7 @@ async def _session_start(home: str, io: CliIo) -> None:
         io.stdout(NO_INBOX_NOTE)
         return
     base_label, repo, branch = session_label_parts(cwd)
+    project, root = session_project(cwd)
     client = await connect_to_daemon(home)
     if client is None:
         started = await start_daemon(home, service_env(io.env))
@@ -180,11 +169,17 @@ async def _session_start(home: str, io: CliIo) -> None:
                 "base_label": base_label,
                 "repo": repo,
                 "branch": branch,
+                "project": project,
+                "root": root,
             },
         )
     finally:
         await client.close()
-    io.stdout(session_note(result["label"], bool(result.get("catch_all"))))
+    io.stdout(
+        session_note(
+            result["label"], bool(result.get("catch_all")), result.get("visible") is not False
+        )
+    )
 
 
 async def _session_end(home: str, io: CliIo) -> None:
@@ -235,7 +230,28 @@ def _table(rows: list[list[str]]) -> str:
     )
 
 
-def format_local_sessions(sessions: list[SessionInfo], catch_all: str | None, share: bool) -> str:
+def format_patterns(allow: list[str], deny: list[str]) -> str:
+    """The allow and deny lists, as `squawk sessions` shows them."""
+    if not allow:
+        out = (
+            "Allow list: empty, so paired contacts can see and address none of your "
+            "sessions. Allow projects with `squawk sessions --allow <pattern>`, such as "
+            "'some-org/*', or '*' for all of them.\n"
+        )
+    else:
+        out = f"Allow list: {'  '.join(allow)}\n"
+    if deny:
+        out += f"Deny list (wins over the allow list): {'  '.join(deny)}\n"
+    return out
+
+
+def format_local_sessions(
+    sessions: list[SessionInfo],
+    catch_all: str | None,
+    share: bool,
+    allow: list[str],
+    deny: list[str],
+) -> str:
     out = ""
     if not sessions:
         out += (
@@ -244,11 +260,13 @@ def format_local_sessions(sessions: list[SessionInfo], catch_all: str | None, sh
             "already open.\n"
         )
     else:
-        rows = [["", "LABEL", "BRANCH", "REACHABLE", "FOLDER"]] + [
+        rows = [["", "LABEL", "BRANCH", "PROJECT", "VISIBLE", "REACHABLE", "FOLDER"]] + [
             [
                 "*" if s["catch_all"] else "",
                 s["label"],
                 s["branch"] or "-",
+                s["project"] or "-",
+                "yes" if s["visible"] else "no",
                 "yes" if s["reachable"] else "no",
                 s["cwd"],
             ]
@@ -264,13 +282,20 @@ def format_local_sessions(sessions: list[SessionInfo], catch_all: str | None, sh
         )
     elif any(s["catch_all"] for s in sessions):
         out += f"Catch-all: {catch_all} (marked *) takes messages that name no open session.\n"
+    elif any(not s["visible"] and catch_all in (s["label"], s["repo"]) for s in sessions):
+        out += (
+            f"Catch-all: {catch_all}, but that session is hidden from contacts, so it "
+            "takes no such messages.\n"
+        )
     else:
         out += f"Catch-all: {catch_all}, but no open session has that label now.\n"
+    out += format_patterns(allow, deny)
     out += (
-        "Paired contacts can see these labels and branches (`squawk sessions --share off` "
-        "to stop that).\n"
+        "Paired contacts can see the labels and branches of the visible sessions, and "
+        "address them (`squawk sessions --share off` to stop them listing any).\n"
         if share
-        else "Paired contacts cannot see this list (`squawk sessions --share on` to allow it).\n"
+        else "Paired contacts cannot list your sessions (`squawk sessions --share on` to "
+        "allow it); they can still address a visible one by its label.\n"
     )
     return out
 
@@ -281,7 +306,7 @@ def format_peer_sessions(result: dict[str, Any]) -> str:
         return f"{name} has turned off sharing their session list.\n"
     sessions = result["sessions"]
     if not sessions:
-        return f"{name} has no open Claude Code sessions registered with squawk.\n"
+        return f"{name} has no open Claude Code sessions that you can see.\n"
     rows = [["LABEL", "BRANCH"]] + [[s["label"], s["branch"] or "-"] for s in sessions]
     return f"{name}'s open sessions:\n" + _table(rows)
 
@@ -292,19 +317,61 @@ SESSIONS_USAGE = (
     "       squawk sessions --catch-all <label>|off   choose the session for messages\n"
     "                                                 that name no open session\n"
     "       squawk sessions --share on|off            let paired contacts list your sessions\n"
+    "       squawk sessions --allow <pattern>         let paired contacts see and address\n"
+    "                                                 sessions in matching projects\n"
+    "       squawk sessions --deny <pattern>          hide sessions in matching projects,\n"
+    "                                                 even allowed ones\n"
+    "       squawk sessions --forget <pattern>        take a pattern off both lists\n"
+    "A pattern is compared with a session's project (the owner/repository of its git\n"
+    "remote, such as 'some-org/*') and its repository name; one starting with / or ~\n"
+    "is compared with the repository's folder. Nothing is allowed until you allow it;\n"
+    "'*' allows everything. Quote patterns so that the shell leaves them alone.\n"
 )
+
+
+def _hidden_and_visible(sessions: list[SessionInfo]) -> str:
+    visible = [s["label"] for s in sessions if s["visible"]]
+    hidden = [s["label"] for s in sessions if not s["visible"]]
+    return (
+        f"Visible to paired contacts now: {', '.join(visible) or 'none'}.\n"
+        f"Hidden: {', '.join(hidden) or 'none'}.\n"
+    )
 
 
 async def _sessions(args: list[str], io: CliIo) -> int:
     values, positionals = parse_args(
         args,
-        {"json": Opt("boolean"), "catch-all": Opt("string"), "share": Opt("string")},
+        {
+            "json": Opt("boolean"),
+            "catch-all": Opt("string"),
+            "share": Opt("string"),
+            "allow": Opt("string"),
+            "deny": Opt("string"),
+            "forget": Opt("string"),
+        },
         allow_positionals=True,
     )
+    patterns = [
+        (action, value)
+        for action in ("allow", "deny", "forget")
+        if (value := string_value(values, action)) is not None
+    ]
     catch_all = string_value(values, "catch-all")
     share = string_value(values, "share")
     as_json = values.get("json") is True
-    if len(positionals) > 1 or (positionals and (catch_all is not None or share is not None)):
+    setting = catch_all is not None or share is not None or bool(patterns)
+    # Only the last value of a repeated option is kept, and the lists are
+    # changed in a fixed order: refuse what would not do what was typed.
+    given = [a.split("=", 1)[0] for a in args if a.startswith("--")]
+    if any(given.count(f"--{action}") > 1 for action, _ in patterns) or len(
+        {pattern for _, pattern in patterns}
+    ) < len(patterns):
+        io.stderr(
+            "squawk sessions: give each of --allow, --deny and --forget once, with "
+            "different patterns; run the command again for another pattern\n"
+        )
+        return 2
+    if len(positionals) > 1 or (positionals and setting):
         io.stderr(SESSIONS_USAGE)
         return 2
     if share is not None and share not in ("on", "off"):
@@ -312,7 +379,30 @@ async def _sessions(args: list[str], io: CliIo) -> int:
         return 2
 
     async def run(client: RpcClient) -> int:
-        if catch_all is not None or share is not None:
+        if setting:
+            for action, pattern in patterns:
+                result = await client.call(
+                    "set_session_pattern", {"action": action, "pattern": pattern}
+                )
+                if not result["changed"]:
+                    io.stdout(
+                        f"{pattern} is on neither list.\n"
+                        if action == "forget"
+                        else f"{pattern} was already on the {action} list.\n"
+                    )
+                elif action == "forget":
+                    io.stdout(f"{pattern} is no longer on the allow or the deny list.\n")
+                else:
+                    what = "whose folder matches" if result["path"] else "in projects matching"
+                    io.stdout(
+                        f"Paired contacts can now see and address sessions {what} "
+                        f"{pattern}, unless the deny list hides them.\n"
+                        if action == "allow"
+                        else f"Sessions {what} {pattern} are now hidden from paired contacts.\n"
+                    )
+            if patterns:
+                io.stdout(format_patterns(result["allow"], result["deny"]))
+                io.stdout(_hidden_and_visible(result["sessions"]))
             if share is not None:
                 await client.call("set_share_sessions", {"share": share == "on"})
                 io.stdout(
@@ -330,6 +420,12 @@ async def _sessions(args: list[str], io: CliIo) -> int:
                     )
                 elif result["open"]:
                     io.stdout(f"{label} now takes messages that name no open session.\n")
+                elif result.get("hidden"):
+                    io.stdout(
+                        f"{label} is hidden from paired contacts by your allow and deny "
+                        "lists, so it will take no such messages until it is visible "
+                        "(`squawk sessions --allow <pattern>`).\n"
+                    )
                 else:
                     io.stdout(
                         f"{label} will take messages that name no open session; no open "
@@ -346,7 +442,13 @@ async def _sessions(args: list[str], io: CliIo) -> int:
         io.stdout(
             jsontext.stringify(result, "  ") + "\n"
             if as_json
-            else format_local_sessions(result["sessions"], result["catch_all"], result["share"])
+            else format_local_sessions(
+                result["sessions"],
+                result["catch_all"],
+                result["share"],
+                result["allow"],
+                result["deny"],
+            )
         )
         return 0
 
@@ -380,7 +482,7 @@ async def _inbox(args: list[str], io: CliIo) -> int:
 SESSION_COMMANDS: dict[str, Command] = {
     "sessions": Command(
         "list Claude Code sessions: yours, or a contact's with `sessions <contact>` "
-        "(--catch-all <label>|off, --share on|off, --json)",
+        "(--catch-all <label>|off, --share on|off, --allow|--deny|--forget <pattern>, --json)",
         _sessions,
     ),
     "inbox": Command(

@@ -208,6 +208,7 @@ async def daemon(home: str) -> AsyncIterator[Daemon]:
     d = Daemon(home)
     await d.start()
     d.store.upsert_contact(alice.id, "alice")
+    d.change_session_patterns("allow", "*")
     try:
         yield d
     finally:
@@ -235,7 +236,8 @@ async def test_sessions_lists_the_local_sessions_and_sets_the_catch_all(
     assert "no open session has that label right now" in later.out
     listed = await cli(home, "sessions")
     assert listed.out.startswith(
-        "  LABEL     BRANCH  REACHABLE  FOLDER\n  web@main  main    yes        /work/web\n"
+        "  LABEL     BRANCH  PROJECT  VISIBLE  REACHABLE  FOLDER\n"
+        "  web@main  main    -        yes      yes        /work/web\n"
     )
     assert "Catch-all: api@main, but no open session has that label now." in listed.out
 
@@ -253,7 +255,7 @@ async def test_sessions_lists_the_local_sessions_and_sets_the_catch_all(
     assert (await cli(home, "sessions", "--share", "off")).out == (
         "Paired contacts can no longer list your sessions.\n"
     )
-    assert "Paired contacts cannot see this list" in (await cli(home, "sessions")).out
+    assert "Paired contacts cannot list your sessions" in (await cli(home, "sessions")).out
 
     bad = await cli(home, "sessions", "--share", "maybe")
     assert bad.code == 2
@@ -262,6 +264,113 @@ async def test_sessions_lists_the_local_sessions_and_sets_the_catch_all(
     no_network = await cli(home, "sessions", "alice")
     assert no_network.code == 1
     assert "has no network transport" in no_network.err
+
+
+async def test_sessions_allows_and_denies_projects(
+    home: str, daemon: Daemon, inboxes: Inboxes
+) -> None:
+    daemon.change_session_patterns("forget", "*")
+    for number, (label, project) in enumerate(
+        (("app@main", "cadena/app"), ("api@main", "some-org/api")), 1
+    ):
+        inbox = await inboxes.new(f"s{number}")
+        daemon.register_session(
+            session_id=f"s-{number}",
+            socket=inbox.path,
+            token=inbox.token,
+            cwd=f"/work/{label}",
+            base_label=label,
+            repo=label.split("@")[0],
+            branch="main",
+            project=project,
+            root=f"/work/{label}",
+        )
+    listed = await cli(home, "sessions")
+    assert listed.out.startswith(
+        "  LABEL     BRANCH  PROJECT       VISIBLE  REACHABLE  FOLDER\n"
+        "  app@main  main    cadena/app    no       yes        /work/app@main\n"
+        "  api@main  main    some-org/api  no       yes        /work/api@main\n"
+    )
+    assert "Allow list: empty, so paired contacts can see and address none" in listed.out
+    assert "[hidden from contacts]" in (await cli(home, "status")).out
+
+    allowed = await cli(home, "sessions", "--allow", "*")
+    assert allowed.out == (
+        "Paired contacts can now see and address sessions in projects matching *, unless "
+        "the deny list hides them.\n"
+        "Allow list: *\n"
+        "Visible to paired contacts now: app@main, api@main.\n"
+        "Hidden: none.\n"
+    )
+    denied = await cli(home, "sessions", "--deny", "some-org/*")
+    assert denied.out == (
+        "Sessions in projects matching some-org/* are now hidden from paired contacts.\n"
+        "Allow list: *\n"
+        "Deny list (wins over the allow list): some-org/*\n"
+        "Visible to paired contacts now: app@main.\n"
+        "Hidden: api@main.\n"
+    )
+    assert daemon.sessions_for_peer()["sessions"] == [{"label": "app@main", "branch": "main"}]
+    again = await cli(home, "sessions", "--deny", "some-org/*")
+    assert again.out.startswith("some-org/* was already on the deny list.\n")
+    by_folder = await cli(home, "sessions", "--deny", "/work/app*")
+    assert by_folder.out.startswith("Sessions whose folder matches /work/app* are now hidden")
+    assert "Visible to paired contacts now: none.\n" in by_folder.out
+
+    hidden = await cli(home, "sessions", "--catch-all", "api@main")
+    assert hidden.out.startswith("api@main is hidden from paired contacts")
+    listed = await cli(home, "sessions")
+    assert "Catch-all: api@main, but that session is hidden from contacts" in listed.out
+    assert "Deny list (wins over the allow list): some-org/*  /work/app*\n" in listed.out
+    assert json.loads((await cli(home, "sessions", "--json")).out)["deny"] == [
+        "some-org/*",
+        "/work/app*",
+    ]
+
+    forgot = await cli(home, "sessions", "--forget", "/work/app*")
+    assert forgot.out.startswith("/work/app* is no longer on the allow or the deny list.\n")
+    # A repeated option, or one pattern for two lists, is refused whole.
+    for args in (
+        ("--forget", "some-org/*", "--forget=x"),
+        ("--allow", "x", "--deny", "x"),
+    ):
+        refused = await cli(home, "sessions", *args)
+        assert refused.code == 2 and "once" in refused.err
+    assert daemon.session_patterns("deny") == ["some-org/*"]
+    both = await cli(home, "sessions", "--allow", "cadena/*", "--forget", "some-org/*")
+    assert both.code == 0
+    assert (daemon.session_patterns("allow"), daemon.session_patterns("deny")) == (
+        ["*", "cadena/*"],
+        [],
+    )
+    assert (await cli(home, "sessions", "--forget", "nope")).out.startswith(
+        "nope is on neither list.\n"
+    )
+    assert (await cli(home, "sessions", "alice", "--allow", "*")).code == 2
+    assert (await cli(home, "sessions", "--allow", "")).code == 1
+
+
+async def test_session_start_records_the_project_and_says_when_the_session_is_hidden(
+    home: str, daemon: Daemon, inboxes: Inboxes
+) -> None:
+    repo = os.path.join(os.path.realpath(home), "myrepo")
+    os.makedirs(repo)
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "remote", "add", "origin", "https://github.com/some-org/myrepo.git")
+    daemon.change_session_patterns("deny", "some-org/*")
+    inbox = await inboxes.new("s")
+    result = await cli(home, "hook", "session-start", stdin=start_input("s-1", repo), inbox=inbox)
+    assert "allow and deny lists hide this session from their contacts" in result.out
+    [record] = daemon.store.list_sessions()
+    assert (record.project, record.root) == ("some-org/myrepo", repo)
+    assert daemon.sessions_for_peer()["sessions"] == []
+
+    other = await inboxes.new("o")
+    shown = await cli(
+        home, "hook", "session-start", stdin=start_input("s-2", "/tmp/no-repo/x"), inbox=other
+    )
+    assert "hide this session" not in shown.out
+    assert daemon.sessions_for_peer()["sessions"] == [{"label": "x", "branch": None}]
 
 
 async def test_inbox_shows_unread_messages_and_marks_them_read(home: str, daemon: Daemon) -> None:

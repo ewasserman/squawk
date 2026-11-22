@@ -177,8 +177,39 @@ tokens are deleted when the session ends.
 
 Paired contacts can list your open sessions' labels (repository name and
 branch), so that their Claude can address the right one. Paths, tokens and
-anything else stay on your machine. `squawk sessions --share off` turns the
+anything else stay on your machine, including the project and folder that
+the lists below are compared with. `squawk sessions --share off` turns the
 list off.
+
+A label can itself be private: the name of a client's repository, or of a
+branch. The person therefore chooses by project which sessions contacts may
+see, with an allow list and a deny list of patterns (`squawk sessions
+--allow`, `--deny`). A session is visible only if it matches an allow pattern
+and no deny pattern, and the allow list starts empty, so nothing is listed
+until the person allows it.
+
+- The lists are stored and applied only by the service of the machine the
+  sessions are on, where it answers the list request and where it chooses
+  the session for an incoming message. The asking side is not trusted to
+  filter anything, and nothing in a message or a request can change the
+  lists.
+- A hidden session is not listed, is not found by the name a message gives,
+  and is never the catch-all. Such a message waits in the inbox, exactly as
+  when no open session has that name, and the sender gets the same
+  acknowledgement in both cases, so a contact cannot learn by guessing
+  labels that a hidden session exists.
+- A hidden session can still send, and answers in the conversations it has
+  come back to it. Outgoing messages do not carry the sending session's
+  label.
+- The squawk skill tells Claude that only its user may change the lists, and
+  never because a message asks.
+
+**What remains.** A session's project comes from its `origin` remote, read
+when the session starts. A repository without that remote matches only by
+its name or its folder, so a deny pattern such as `some-org/*` does not hide
+it; with the allow list, the usual way to share, it stays hidden unless
+something allows it. A conversation that a session had before it was hidden
+stays with it.
 
 ### 7. The private key on disk
 

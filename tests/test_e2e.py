@@ -80,6 +80,7 @@ class World:
             home, transport=transport, notify=lambda title, text: notes.append((title, text))
         )
         await daemon.start()
+        daemon.change_session_patterns("allow", "*")
         pairing = Pairing(daemon, transport, timeout_ms=5000)
         pairing.start()
         person = Person(name, home, daemon, pairing, f"127.0.0.1:{transport.port}", notes)
@@ -243,7 +244,20 @@ async def test_two_people_exchange_messages_between_the_right_sessions(world: Wo
     assert body_of(lunch) == "lunch at noon?"
     assert len(alice_a.messages) == 1
     local = await world.cli(alice, "sessions")
-    assert re.search(r"^\*\s+other\s+-\s+yes\s+/tmp/no-repo/other$", local.out, re.M)
+    assert re.search(r"^\*\s+other\s+-\s+-\s+yes\s+yes\s+/tmp/no-repo/other$", local.out, re.M)
+
+    # Bob hides one project: Alice no longer sees that session, and a new
+    # message naming it waits in Bob's inbox instead of reaching it.
+    denied = await world.cli(bob, "sessions", "--deny", "web")
+    assert denied.code == 0 and "Hidden: web.\n" in denied.out
+    listed = await world.cli(alice, "sessions", "bob")
+    assert listed.out == "bob's open sessions:\nLABEL  BRANCH\napi    -\n"
+    probe = await world.cli(alice, "send", "bob", "anyone in web?", "--session", "web")
+    assert probe.code == 0, probe.err
+    assert "delivered to their squawk service" in probe.out
+    await wait_for(lambda: bob.notes or None)
+    assert bob.notes == [("squawk: message from alice", "anyone in web?")]
+    assert bob_web.messages == []
 
     # Bob turns sharing off: Alice sees no sessions.
     assert (await world.cli(bob, "sessions", "--share", "off")).code == 0

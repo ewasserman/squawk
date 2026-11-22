@@ -136,6 +136,14 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE messages ADD COLUMN error TEXT;
     """,
+    # The project (from the git remote) and root folder of each session, which
+    # the allow and deny lists for paired contacts are compared with. NULL
+    # for a session registered before these columns existed. Older versions
+    # ignore the extra columns.
+    """
+    ALTER TABLE sessions ADD COLUMN project TEXT;
+    ALTER TABLE sessions ADD COLUMN root TEXT;
+    """,
     # The relay each contact uses, learned during pairing (NULL: not known).
     # squawk 0.1 ignores the extra column.
     """
@@ -258,6 +266,13 @@ class SessionRecord:
     token: str
     """The session's inbox token (CLAUDE_CODE_MESSAGING_TOKEN)."""
     registered_at: str
+    project: str | None = None
+    """The path of the repository's `origin` remote without the host, such as
+    "some-org/api-server", or None when there is none."""
+    root: str | None = None
+    """The folder of the repository's main checkout, or outside git the
+    folder the session started in. None only for a session registered before
+    squawk recorded it."""
 
 
 SUBJECT_MAX = 120
@@ -1048,8 +1063,8 @@ class Store:
         self._run(
             """INSERT OR REPLACE INTO sessions
              (session_id, label, base_label, repo, branch, cwd, socket_path, token,
-              registered_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              registered_at, project, root)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             record.session_id,
             record.label,
             record.base_label,
@@ -1059,6 +1074,8 @@ class Store:
             record.socket_path,
             record.token,
             record.registered_at,
+            record.project,
+            record.root,
         )
 
     def delete_session(self, session_id: str) -> bool:
@@ -1078,6 +1095,8 @@ class Store:
                 socket_path=row["socket_path"],
                 token=row["token"],
                 registered_at=row["registered_at"],
+                project=row["project"],
+                root=row["root"],
             )
             for row in self._all("SELECT * FROM sessions ORDER BY registered_at, rowid")
         ]

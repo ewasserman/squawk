@@ -4,6 +4,7 @@ import asyncio
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -25,6 +26,7 @@ from squawk.daemon import (
 from squawk.envelope import Envelope, create_envelope
 from squawk.identity import Identity, identity_from_secret_key, init_identity
 from squawk.rpc import RpcClient, RpcError, RpcErrorCode
+from squawk.store import SessionRecord
 
 alice = identity_from_secret_key("alice", ed25519_random_secret_key())
 
@@ -78,6 +80,8 @@ class Env:
         repo: str | None = None,
         session_id: str | None = None,
         inbox: FakeInbox | None = None,
+        project: str | None = None,
+        root: str | None = None,
     ) -> "Session":
         """Registers a fake Claude Code session over the real socket, as its
         SessionStart hook would."""
@@ -95,6 +99,8 @@ class Env:
                 "base_label": base_label,
                 "repo": repo,
                 "branch": None,
+                "project": project,
+                "root": root or f"/work/{base_label}",
             },
         )
         return Session(session_id, result["label"], inbox)
@@ -141,6 +147,9 @@ async def env() -> AsyncIterator[Env]:
     e.daemon = e.make_daemon()
     await e.daemon.start()
     e.daemon.store.upsert_contact(alice.id, "alice", inbound_policy="auto_answer")
+    # Most tests are about sessions contacts may address; the tests of the
+    # allow and deny lists change this.
+    e.daemon.change_session_patterns("allow", "*")
     try:
         yield e
     finally:
@@ -210,7 +219,11 @@ async def test_a_message_naming_no_open_session_waits_and_shows_a_notification(
     # Choosing a catch-all session delivers what waited to it, except the
     # message that names another session.
     client = await env.connect()
-    assert await client.call("set_catch_all", {"label": "a"}) == {"catch_all": "a", "open": True}
+    assert await client.call("set_catch_all", {"label": "a"}) == {
+        "catch_all": "a",
+        "open": True,
+        "hidden": False,
+    }
     await poll(lambda: len(a.inbox.messages) == 2)
     await poll(lambda: a.bodies() == ["nobody in particular " + "x" * 200, "for c"])
     assert env.daemon.status()["queued_inbound"] == 0
@@ -218,6 +231,7 @@ async def test_a_message_naming_no_open_session_waits_and_shows_a_notification(
     assert await client.call("set_catch_all", {"label": None}) == {
         "catch_all": None,
         "open": False,
+        "hidden": False,
     }
 
 
@@ -370,7 +384,9 @@ async def test_unregister_and_the_sessions_method(env: Env) -> None:
         "label": "a",
         "repo": None,
         "branch": None,
+        "project": None,
         "cwd": "/work/a",
+        "visible": True,
         "reachable": True,
         "catch_all": False,
         "registered_at": info["registered_at"],
@@ -396,6 +412,223 @@ async def test_what_paired_contacts_may_see_of_the_sessions(env: Env) -> None:
     client = await env.connect()
     assert await client.call("set_share_sessions", {"share": False}) == {"share": False}
     assert env.daemon.sessions_for_peer() == {"shared": False, "sessions": []}
+
+
+# The allow and deny lists
+
+
+async def test_nothing_is_visible_to_contacts_until_a_project_is_allowed(env: Env) -> None:
+    env.daemon.change_session_patterns("forget", "*")
+    web = await env.open_session("web@main", repo="web", project="cadena/web")
+    assert env.daemon.sessions_for_peer() == {"shared": True, "sessions": []}
+    assert [s["visible"] for s in env.daemon.session_infos()] == [False]
+    # Named exactly, it still takes nothing: the message waits as if the
+    # session were not open.
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "web@main"))) is None
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "web"))) is None
+    assert web.inbox.messages == [] and len(env.notes) == 2
+
+    # Allowing its project shows it and delivers what waited for it.
+    client = await env.connect()
+    changed = await client.call("set_session_pattern", {"action": "allow", "pattern": "cadena/*"})
+    assert (changed["changed"], changed["path"]) == (True, False)
+    assert (changed["allow"], changed["deny"]) == (["cadena/*"], [])
+    assert [(s["label"], s["visible"]) for s in changed["sessions"]] == [("web@main", True)]
+    await poll(lambda: len(web.inbox.messages) == 2)
+    assert env.daemon.sessions_for_peer() == {
+        "shared": True,
+        "sessions": [{"label": "web@main", "branch": None}],
+    }
+
+
+async def test_a_denied_project_is_hidden_even_when_allowed(env: Env) -> None:
+    client = await env.connect()
+    work = await env.open_session("app@main", repo="app", project="cadena/app")
+    side = await env.open_session("api@main", repo="api", project="some-org/api")
+    local = await env.open_session("notes", root="/home/me/private/notes")
+    await client.call("set_session_pattern", {"action": "deny", "pattern": "some-org/*"})
+    path = await client.call(
+        "set_session_pattern", {"action": "deny", "pattern": "/home/me/private"}
+    )
+    assert path["path"] is True and path["deny"] == ["some-org/*", "/home/me/private"]
+    assert env.daemon.sessions_for_peer()["sessions"] == [{"label": "app@main", "branch": None}]
+    listed = await client.call("sessions")
+    assert (listed["allow"], listed["deny"]) == (["*"], ["some-org/*", "/home/me/private"])
+    assert [(s["label"], s["project"], s["visible"]) for s in listed["sessions"]] == [
+        ("app@main", "cadena/app", True),
+        ("api@main", "some-org/api", False),
+        ("notes", None, False),
+    ]
+    for name in ("api@main", "api", "notes"):
+        assert await delivered(env.daemon.deliver_incoming(env.incoming("psst", name))) is None
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "app"))) == "app@main"
+    assert side.inbox.messages == [] and local.inbox.messages == []
+    await poll(lambda: work.bodies() == ["hi"])
+
+    # Taking the pattern off the deny list shows the session again.
+    forgot = await client.call("set_session_pattern", {"action": "forget", "pattern": "some-org/*"})
+    assert forgot["changed"] is True and forgot["deny"] == ["/home/me/private"]
+    await poll(lambda: side.bodies() == ["psst", "psst"])
+    assert local.inbox.messages == []
+
+
+async def test_a_hidden_session_is_never_the_catch_all(env: Env) -> None:
+    client = await env.connect()
+    await client.call("set_session_pattern", {"action": "deny", "pattern": "some-org/*"})
+    side = await env.open_session("api@main", repo="api", project="some-org/api")
+    assert await client.call("set_catch_all", {"label": "api@main"}) == {
+        "catch_all": "api@main",
+        "open": False,
+        "hidden": True,
+    }
+    assert [s["catch_all"] for s in env.daemon.session_infos()] == [False]
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("anyone?"))) is None
+    assert side.inbox.messages == []
+    # A session registering learns whether contacts can see it.
+    registered = await client.call(
+        "register_session",
+        {
+            "session_id": "x",
+            "socket": side.inbox.path + "-other",
+            "token": "",
+            "cwd": "/work/api",
+            "base_label": "api@main",
+            "project": "some-org/api",
+        },
+    )
+    assert registered == {"label": "api@main-2", "catch_all": False, "visible": False}
+
+
+async def test_a_visible_label_gets_no_number_because_of_a_hidden_session(env: Env) -> None:
+    env.daemon.change_session_patterns("deny", "some-org/*")
+    await env.open_session("api@main", repo="api", project="some-org/api")
+    mine = await env.open_session("api@main", repo="api", project="cadena/api")
+    second = await env.open_session("api@main", repo="api", project="cadena/api")
+    assert (mine.label, second.label) == ("api@main", "api@main-2")
+    assert env.daemon.sessions_for_peer()["sessions"] == [
+        {"label": "api@main", "branch": None},
+        {"label": "api@main-2", "branch": None},
+    ]
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "api@main"))) == (
+        "api@main"
+    )
+    await poll(lambda: mine.bodies() == ["hi"])
+
+
+async def test_a_hidden_session_still_gets_the_answers_to_what_it_sent(env: Env) -> None:
+    client = await env.connect()
+    await client.call("set_session_pattern", {"action": "deny", "pattern": "some-org/*"})
+    side = await env.open_session("api@main", repo="api", project="some-org/api")
+    work = await env.open_session("app@main", repo="app", project="cadena/app")
+    env.daemon.set_catch_all("app@main")
+    sent = await client.call(
+        "send", {"to": "alice", "body": "question", "from_socket": side.inbox.path}
+    )
+    # What goes out says nothing about the session it came from.
+    [envelope] = env.transport.kicked
+    assert "session" not in envelope
+    answer = create_envelope(
+        from_=alice.id,
+        to=env.me.id,
+        body="answer",
+        thread_id=sent["thread_id"],
+        in_reply_to=sent["id"],
+    )
+    assert await delivered(env.daemon.deliver_incoming(answer)) == "api@main"
+    await poll(lambda: side.bodies() == ["answer"])
+    # A new conversation does not reach it, whatever it names.
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("new", "api@main"))) == (
+        "app@main"
+    )
+    await poll(lambda: work.bodies() == ["new"])
+
+
+async def test_changing_the_allow_and_deny_lists(env: Env) -> None:
+    client = await env.connect()
+
+    async def change(action: str, pattern: str) -> tuple[bool, list[str], list[str]]:
+        result = await client.call("set_session_pattern", {"action": action, "pattern": pattern})
+        return result["changed"], result["allow"], result["deny"]
+
+    assert await change("allow", "*") == (False, ["*"], [])
+    assert await change("deny", "a/*") == (True, ["*"], ["a/*"])
+    # A pattern is on one list at a time.
+    assert await change("allow", "a/*") == (True, ["*", "a/*"], [])
+    assert await change("deny", "*") == (True, ["a/*"], ["*"])
+    assert await change("forget", "nope") == (False, ["a/*"], ["*"])
+    assert await change("forget", "*") == (True, ["a/*"], [])
+    for params in (
+        {"pattern": "x"},
+        {"action": "allow"},
+        {"action": "hide", "pattern": "x"},
+        {"action": "allow", "pattern": ""},
+        {"action": "allow", "pattern": " x"},
+        {"action": "allow", "pattern": "x\ny"},
+        {"action": "allow", "pattern": "x" * 1025},
+    ):
+        with pytest.raises(RpcError) as bad:
+            await client.call("set_session_pattern", params)
+        assert bad.value.code == RpcErrorCode.INVALID_PARAMS, params
+    # The lists survive a restart, and a stored value that cannot be read
+    # allows nothing.
+    await env.daemon.stop()
+    env.daemon = env.make_daemon()
+    await env.daemon.start()
+    assert env.daemon.session_patterns("allow") == ["a/*"]
+    env.daemon.store.set_setting("session_allow", "not json")
+    assert env.daemon.session_patterns("allow") == []
+    env.daemon.store.set_setting("session_allow", '{"a": 1}')
+    assert env.daemon.session_patterns("allow") == []
+
+
+async def test_sessions_registered_by_an_older_squawk_get_their_root_at_start(env: Env) -> None:
+    old = await env.open_session("old")
+    record = env.daemon.store.list_sessions()[0]
+    assert record.root == "/work/old"
+    env.daemon.store.db.execute("UPDATE sessions SET root = NULL")
+    await env.daemon.stop()
+    env.daemon = env.make_daemon()
+    await env.daemon.start()
+    [record] = env.daemon.store.list_sessions()
+    assert (record.project, record.root) == (None, "/work/old")
+    env.daemon.change_session_patterns("deny", "/work")
+    assert env.daemon.sessions_for_peer()["sessions"] == []
+    assert old.label == "old"
+
+
+async def test_the_start_fills_in_the_project_of_a_repository_and_retries_when_git_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = os.path.join(os.path.realpath(env.home), "myrepo")
+    os.makedirs(repo)
+    for args in (
+        ("init", "-q"),
+        ("remote", "add", "origin", "git@github.com:some-org/myrepo.git"),
+    ):
+        subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True)
+    await env.open_session("myrepo@main", repo="myrepo")
+    env.daemon.store.db.execute("UPDATE sessions SET root = NULL, cwd = ?", (repo,))
+
+    async def restart() -> SessionRecord:
+        await env.daemon.stop()
+        env.daemon = env.make_daemon()
+        await env.daemon.start()
+        [record] = env.daemon.store.list_sessions()
+        return record
+
+    # git not answering leaves the session to be tried again; meanwhile no
+    # project pattern allows it.
+    def no_git(*_args: Any, **_kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired("git", 2)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(subprocess, "run", no_git)
+        unknown = await restart()
+    assert (unknown.project, unknown.root) == (None, None)
+    record = await restart()
+    assert (record.project, record.root) == ("some-org/myrepo", repo)
+    env.daemon.change_session_patterns("deny", "some-org")
+    assert env.daemon.sessions_for_peer()["sessions"] == []
 
 
 async def test_ignores_a_message_whose_id_was_already_stored(env: Env) -> None:
