@@ -127,7 +127,12 @@ async def wait_for_relay(home: str, timeout_s: float = CONNECT_WAIT_S) -> RelayS
         while True:
             status = cast(StatusResult, await client.call("status"))
             relay = status.get("relay")
-            if relay is None or relay["connected"] or relay["last_error"] is not None:
+            if (
+                relay is None
+                or relay["connected"]
+                or relay["last_error"] is not None
+                or relay.get("in_use") is False
+            ):
                 return relay
             if loop.time() >= deadline:
                 return relay
@@ -148,6 +153,12 @@ def describe_new_relay(url: str, running: bool, relay: RelayStatus | None) -> st
         lines.append(
             "The squawk service is not running; it connects to the relay when it starts "
             "(`squawk daemon start`)."
+        )
+    elif relay is not None and relay.get("in_use") is False:
+        lines.append(
+            "The running service is not using it (it has no network connection, or the URL "
+            "no longer passes the checks). Restart it with `squawk daemon stop` and "
+            "`squawk daemon start`."
         )
     elif relay is not None and relay["connected"]:
         lines.append(f"Connected. Relay key: {relay['relay_key']}")

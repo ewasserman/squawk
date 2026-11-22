@@ -306,6 +306,9 @@ class RelayStatus(TypedDict):
     """The relay's key id, from the last time it connected; None if it never has."""
     last_error: str | None
     """Why the last connection attempt failed or the connection dropped, if it did."""
+    in_use: NotRequired[bool]
+    """False when the relay is set but the service is not using it (it has no
+    network, or the stored URL no longer passes the checks). Absent means True."""
 
 
 # Checking params. Unknown fields are ignored, an optional field may be left
@@ -1092,6 +1095,7 @@ class Daemon:
             "connected": False,
             "relay_key": None,
             "last_error": "the service is not using this relay",
+            "in_use": False,
         }
 
     async def set_relay(self, url: str | None, *, allow_plain: bool = False) -> None:

@@ -301,8 +301,16 @@ async def test_switching_relays_keeps_the_callbacks_set_on_the_old_client() -> N
     # The transport is not started, so the new client is only put in place.
     await transport.use_relay(second)
     assert transport.relay is second
-    assert second.on_live is on_live
+    # The transport's own handler for live requests, whatever the old client had.
+    assert second.on_live == transport._on_live
     assert second.on_ready == [on_ready]
+
+
+async def test_a_relay_set_after_starting_without_one_answers_live_requests() -> None:
+    transport = NetworkTransport(host="127.0.0.1", discovery=False)
+    relay = RelayClient("wss://one.example")
+    await transport.use_relay(relay)
+    assert relay.on_live == transport._on_live
 
 
 async def test_contacts_show_the_route_to_each_contact(service: Daemon) -> None:

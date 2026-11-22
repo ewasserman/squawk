@@ -121,6 +121,8 @@ class RoomLink:
         self._frame_listeners: list[Callable[[dict[str, Any]], None]] = []
         self._close_listeners: list[Callable[[], None]] = []
         self._last_send: asyncio.Task[None] | None = None
+        self._held: list[object] = []
+        """Frames that arrived before anyone listened; passed on to the first listener."""
         self.closed = False
 
     def send(self, frame: dict[str, Any]) -> None:
@@ -140,6 +142,16 @@ class RoomLink:
 
     def on_frame(self, fn: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         self._frame_listeners.append(fn)
+        if self._held:
+            # Frames can arrive between the relay saying someone joined and
+            # pairing starting to listen; they are passed on, in order, now.
+            held, self._held = self._held, []
+
+            def pass_on() -> None:
+                for frame in held:
+                    self._deliver(frame)
+
+            asyncio.get_running_loop().call_soon(pass_on)
 
         def stop() -> None:
             if fn in self._frame_listeners:
@@ -165,6 +177,9 @@ class RoomLink:
 
     def _deliver(self, frame: object) -> None:
         if self.closed or not isinstance(frame, dict) or not isinstance(frame.get("t"), str):
+            return
+        if not self._frame_listeners:
+            self._held.append(frame)
             return
         for fn in list(self._frame_listeners):
             try:
@@ -208,6 +223,9 @@ class RelayClient:
         self._guard: ReplayGuard | None = None
         self._ws: ClientConnection | None = None
         self._ready = False
+        self._setting_up = False
+        """True after the relay accepted our key, while the allow list and
+        `fetch` are being sent; requests are allowed, `connected` is not yet true."""
         self._stopped = False
         self._runner: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -317,7 +335,7 @@ class RelayClient:
 
     async def _request(self, frame: dict[str, Any], req: str | None = None) -> dict[str, Any]:
         ws = self._ws
-        if ws is None or not self._ready:
+        if ws is None or not (self._ready or self._setting_up):
             raise LinkError("not connected to the relay")
         req = req or self._new_req()
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -380,6 +398,7 @@ class RelayClient:
 
     def _disconnected(self) -> None:
         self._ready = False
+        self._setting_up = False
         self._ws = None
         self._sent_allow = None
         for future in self._pending.values():
@@ -424,9 +443,13 @@ class RelayClient:
         try:
             # The allow list goes first: anything waiting was deposited
             # under the old list, and new deposits need the new one.
+            self._setting_up = True
+            try:
+                await self._publish_allow_list()
+                await self._send({"t": "fetch", "req": "fetch"})
+            finally:
+                self._setting_up = False
             self._ready = True
-            await self._publish_allow_list()
-            await self._send({"t": "fetch", "req": "fetch"})
             _log(f"connected to {self.url}")
             for fn in list(self.on_ready):
                 try:
@@ -462,11 +485,17 @@ class RelayClient:
             if not future.done():
                 future.set_result(frame)
             return
-        if t == "invite-joined" and isinstance(req, str) and req in self._invite_waiters:
-            waiter = self._invite_waiters[req]
+        if t == "invite-joined":
+            waiter = self._invite_waiters.get(req) if isinstance(req, str) else None
             room = self._open_room(frame)
-            if room is not None and not waiter.done():
+            if room is None:
+                return
+            if waiter is not None and not waiter.done():
                 waiter.set_result(room)
+            else:
+                # The invite was replaced or cancelled here: tell the joiner
+                # at once rather than leave them waiting.
+                room.close()
             return
         if t in ("pair", "pair-end"):
             room_id = frame.get("room")

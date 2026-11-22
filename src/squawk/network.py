@@ -565,8 +565,9 @@ class NetworkTransport(Transport):
 
     Routes. Each due message is tried on each route in turn until one takes
     it: first directly over the local network, then through the relay (if
-    there is one, it is connected, and the contact uses the same relay or
-    its relay is not known). A message the relay stored is marked "sent"
+    there is one and it is connected). The relay refuses a message for a
+    contact that has no mailbox there or has not listed us, and the message
+    then stays queued. A message the relay stored is marked "sent"
     and waits in the queue for the recipient's receipt; it is not sent again
     by any route. More routes can be added to `_routes`.
     """
@@ -683,18 +684,22 @@ class NetworkTransport(Transport):
     async def use_relay(self, relay: "RelayClient | None") -> None:
         """Switches to another relay, or to none, while running: stops the
         current relay client and starts `relay`. Callbacks that others set
-        on the current client (`on_ready`, `on_live`) are moved to the new
-        one. Messages the old relay already holds stay there."""
+        on the current client (`on_ready`) are moved to the new one.
+
+        Messages the old relay holds may never be delivered now (it may be
+        gone), so they are queued again for every route; a recipient that
+        gets a second copy recognises it and only acknowledges it again."""
         old = self.relay
         self.relay = relay
         if old is not None:
             await old.stop()
+        if self._daemon is not None and old is not None:
+            self._daemon.store.requeue_relayed()
         if relay is None:
             return
         if old is not None:
             relay.on_ready.extend(f for f in old.on_ready if f != self._relay_came_up)
-            if relay.on_live is None:
-                relay.on_live = old.on_live
+        relay.on_live = self._on_live
         if self._daemon is not None and not self._stopped:
             relay.on_ready.append(self._relay_came_up)
             await relay.start(self._daemon)
@@ -971,8 +976,6 @@ class NetworkTransport(Transport):
             return items, None
         if not relay.connected:
             return items, "relay: not connected"
-        if contact.relay_url is not None and contact.relay_url != relay.url:
-            return items, "relay: the contact uses a different relay"
         from squawk.relay_client import RelayRefused
 
         daemon = self._require_daemon()
@@ -1169,8 +1172,6 @@ class NetworkTransport(Transport):
         """The relay client, if messages to `contact` can go through it now."""
         relay = self.relay
         if relay is None or not relay.connected:
-            return None
-        if contact.relay_url is not None and contact.relay_url != relay.url:
             return None
         return relay
 
@@ -1377,6 +1378,9 @@ class NetworkTransport(Transport):
             return
         contact = self._daemon.store.get_contact(peer.key_id)
         if contact is not None and contact.trust == "paired":
+            # Messages a relay holds for this contact can go directly now,
+            # in case the relay lost them.
+            self._daemon.store.requeue_relayed(peer.key_id)
             self.flush()
 
     def _require_guard(self) -> ReplayGuard:

@@ -505,7 +505,7 @@ class Store:
         trust: Trust | None = None,
         auto_send: bool | None = None,
         inbound_policy: InboundPolicy | _Unset | None = UNSET,
-        relay_url: str | None = None,
+        relay_url: str | _Unset | None = UNSET,
     ) -> Contact:
         """Adds a contact, or updates the name and any given fields of an existing one."""
         now = self._now_iso()
@@ -525,7 +525,7 @@ class Store:
                     None if inbound_policy is UNSET else inbound_policy,
                     now,
                     now,
-                    relay_url,
+                    None if relay_url is UNSET else relay_url,
                 )
             else:
                 self.update_contact(
@@ -560,7 +560,7 @@ class Store:
         trust: Trust | None = None,
         auto_send: bool | None = None,
         inbound_policy: InboundPolicy | _Unset | None = UNSET,
-        relay_url: str | None = None,
+        relay_url: str | _Unset | None = UNSET,
     ) -> Contact:
         """Changes the given fields of a contact. Raises KeyError if there is no such contact.
 
@@ -580,7 +580,7 @@ class Store:
         if inbound_policy is not UNSET:
             sets.append("inbound_policy = ?")
             values.append(inbound_policy)
-        if relay_url is not None:
+        if relay_url is not UNSET:
             sets.append("relay_url = ?")
             values.append(relay_url)
         sets.append("updated_at = ?")
@@ -949,6 +949,31 @@ class Store:
                 message_id,
             )
             return True
+
+        return self.transaction(run)
+
+    def requeue_relayed(self, recipient: str | None = None) -> int:
+        """Puts messages a relay holds (to `recipient`, or to everyone) back
+        in the queue as due now, to be sent again by any route. Used when the
+        relay may have lost them. Returns how many."""
+
+        def run() -> int:
+            where = "" if recipient is None else "AND o.recipient = ?"
+            params: list[_Param] = [] if recipient is None else [recipient]
+            ids = [
+                row["message_id"]
+                for row in self._all(
+                    f"""SELECT o.message_id FROM outbox o JOIN messages m ON m.id = o.message_id
+                     WHERE m.state = 'sent' {where}""",
+                    *params,
+                )
+            ]
+            for id in ids:
+                self._run(
+                    "UPDATE outbox SET next_attempt_at = ? WHERE message_id = ?", self._now(), id
+                )
+                self._run("UPDATE messages SET state = 'queued' WHERE id = ?", id)
+            return len(ids)
 
         return self.transaction(run)
 

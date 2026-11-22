@@ -23,7 +23,7 @@ from squawk.network import NetworkTransport, auth_message
 from squawk.pairing import Pairing, PairingError
 from squawk.relay import RelayServer
 from squawk.relay.limits import MINUTE_MS
-from squawk.relay_client import RelayClient
+from squawk.relay_client import RelayClient, RoomLink
 
 
 async def wait_for[T](check: Callable[[], T | None], timeout: float = 8.0) -> T:
@@ -270,3 +270,38 @@ async def test_the_invite_and_pair_code_commands(setup: Setup) -> None:
     assert "Do not\nsend it as a message" in joining.text
     assert 'Paired with "alice"' in joining.text
     assert 'Paired with "bob"' in inviting.text
+
+
+async def test_frames_that_arrive_before_pairing_listens_are_kept(setup: Setup) -> None:
+    alice = await setup.node("alice")
+    relay = alice.transport.relay
+    assert relay is not None
+    room = RoomLink(relay, "room-1", alice.id)
+    room._deliver({"t": "pair-commit", "n": 1})
+    room._deliver({"t": "pair-reveal", "n": 2})
+    seen: list[Any] = []
+    room.on_frame(seen.append)
+    await wait_for(lambda: len(seen) == 2)
+    assert [f["n"] for f in seen] == [1, 2]
+
+
+async def test_joining_a_replaced_invite_fails_at_once(setup: Setup) -> None:
+    alice = await setup.node("alice")
+    bob = await setup.node("bob")
+    first = await alice.pairing.invite()
+    # A second invite replaces the first at the relay; joining the first code
+    # is refused straight away.
+    await alice.pairing.invite()
+    with pytest.raises(PairingError, match="unknown, expired or already used"):
+        await asyncio.wait_for(bob.pairing.join(first["code"]), 3)
+
+
+async def test_joining_an_invite_cancelled_by_its_creator_fails_at_once(setup: Setup) -> None:
+    alice = await setup.node("alice")
+    bob = await setup.node("bob")
+    invite = await alice.pairing.invite()
+    # Alice cancels; the relay still has the code, so Bob's join gets a room,
+    # and Alice's service ends it at once.
+    alice.pairing.stop()
+    with pytest.raises(PairingError, match="disconnected before pairing finished"):
+        await asyncio.wait_for(bob.pairing.join(invite["code"]), 3)

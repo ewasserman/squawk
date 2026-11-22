@@ -193,15 +193,39 @@ async def test_a_blocked_contact_is_taken_off_the_allow_list(setup: Setup) -> No
     assert setup.waiting_at_relay() == 0
 
 
-async def test_a_contact_on_another_relay_is_not_sent_through_ours(setup: Setup) -> None:
+async def test_a_contact_whose_saved_relay_differs_is_still_tried_through_ours(
+    setup: Setup,
+) -> None:
+    # The saved URL can be out of date (the contact moved relays, or the
+    # same relay has a new name); the relay itself says whether they are there.
     alice = await setup.start(setup.make_home("alice"))
     bob = await setup.start(setup.make_home("bob"))
     pair(alice, bob)
     alice.store.update_contact(bob.identity.id, relay_url="wss://elsewhere.example")
+    await wait_for(lambda: setup.allow_list_of(bob.identity.id) == [alice.identity.id])
     sent = await alice.send({"to": "bob", "body": "hi"})
-    item = await wait_for(lambda: after_an_attempt(alice, sent["id"]))
-    assert item.last_error is not None and "different relay" in item.last_error
-    assert setup.waiting_at_relay() == 0
+    await wait_for(lambda: alice.store.acked_at(sent["id"]))
+
+
+async def test_switching_relays_queues_held_messages_again(setup: Setup) -> None:
+    alice = await setup.start(setup.make_home("alice"))
+    bob = await setup.start(setup.make_home("bob"))
+    pair(alice, bob)
+    await wait_for(lambda: setup.allow_list_of(bob.identity.id) == [alice.identity.id])
+    await setup.stop(bob)
+    sent = await alice.send({"to": "bob", "body": "held"})
+    await wait_for(lambda: in_state(alice, sent["id"], "sent"))
+    await transport_of(alice).use_relay(None)
+    message = alice.store.get_message(sent["id"])
+    assert message is not None and message.state == "queued"
+    assert alice.store.count_relayed() == 0
+
+
+async def test_connected_only_once_the_allow_list_is_sent(setup: Setup) -> None:
+    alice = await setup.start(setup.make_home("alice"))
+    relay = transport_of(alice).relay
+    assert relay is not None and relay.connected
+    assert relay._sent_allow == []
 
 
 async def test_a_refusal_from_the_recipient_comes_back_as_a_failure(setup: Setup) -> None:
