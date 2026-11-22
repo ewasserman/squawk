@@ -11,9 +11,8 @@ command. A process sending multicast packets itself is often refused there
 (EHOSTUNREACH) by the Local Network privacy setting, while mDNSResponder is
 always allowed. Elsewhere the `zeroconf` package is used.
 
-This is the Python version of src/discovery.ts. It advertises the same
-service type, instance names and TXT fields, so Node and Python services
-find each other.
+The service type, instance names and TXT fields are fixed, so services of
+every squawk version since 0.1 find each other.
 """
 
 import asyncio
@@ -404,8 +403,8 @@ class DnsSdBackend:
 def default_backend(env: Mapping[str, str] | None = None) -> MdnsBackend:
     """Picks the mDNS backend for this machine.
 
-    SQUAWK_MDNS=zeroconf|dns-sd overrides ("bonjour", the Node version's name
-    for its library, also selects zeroconf).
+    SQUAWK_MDNS=zeroconf|dns-sd overrides ("bonjour", the value an earlier
+    version of squawk used, also selects zeroconf).
     """
     choice = (os.environ if env is None else env).get("SQUAWK_MDNS")
     if choice in ("zeroconf", "bonjour"):
@@ -418,7 +417,8 @@ def default_backend(env: Mapping[str, str] | None = None) -> MdnsBackend:
 
 
 def _js_number(text: str) -> float | None:
-    """Roughly what JavaScript's `Number(text)` gives for a port: None for NaN."""
+    """The port in a TXT record as a number: surrounding whitespace is ignored,
+    empty text counts as 0, and text that is not a number gives None."""
     stripped = jsontext.js_trim(text)
     if stripped == "":
         return 0

@@ -1,6 +1,6 @@
-"""The helpers that reproduce JavaScript's JSON, string and date behaviour.
+"""The helpers for squawk's exact JSON text, string and date formats.
 
-The expected values were produced by running the same input through Node.
+The expected values were checked against the output of squawk 0.1.
 Characters are built with chr() so the test text stays plain ASCII.
 """
 
@@ -19,25 +19,25 @@ def test_stringify_writes_compact_json_without_escaping_non_ascii() -> None:
     assert jsontext.stringify(value) == '{"a":[1,"x"],"b":"caf' + chr(0xE9) + '","c":null,"d":true}'
 
 
-def test_stringify_escapes_control_characters_as_javascript_does() -> None:
+def test_stringify_escapes_control_characters() -> None:
     assert (
         jsontext.stringify('\b\f\n\r\t\x00\x1f\x7f"\\')
         == '"\\b\\f\\n\\r\\t\\u0000\\u001f\x7f\\"\\\\"'
     )
 
 
-def test_stringify_escapes_a_lone_surrogate_as_javascript_does() -> None:
+def test_stringify_escapes_a_lone_surrogate_in_lowercase() -> None:
     assert jsontext.stringify(LONE_HIGH + EMOJI) == '"\\ud800' + EMOJI + '"'
 
 
-def test_stringify_with_an_indent_matches_json_stringify_with_a_tab() -> None:
+def test_stringify_with_a_tab_indent() -> None:
     assert jsontext.stringify({"version": 1, "name": "a"}, indent="\t") == (
         '{\n\t"version": 1,\n\t"name": "a"\n}'
     )
 
 
 @pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity", "[NaN]"])
-def test_parse_refuses_values_javascript_refuses(text: str) -> None:
+def test_parse_refuses_nan_and_infinity(text: str) -> None:
     with pytest.raises(ValueError):
         jsontext.parse(text)
 
@@ -52,8 +52,8 @@ def test_lengths_and_slices_count_utf16_code_units() -> None:
     assert jsontext.js_slice("a" + EMOJI, 3) == "a" + EMOJI
 
 
-def test_trim_uses_javascripts_white_space() -> None:
-    # U+FEFF is white space to JavaScript but not to Python; U+001C is the reverse.
+def test_trim_uses_squawks_white_space() -> None:
+    # U+FEFF is white space to squawk but not to Python's str.strip; U+001C is the reverse.
     assert jsontext.js_trim(chr(0xFEFF) + " a ") == "a"
     assert jsontext.js_trim(chr(0x1C) + "a") == chr(0x1C) + "a"
 
@@ -69,7 +69,7 @@ def test_trim_uses_javascripts_white_space() -> None:
         ("", ""),
     ],
 )
-def test_base64url_decoding_matches_nodes_buffer(text: str, hex_bytes: str) -> None:
+def test_base64url_decoding_rules(text: str, hex_bytes: str) -> None:
     assert from_base64url(text).hex() == hex_bytes
 
 
@@ -84,7 +84,7 @@ def test_base64url_decoding_matches_nodes_buffer(text: str, hex_bytes: str) -> N
         (253402300800000, "+010000-01-01T00:00:00.000Z"),
     ],
 )
-def test_iso_from_ms_matches_to_iso_string(ms: int, text: str) -> None:
+def test_iso_from_ms_writes_squawks_text_form(ms: int, text: str) -> None:
     assert iso_from_ms(ms) == text
 
 
@@ -101,5 +101,5 @@ def test_iso_from_ms_matches_to_iso_string(ms: int, text: str) -> None:
         ("2026-02-29T12:00:00Z", None),
     ],
 )
-def test_parse_iso_ms_matches_date_parse(text: str, ms: int | None) -> None:
+def test_parse_iso_ms_reads_squawks_text_form(text: str, ms: int | None) -> None:
     assert parse_iso_ms(text) == ms

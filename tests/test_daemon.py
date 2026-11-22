@@ -1,4 +1,4 @@
-"""Tests for squawk.daemon (the Python version of test/daemon.test.ts)."""
+"""Tests for squawk.daemon."""
 
 import asyncio
 import os
@@ -621,7 +621,7 @@ async def test_auto_send_follows_the_default_unless_the_contact_has_its_own_sett
         assert error.value.code == RpcErrorCode.INVALID_PARAMS
 
 
-async def test_a_contact_turned_on_by_the_node_version_keeps_auto_send_on(env: Env) -> None:
-    # The Node version sets only the contacts table's column.
+async def test_a_contact_turned_on_by_squawk_0_1_keeps_auto_send_on(env: Env) -> None:
+    # squawk 0.1 sets only the contacts table's column.
     env.daemon.store.update_contact(alice.id, auto_send=True)
     assert env.daemon.store.auto_send_for(alice.id) == (True, False)

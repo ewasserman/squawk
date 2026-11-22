@@ -1,4 +1,4 @@
-"""Tests for squawk.discovery (the Python version of test/discovery.test.ts)."""
+"""Tests for squawk.discovery."""
 
 import asyncio
 import os

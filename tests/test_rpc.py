@@ -1,4 +1,4 @@
-"""Tests for squawk.rpc (the Python version of test/rpc.test.ts)."""
+"""Tests for squawk.rpc."""
 
 import asyncio
 import json

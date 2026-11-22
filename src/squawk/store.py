@@ -1,14 +1,14 @@
 """Local SQLite storage for contacts, messages, the outbound queue,
 acknowledgements, threads, seen message ids and settings.
 
-Timestamps in text columns are ISO 8601 strings in UTC (as produced by
-JavaScript's `Date.prototype.toISOString`, see `squawk.timefmt`), so they
-sort correctly as text. Columns used for scheduling or expiry
+Timestamps in text columns are ISO 8601 strings in UTC, always with
+milliseconds and a "Z" (see `squawk.timefmt`), so they sort correctly as
+text. Columns used for scheduling or expiry
 (`next_attempt_at`, `seen_ids.created_at_ms`) are milliseconds since the
 epoch.
 
-This is the Python version of src/store.ts. It uses the same file, schema
-and migrations, so either version can open a database the other wrote.
+The file, schema and migrations are compatible with databases written by
+squawk 0.1, so a database created by an earlier version opens unchanged.
 """
 
 import os
@@ -108,10 +108,10 @@ MIGRATIONS: tuple[str, ...] = (
     DELETE FROM outbox;
     DELETE FROM seen_ids;
     """,
-    # Python version only. The Claude Code sessions open on this machine, so
-    # that a restarted service still knows where to deliver, and which local
-    # session each conversation belongs to. The Node version ignores these
-    # tables.
+    # The Claude Code sessions open on this machine, so that a restarted
+    # service still knows where to deliver, and which local session each
+    # conversation belongs to. squawk 0.1 did not have these tables and
+    # ignores them if it opens the database.
     """
     CREATE TABLE sessions (
         session_id    TEXT PRIMARY KEY,
@@ -134,9 +134,9 @@ MIGRATIONS: tuple[str, ...] = (
 )
 """Schema migrations, applied in order. The database's `PRAGMA user_version`
 holds how many have been applied. Never edit or reorder an entry that has
-shipped; add a new one at the end instead. The text of the first three is
-the same as in src/store.ts apart from indentation; the fourth exists only in
-the Python version (the Node version opens such a database and ignores it)."""
+shipped; add a new one at the end instead. The first three are the ones
+squawk 0.1 applied; the fourth was added later (squawk 0.1 opens such a
+database and ignores the extra tables)."""
 
 Trust = Literal["paired", "blocked"]
 InboundPolicy = Literal["show_first", "auto_answer"]
@@ -155,8 +155,8 @@ AUTO_SEND_KEY_PREFIX = "auto_send:"
 """Prefix of the setting key (followed by the contact's key id) that records
 a contact's own auto-send setting, "on" or "off". The contacts table's
 `auto_send` column cannot tell "off" from "never set", and changing that
-column would change the schema the Node version shares, so the choice is kept
-here. The column is still updated, for the Node version."""
+column would change a schema shared with squawk 0.1 databases, so the
+choice is kept here. The column is still updated, for squawk 0.1."""
 
 
 class _Unset(Enum):
@@ -254,8 +254,8 @@ _HEADING_MARK = re.compile(f"^#+[{jsontext.JS_WHITESPACE}]*")
 
 
 def _bind(value: _Param) -> _Param:
-    # A lone UTF-16 surrogate cannot be written as UTF-8; Node writes it as
-    # U+FFFD, and Python's sqlite3 would raise instead.
+    # A lone UTF-16 surrogate cannot be written as UTF-8. Squawk stores it as
+    # U+FFFD; Python's sqlite3 would raise instead.
     return _LONE_SURROGATE.sub("\ufffd", value) if isinstance(value, str) else value
 
 
@@ -313,7 +313,7 @@ def _to_thread(row: sqlite3.Row) -> Thread:
 
 def subject_of(body: str) -> str:
     """The first non-empty line of `body`, without a leading Markdown heading
-    mark, shortened to SUBJECT_MAX characters (counted as JavaScript counts)."""
+    mark, shortened to SUBJECT_MAX characters (counted in UTF-16 code units)."""
     first_line = next(
         (
             line
@@ -328,7 +328,7 @@ def subject_of(body: str) -> str:
 
 
 def _iso(time: str | int | datetime) -> str:
-    """The time as `new Date(time).toISOString()` gives it."""
+    """The time as squawk's timestamp text (see `squawk.timefmt`)."""
     if isinstance(time, datetime):
         return iso_from_ms(ms_from_datetime(time))
     if isinstance(time, int):
@@ -386,7 +386,7 @@ class Store:
 
         # autocommit=True: Python's sqlite3 module does not begin or commit
         # transactions on its own (and executescript does not commit first),
-        # so `transaction` controls them, as in the Node version.
+        # so `transaction` controls them.
         if path == ":memory:":
             store = make(sqlite3.connect(path, autocommit=True))
             store._configure()
@@ -582,7 +582,7 @@ class Store:
         that comes from the default (True) rather than the contact's own setting.
 
         The contact's own setting wins. A contact whose `auto_send` column is
-        on but who has no recorded setting (turned on by the Node version)
+        on but who has no recorded setting (turned on by squawk 0.1)
         counts as having it on. Otherwise the default setting applies, which
         is off unless set.
         """

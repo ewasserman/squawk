@@ -1,4 +1,4 @@
-"""Tests for squawk.pairing (the Python version of test/pairing.test.ts)."""
+"""Tests for squawk.pairing."""
 
 import asyncio
 import re

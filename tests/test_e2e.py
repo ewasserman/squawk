@@ -3,8 +3,6 @@ homes on 127.0.0.1 and discovery off; Claude Code sessions are fake inbox
 sockets registered through the real `squawk hook session-start` command;
 messages go through the real `squawk send` and `squawk reply` commands with
 the confirmation dialog replaced by a stand-in that always sends.
-
-This replaces test/e2e.test.ts, which drove the Node version's MCP server.
 """
 
 import asyncio

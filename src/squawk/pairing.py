@@ -26,8 +26,8 @@ other side's nonce, so it gets a single one-in-a-million guess at matching
 codes instead of trying keys until the codes happen to match. See
 docs/plan/security.md, threat 5.
 
-This is the Python version of src/pairing.ts; Node and Python services can
-pair with each other.
+The pairing exchange is the same as in squawk 0.1, so services of either
+version can pair with each other.
 """
 
 import asyncio

@@ -1,8 +1,8 @@
 """Starting, stopping and querying the background service from the CLI.
 
-This is the Python version of src/daemon-control.ts. It works on the same
-files (run/squawkd.sock, run/squawkd.pid, run/squawkd.log), so it can also
-query or stop a service started by the Node version.
+It works through the files run/squawkd.sock, run/squawkd.pid and
+run/squawkd.log, the same files squawk 0.1 used, so it can also query or
+stop a service started by an earlier version.
 """
 
 import asyncio
@@ -115,7 +115,7 @@ async def start_daemon(
 
 
 def _seconds(ms: int) -> str:
-    """Milliseconds as seconds, written as JavaScript would (5, not 5.0)."""
+    """Milliseconds as seconds, with no ".0" for whole seconds (5, not 5.0)."""
     value = ms / 1000
     return str(int(value)) if value.is_integer() else str(value)
 

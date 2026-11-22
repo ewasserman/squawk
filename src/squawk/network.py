@@ -26,13 +26,13 @@ outbound queue and are retried with backoff.
 A dialling side may also send `sessions-req` (with a request id); the
 receiver answers `sessions` with the labels and branches of the Claude Code
 sessions open on its machine, or an empty list if its person turned sharing
-off. Paths and inbox tokens are never sent. This exchange is new in the
-Python version; a Node service does not answer it.
+off. Paths and inbox tokens are never sent. This exchange was added after
+squawk 0.1; a squawk 0.1 service does not answer it.
 
 Other frame types (used by pairing) can be added with `on_frame`.
 
-This is the Python version of src/network.ts and speaks the same protocol,
-so Node and Python services can send to each other.
+The protocol is the same as in squawk 0.1, so services of either version can
+send to each other.
 """
 
 import asyncio
@@ -406,7 +406,7 @@ def address_setting_key(key_id: str) -> str:
 
 def _listening_socket(host: str | None, port: int) -> socket.socket:
     """A bound TCP socket for the listener. With no host it accepts IPv4 and
-    IPv6 on one port (as Node does), falling back to IPv4 only."""
+    IPv6 on one port, falling back to IPv4 only."""
     if host is not None:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         sock = socket.socket(family, socket.SOCK_STREAM)
@@ -845,7 +845,7 @@ class NetworkTransport(Transport):
     async def request_sessions(self, key_id: str) -> PeerSessions:
         """Asks a paired contact's service which Claude Code sessions are open
         there. Raises `LinkError` if it cannot be reached or does not answer
-        in time (a Node service never answers)."""
+        in time (a squawk 0.1 service never answers)."""
         store = self._require_daemon().store
         contact = store.get_contact(key_id)
         if contact is None or contact.trust != "paired":
@@ -1015,7 +1015,8 @@ class NetworkTransport(Transport):
 
 
 def _js_string(value: object) -> str:
-    """`String(value)` as JavaScript writes it, for the common JSON values."""
+    """A JSON value as text for a message: None as "undefined", booleans as
+    "true" or "false", strings as they are and anything else as JSON."""
     if value is None:
         return "undefined"
     if isinstance(value, bool):

@@ -22,9 +22,8 @@ Network transports (mDNS discovery, the WebSocket listener) plug in through
 `deliver_incoming` (for messages that arrive) and the `Transport` class (for
 messages to send), so routing does not depend on how a message travels.
 
-This started as the Python version of src/daemon.ts. The methods both
-versions have take and return the same JSON, apart from the session methods
-and `status`'s session list, which are new.
+The methods squawk 0.1 also had take and return the same JSON as there; the
+session methods and `status`'s session list were added later.
 """
 
 import asyncio
@@ -210,7 +209,7 @@ class ContactInfo(TypedDict):
     (the contact's own setting, or the default)."""
     auto_send_is_default: bool
     """True when the contact has no auto-send setting of its own and follows
-    the default. Not in the Node version."""
+    the default. Not sent by squawk 0.1."""
     inbound_policy: InboundPolicy
     """The policy that applies to this contact's messages (their own or the default)."""
     policy_is_default: bool
@@ -245,11 +244,10 @@ class StatusResult(TypedDict):
     """The label chosen to take messages no other session takes, if any."""
 
 
-# Checking params. These follow the zod schemas in src/daemon.ts: unknown
-# fields are ignored, an optional field may be left out but not set to null
-# (unless it says so), and string lengths count UTF-16 code units. The error
-# texts are plain descriptions rather than zod's wording; clients rely only on
-# the error code.
+# Checking params. Unknown fields are ignored, an optional field may be left
+# out but not set to null (unless it says so), and string lengths count
+# UTF-16 code units. The error texts are plain descriptions; clients rely
+# only on the error code.
 
 _INBOUND_POLICIES = ("show_first", "auto_answer")
 
@@ -363,8 +361,8 @@ def _optional_string(obj: Mapping[str, Any], key: str, max_length: int) -> str |
 
 
 def _name_sort_key(name: str) -> tuple[str, str, str]:
-    """Orders names roughly as JavaScript's `localeCompare` does: ignoring
-    accents and case first, then accents, then lower case before upper case."""
+    """Orders names ignoring accents and case first, then by accents, then
+    with lower case before upper case."""
     decomposed = unicodedata.normalize("NFD", name)
     base = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return base.casefold(), decomposed.casefold(), name.swapcase()

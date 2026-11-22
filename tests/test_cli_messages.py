@@ -1,6 +1,5 @@
-"""Tests for `squawk send`, `reply`, `tail`, `peers` and `status` (the Python
-version of test/cli-messages.test.ts, plus `reply`, the confirmation step and
-the delivery report, which are new in the Python version)."""
+"""Tests for `squawk send`, `reply`, `tail`, `peers` and `status`,
+including the confirmation step and the delivery report."""
 
 import asyncio
 import json
@@ -216,7 +215,7 @@ async def test_prints_a_sent_message_as_one_json_line_in_the_other_services_tail
         "session": "review",
         "body": "hi bob",
     }
-    # The keys come in the Node version's order.
+    # The keys come in a fixed order.
     assert list(json.loads(tailing.out[0])) == [
         "type",
         "note",

@@ -22,8 +22,8 @@ the JSON that travels (described by the `Envelope` and `Sealed` types). The
 dict with the fields in a fixed order; they raise `EnvelopeValidationError`,
 a `ValueError`, when the value does not have the expected shape.
 
-This module is the Python version of src/envelope.ts and must stay
-compatible with it: a message sealed by either version opens in the other.
+The format is fixed: a message sealed by any squawk version since 0.1 must
+open in every other.
 """
 
 import re
@@ -132,9 +132,8 @@ class EnvelopeError(Exception):
         self.code: EnvelopeErrorCode = code
 
 
-# Validation. These follow the zod schemas in src/envelope.ts. String lengths
-# are counted in UTF-16 code units, as JavaScript counts them, so that both
-# versions accept exactly the same envelopes.
+# Validation. String lengths are counted in UTF-16 code units, so that every
+# squawk peer accepts exactly the same envelopes.
 
 _ENVELOPE_FIELDS = (
     "id",
@@ -342,8 +341,7 @@ def open_sealed(
     message that failed to store can be accepted when the sender retries.
     Raises `EnvelopeError` on any failure.
 
-    (Called `open` in the Node version; renamed so it does not hide Python's
-    built-in `open`.)
+    (Not called `open`, so that it does not hide Python's built-in `open`.)
     """
     try:
         s = parse_sealed(sealed)
@@ -367,8 +365,8 @@ def open_sealed(
         raise EnvelopeError("tampered", "message could not be decrypted") from err
 
     try:
-        # JavaScript's TextDecoder replaces invalid UTF-8 and drops a leading
-        # byte order mark; do the same so both versions read the same text.
+        # Invalid UTF-8 is replaced and a leading byte order mark is dropped,
+        # so every squawk peer reads the same text.
         text = plaintext.decode("utf-8", "replace").removeprefix("\ufeff")
         envelope_text, sig = _parse_inner(jsontext.parse(text))
         envelope = parse_envelope(jsontext.parse(envelope_text))
@@ -421,7 +419,7 @@ class MemorySeenIds:
 
 
 def _js_number(value: float) -> str:
-    """A number as JavaScript prints it in a template string (300, not 300.0)."""
+    """A number as text, with no ".0" for whole numbers (300, not 300.0)."""
     return str(int(value)) if float(value).is_integer() else repr(value)
 
 

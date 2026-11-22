@@ -392,11 +392,10 @@ class TestSubject:
         assert subject_of("") == ""
         assert subject_of("\u00a0\n\ufeffhi\u3000") == "hi"
 
-    def test_shortens_long_subjects_counting_as_javascript_does(self) -> None:
+    def test_shortens_long_subjects_counting_utf16_code_units(self) -> None:
         assert subject_of("x" * 120) == "x" * 120
         assert subject_of("x" * 121) == "x" * 119 + "\u2026"
         # 60 emoji are 120 UTF-16 code units: kept whole.
         assert subject_of("\U0001f600" * 60) == "\U0001f600" * 60
-        # Cutting at 119 units splits an emoji; the leftover half becomes U+FFFD,
-        # as it does when the Node version writes it to the database.
+        # Cutting at 119 units splits an emoji; the leftover half becomes U+FFFD.
         assert subject_of("\U0001f600" * 61) == "\U0001f600" * 59 + "\ufffd\u2026"

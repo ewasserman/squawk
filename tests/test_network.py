@@ -1,4 +1,4 @@
-"""Tests for squawk.network (the Python version of test/network.test.ts)."""
+"""Tests for squawk.network."""
 
 import asyncio
 import dataclasses

@@ -6,8 +6,8 @@ notifications in both directions (no id, never answered), and server code
 pushing notifications to a connected client at any time. Batch requests (a
 JSON array) are not supported and get an "invalid request" error.
 
-This is the Python version of src/rpc.ts and speaks the same protocol, so a
-client of either version can talk to a server of the other.
+The protocol is the same as in squawk 0.1, so a client of either version can
+talk to a server of the other.
 """
 
 import asyncio
@@ -369,7 +369,7 @@ class RpcClient:
     async def close(self) -> None:
         """Closes the connection and waits until it is closed."""
         if not self.writer.is_closing():
-            # Half-close, as Node's socket.end() does: the server sees the end
+            # Half-close: the server sees the end
             # of input and closes its side, which ends our reader.
             with contextlib.suppress(OSError):
                 if self.writer.can_write_eof():

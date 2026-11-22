@@ -378,7 +378,7 @@ def _check_claude(io: CliIo) -> None:
 
 
 def _remove_old_mcp_registration(io: CliIo) -> None:
-    """Removes the MCP server the Node version of squawk registered, if any."""
+    """Removes the MCP server an earlier version of squawk registered, if any."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(
             [_claude_bin(io.env), "mcp", "remove", "--scope", "user", "squawk"],

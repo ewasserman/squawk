@@ -1,11 +1,11 @@
-"""Reads command-line options the way Node's `util.parseArgs` does in strict
-mode, so the Python `squawk` command accepts the same arguments and prints
-the same error messages as the Node version.
+"""Reads command-line options for the `squawk` command, strictly: an unknown
+option or a missing value is an error. The rules and the error messages are
+the same as in squawk 0.1, so scripts written for it keep working.
 
 What it accepts: `--name value`, `--name=value`, `-n value`, `-nvalue`,
 grouped short flags (`-up`), options before or after positionals, and `--`
 to end options. A string option whose value starts with "-" must be written
-as `--name=-x` (or `-n-x`), as in Node.
+as `--name=-x` (or `-n-x`).
 """
 
 import json
@@ -25,7 +25,8 @@ class Opt:
 
 
 class ParseArgsError(Exception):
-    """The arguments do not fit the command's options. The message is Node's wording."""
+    """The arguments do not fit the command's options. The message wording is
+    fixed (see the module docstring)."""
 
 
 @dataclass
@@ -74,7 +75,7 @@ def parse_args(
         if opt is None:
             message = f"Unknown option '{token.raw_name}'"
             if allow_positionals:
-                # The missing closing quote is in Node's message too.
+                # The missing closing quote is part of the fixed wording.
                 quoted = json.dumps(token.raw_name, ensure_ascii=False)
                 message += (
                     ". To specify a positional argument starting with a '-', place it at "

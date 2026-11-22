@@ -49,7 +49,7 @@ MESSAGE_NOTE = (
 def to_tail_line(notification: MessageNotification) -> dict[str, Any]:
     """Converts a `message` notification from the service into a tail line.
 
-    Every key is always present, in the Node version's order. `from_name`,
+    Every key is always present, in a fixed order. `from_name`,
     `in_reply_to` and `session` are None (null in JSON) when they have no
     value: the sender is not a contact, the message is not a reply, or no
     session was addressed.
