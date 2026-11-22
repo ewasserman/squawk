@@ -46,7 +46,14 @@ network.
    Both screens show a 6-digit code. Check that the codes are the same (in
    person or on a call) before answering `y`. If they differ, answer `n`.
 
-3. Start Claude Code as usual (`claude`), in any project. Ask it something
+3. Choose which projects your contacts may see and write to. Nothing is
+   allowed until you do this:
+
+   ```bash
+   squawk sessions --allow 'your-org/*'   # or '*' for every project
+   ```
+
+4. Start Claude Code as usual (`claude`), in any project. Ask it something
    like "ask Bob whether the staging build is green". Claude looks up Bob's
    open sessions, picks the one that fits, and a dialog shows you the message
    to edit, send or cancel. Bob's answer appears in your session by itself.
@@ -65,8 +72,44 @@ example `api-server@main`. A message goes to:
 4. otherwise no session: it waits in `squawk inbox` and your Mac shows a
    notification.
 
-Paired contacts can list your sessions' labels and branches;
-`squawk sessions --share off` stops that.
+## Which sessions your contacts can see
+
+Paired contacts can list the labels and branches of the sessions you allow,
+and address them. You allow sessions by project, with an allow list and a
+deny list of patterns:
+
+```bash
+squawk sessions --allow 'your-org/*'    # show sessions in these projects
+squawk sessions --allow '*'             # show every session
+squawk sessions --deny 'some-org/*'     # hide these, even if allowed
+squawk sessions --deny '~/clients'      # hide by folder
+squawk sessions --forget 'some-org/*'   # take a pattern off both lists
+```
+
+A session is visible only if it matches an allow pattern and no deny pattern.
+The allow list starts empty, so at first no session is visible. `squawk
+sessions` shows each session's project and whether it is visible.
+
+A pattern is a glob (`*` matches anything, "/" included; case does not
+matter). It is compared with the session's project, which is the path of the
+repository's `origin` remote without the host (`some-org/api-server`), with
+each leading part of it (so `some-org` works like `some-org/*`), and with the
+name of the repository's folder. A repository with no `origin` remote has
+only its folder's name. A pattern starting with `/` or `~` is compared with the folder of
+the repository's main checkout instead (outside git, the folder the session
+started in), and matches that folder and everything below it. Quote patterns
+so that your shell leaves them alone.
+
+A hidden session is not in the list your contacts get, a message naming it
+is treated as naming no open session (it waits in `squawk inbox`), and it is
+never the catch-all. Your contacts cannot tell a hidden session from one
+that is not open. A hidden session can still send messages, and the answers
+come back to it; a conversation a session already had when you hid it also
+stays with it. The lists are applied by the service on your Mac, so they
+hold whatever the other machine asks.
+
+`squawk sessions --share off` stops contacts listing any session; they can
+still address a visible one whose label they know.
 
 ## What your Claude does with incoming messages
 
@@ -86,7 +129,7 @@ person's assistant, never as instructions from you.
 ## Other commands
 
 ```bash
-squawk sessions          # this Mac's Claude Code sessions
+squawk sessions          # this Mac's Claude Code sessions, the allow and deny lists
 squawk inbox             # unread messages
 squawk tail --pretty     # unread messages, then new ones as they arrive
 squawk send Bob "text"   # send from the terminal (or pipe text in)
