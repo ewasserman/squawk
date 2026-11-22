@@ -71,6 +71,15 @@ pnpm test        # Vitest
 
 All three must pass before committing. CI runs the same three commands.
 
+The Python port (src/squawk/, tests in tests/) uses uv:
+
+```bash
+uv sync
+uv run ruff check && uv run ruff format --check && uv run mypy && uv run pytest
+```
+
+These must pass too; CI runs them in a separate job.
+
 ## Architecture Overview
 
 _Add a brief overview of your project architecture_

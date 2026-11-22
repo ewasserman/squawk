@@ -1,0 +1,56 @@
+[project]
+name = "squawk"
+dynamic = ["version"]
+description = "Lets Claude Code sessions on different machines send messages to each other over a local network."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "ifaddr>=0.2.0",
+    "pynacl>=1.5",
+    "websockets>=17.4",
+    "zeroconf>=0.154.0",
+]
+
+[project.scripts]
+squawk = "squawk.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=1.5.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/squawk/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/squawk"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["node_modules", "dist", "spikes"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+markers = [
+    "mdns: uses real multicast DNS on this machine; skipped when CI is set unless SQUAWK_TEST_MDNS=1",
+]

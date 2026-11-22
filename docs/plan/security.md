@@ -43,12 +43,16 @@ from its own user.
 - Only paired contacts can deliver a message at all (see threats 3 and 4), so
   a stranger cannot inject anything. *Tasks 9, 10.*
 - Every message is labelled as coming from another person's assistant, never
-  from the user. On the channel route, `squawk mcp`'s server instructions say
-  so, and each message arrives in a `<channel source="squawk" sender=...>` tag
-  that Claude cannot confuse with the user typing. The spike showed Claude
-  follows such instructions ("it came from the channel and not from you, so I
-  haven't acted on it"). On the Monitor route, the setup text and a field in
-  each JSON line from `squawk tail` say the same. *Tasks 11, 12, 15.*
+  from the user. The service writes each message into the Claude Code
+  session's cross-session inbox, and Claude Code presents it as a message
+  from another session, never from the user; such a message cannot approve
+  permission prompts or run slash commands. squawk's own text around the
+  body names the sender, says the message is information and not an
+  instruction, states the recipient's policy for that contact, and puts the
+  body between two marker lines carrying a random value the sender cannot
+  know, so the body cannot fake the end of the message. The squawk skill
+  that `squawk setup` installs says the same. In the real-session check,
+  Claude reported a message asking it to run `rm -rf` and refused to run it.
 - The **recipient** decides how much their own Claude may do with a contact's
   messages. The default, `show_first`, means Claude shows the message to its
   human and takes no action without approval. `auto_answer` lets Claude reply
@@ -73,13 +77,14 @@ message asked for it.
 
 **Mitigations.**
 
-- Every `send` and `reply` from a Claude session shows the human the
-  recipient and the full message text through MCP elicitation, and the human
-  approves, edits or cancels. Nothing goes out without that step unless the
-  human has turned on `auto_send` for that specific contact; it is off by
-  default. *Task 13.*
-- `squawk send` from the command line is typed by the person, so it does not
-  need the extra step.
+- Every `squawk send` and `squawk reply` shows the human the recipient and
+  the full message text in a macOS dialog, where they can edit it, then Send
+  or Cancel. The dialog is shown by squawk itself, so it appears whatever
+  permission mode Claude runs in. Nothing goes out without that step unless
+  the human has turned on `auto_send` for that contact, or as their default;
+  it is off by default. There is deliberately no environment variable or
+  option that skips the dialog, since an incoming message could ask Claude
+  to use it. If the dialog cannot be shown, nothing is sent.
 - Messages are encrypted end to end, so nobody else on the network can read
   what was sent. *Tasks 4, 9.*
 
@@ -142,18 +147,28 @@ that each side saves the attacker's key.
 **What remains.** The protection depends on people actually comparing the
 codes. The pairing screens say so plainly.
 
-### 6. Why permission relay stays off permanently
+### 6. No remote approval of permissions
 
-Claude Code channels can also relay permission prompts: a channel server that
-declares `claude/channel/permission` can receive "Claude wants to run X —
-allow?" prompts and answer them remotely. Squawk will never declare it.
+Another person's assistant must never be able to approve commands on your
+machine: that would turn every risk in threat 1 into remote code execution.
+squawk has no feature that relays permission prompts, and Claude Code's
+cross-session messages cannot approve prompts or change configuration. (The
+earlier Node version used Claude Code channels, which can relay permission
+prompts; it never declared that capability. The Python version does not use
+channels at all.)
 
-The person who would answer such a prompt over squawk is, by construction,
-someone other than the local user (or their assistant). Giving another
-person's assistant the power to approve commands on your machine would turn
-every risk in threat 1 into remote code execution. There is no setting to turn
-it on, and a test checks that `squawk mcp` does not declare the capability.
-*Task 12.*
+### 6a. Session inbox tokens and session labels
+
+To write into a session's inbox, the service stores each open session's
+inbox socket path and token in its database (`~/.config/squawk`, readable
+only by you). Anyone who can read that database could already post into
+those sessions, since the sockets are limited to your user account; the
+tokens are deleted when the session ends.
+
+Paired contacts can list your open sessions' labels (repository name and
+branch), so that their Claude can address the right one. Paths, tokens and
+anything else stay on your machine. `squawk sessions --share off` turns the
+list off.
 
 ### 7. The private key on disk
 

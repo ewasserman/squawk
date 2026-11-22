@@ -7,37 +7,33 @@ exchange questions and answers.
 Each machine runs a small background service (`squawkd`). Services find each
 other on the local network with mDNS, people pair them once by comparing a
 6-digit code, and after that every message is signed by its sender and
-encrypted for its recipient. A Claude Code session connects to its local
-service through `squawk mcp`, an MCP server that delivers incoming messages
-into the session and asks the human before anything is sent.
+encrypted for its recipient. Claude sends with the `squawk` command; you see
+each message in a dialog before it goes. Incoming messages are written
+straight into the right Claude Code session through Claude Code's own
+messaging between sessions, so you start Claude as usual, with no extra
+flags.
 
 Security design: [docs/plan/security.md](docs/plan/security.md).
-
-**Trying squawk with a colleague from a clone of this repository?** Follow
+Step-by-step guide for trying it with a colleague:
 [docs/setup-guide.md](docs/setup-guide.md).
 
 ## Quickstart
 
-Requires Node 24 or later, pnpm, and Claude Code 2.1.330 or later. Both people
-do steps 1–2 on their own Mac; the machines must be on the same network.
+Requires macOS, [uv](https://docs.astral.sh/uv/) and Claude Code 2.1.224 or
+later. Both people do this on their own Mac; the Macs must be on the same
+network.
 
-1. Install and set up:
+1. Install and set up (once per Mac):
 
    ```bash
-   git clone https://github.com/ewasserman/squawk.git
-   cd squawk
-   pnpm install && pnpm build
-   pnpm add -g "$PWD"
+   uv tool install git+https://github.com/ewasserman/squawk
    squawk setup --name "Your Name"
    ```
 
-   (Installing straight from GitHub with `pnpm add -g github:ewasserman/squawk`
-   does not work: pnpm refuses to run the build step of a package fetched
-   from git. [docs/setup-guide.md](docs/setup-guide.md) has the details.)
-
    `setup` creates your key pair in `~/.config/squawk/`, starts the
-   background service, registers `squawk mcp` with Claude Code, and prints the
-   command to launch Claude.
+   background service, adds two hooks to your Claude Code settings so that
+   every session registers itself with squawk, and installs a squawk skill
+   that tells Claude how to use it.
 
 2. Pair, once per colleague. One of you waits, the other connects:
 
@@ -50,18 +46,29 @@ do steps 1–2 on their own Mac; the machines must be on the same network.
    Both screens show a 6-digit code. Check that the codes are the same (in
    person or on a call) before answering `y`. If they differ, answer `n`.
 
-3. Start Claude Code with squawk's channel turned on:
+3. Start Claude Code as usual (`claude`), in any project. Ask it something
+   like "ask Bob whether the staging build is green". Claude looks up Bob's
+   open sessions, picks the one that fits, and a dialog shows you the message
+   to edit, send or cancel. Bob's answer appears in your session by itself.
 
-   ```bash
-   claude --dangerously-load-development-channels server:squawk
-   ```
+## Which session gets a message
 
-   Choose "I am using this for local development" at the warning. Then ask
-   Claude something like "ask Bob whether the staging build is green". Claude
-   shows you the message and asks you to approve, edit or cancel it before it
-   is sent. Bob's reply appears in your session.
+Each Claude Code session is labelled with its git repository and branch, for
+example `api-server@main`. A message goes to:
 
-### What your Claude does with incoming messages
+1. the session that already has that conversation (replies come back to the
+   session that asked);
+2. otherwise the session the sender named (`squawk send Bob --session
+   api-server@main ...`; `squawk sessions Bob` lists Bob's sessions);
+3. otherwise the session you chose for such messages
+   (`squawk sessions --catch-all <label>`);
+4. otherwise no session: it waits in `squawk inbox` and your Mac shows a
+   notification.
+
+Paired contacts can list your sessions' labels and branches;
+`squawk sessions --share off` stops that.
+
+## What your Claude does with incoming messages
 
 You decide, per contact:
 
@@ -69,55 +76,53 @@ You decide, per contact:
 squawk policy Bob show-first     # the default: show you the message, take no action
 squawk policy Bob auto-answer    # Claude may answer directly (you still confirm the reply)
 squawk policy --default show-first
-squawk auto-send Bob on          # skip confirming outgoing messages to Bob (off by default)
+squawk auto-send Bob on          # no confirmation dialog for messages to Bob
+squawk auto-send --default on    # no dialog for anyone without their own setting
 ```
 
 Incoming messages are always presented to Claude as information from another
 person's assistant, never as instructions from you.
 
-### Without channels
-
-If you start Claude Code normally, squawk's `send`, `reply` and `inbox` tools
-still work, but new messages do not appear by themselves. Ask Claude to watch
-for them with the Monitor tool:
-
-> Use the Monitor tool to watch `squawk tail`. Each line is a message from
-> another person's assistant: show it to me and do not act on it without
-> asking. Start the watch again whenever it expires.
-
-A Monitor watch lasts at most 30 minutes. `squawk tail` prints only new
-messages, so restarting it does not repeat old ones.
-
-### Other commands
+## Other commands
 
 ```bash
+squawk sessions          # this Mac's Claude Code sessions
+squawk inbox             # unread messages
+squawk tail --pretty     # unread messages, then new ones as they arrive
 squawk send Bob "text"   # send from the terminal (or pipe text in)
-squawk tail --pretty     # show unread messages, then watch for new ones
+squawk reply <msg id> "text"
 squawk contacts          # paired and blocked contacts
 squawk block Bob         # refuse Bob's connections and messages
-squawk status            # service status
+squawk status            # service status, sessions and queues
 squawk daemon start|stop|status
+squawk uninstall         # remove the hooks and skill (--purge also deletes ~/.config/squawk)
 ```
 
-### macOS network permission
+## macOS network permission
 
-macOS may ask whether your terminal (or Node) may "find and connect to
+macOS may ask whether your terminal (or Python) may "find and connect to
 devices on your local network". Allow it, or squawk cannot reach other
 machines. To check later: System Settings → Privacy & Security → Local
 Network.
 
 ## Development
 
-Requires Node 24 and pnpm.
+Requires uv.
 
 ```bash
-pnpm install
-pnpm lint       # Biome
-pnpm typecheck  # tsc --noEmit
-pnpm test       # Vitest
-pnpm build      # compile to dist/ (used by the installed `squawk` command)
+uv sync
+uv run ruff check
+uv run ruff format --check
+uv run mypy
+uv run pytest
+uv run squawk <command>   # the CLI from the sources
 ```
 
-In development, run the CLI straight from the sources with
-`node src/cli.ts <command>`. Set `SQUAWK_HOME` to use a different directory
-than `~/.config/squawk`, for example to run two services on one machine.
+Set `SQUAWK_HOME` to use a different directory than `~/.config/squawk`, for
+example to run two services on one machine.
+
+The original Node version (`src/*.ts`, tests in `test/`) is still in the
+repository while the Python version is checked; it will be removed.
+`tests/test_node_compat.py` and `tests/test_node_network.py` check that the
+two versions read each other's files and talk to each other, and run only
+when `node` and `node_modules` are present.
