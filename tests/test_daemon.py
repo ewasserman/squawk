@@ -340,6 +340,7 @@ async def test_shuts_down_instead_of_running_half_started_when_the_transport_fai
 async def test_contacts_lists_contacts_with_their_fingerprint_and_policy(env: Env) -> None:
     client = await env.connect()
     result = await client.call("contacts")
+    assert result["default_auto_send"] is False
     contacts = result["contacts"]
     assert len(contacts) == 1
     assert isinstance(contacts[0].pop("fingerprint"), str)
@@ -349,6 +350,7 @@ async def test_contacts_lists_contacts_with_their_fingerprint_and_policy(env: En
             "key_id": alice.id,
             "trust": "paired",
             "auto_send": False,
+            "auto_send_is_default": True,
             "inbound_policy": "auto_answer",
             "policy_is_default": False,
         }
@@ -424,3 +426,44 @@ async def test_replaces_a_stale_socket_file_when_nothing_is_listening(env: Env) 
     await env.daemon.start()
     client = await env.connect()
     assert await client.call("peers") == {"peers": []}
+
+
+async def test_auto_send_follows_the_default_unless_the_contact_has_its_own_setting(
+    env: Env,
+) -> None:
+    client = await env.connect()
+
+    async def alice_auto_send() -> tuple[bool, bool]:
+        contact = (await client.call("contacts"))["contacts"][0]
+        return contact["auto_send"], contact["auto_send_is_default"]
+
+    assert await alice_auto_send() == (False, True)
+    assert await client.call("set_default_auto_send", {"auto_send": True}) == {"auto_send": True}
+    assert (await client.call("contacts"))["default_auto_send"] is True
+    assert await alice_auto_send() == (True, True)
+
+    # The contact's own "off" wins over the default "on".
+    updated = await client.call("update_contact", {"contact": "alice", "auto_send": False})
+    assert updated["contact"]["auto_send"] is False
+    assert updated["contact"]["auto_send_is_default"] is False
+    # And its own "on" wins over the default "off".
+    await client.call("set_default_auto_send", {"auto_send": False})
+    await client.call("update_contact", {"contact": "alice", "auto_send": True})
+    assert await alice_auto_send() == (True, False)
+
+    # null clears the contact's own setting.
+    await client.call("update_contact", {"contact": "alice", "auto_send": None})
+    assert await alice_auto_send() == (False, True)
+    contact = env.daemon.store.get_contact(alice.id)
+    assert contact is not None and contact.auto_send is False
+
+    for bad in ({}, {"auto_send": "yes"}, {"auto_send": None}):
+        with pytest.raises(RpcError) as error:
+            await client.call("set_default_auto_send", bad)
+        assert error.value.code == RpcErrorCode.INVALID_PARAMS
+
+
+async def test_a_contact_turned_on_by_the_node_version_keeps_auto_send_on(env: Env) -> None:
+    # The Node version sets only the contacts table's column.
+    env.daemon.store.update_contact(alice.id, auto_send=True)
+    assert env.daemon.store.auto_send_for(alice.id) == (True, False)

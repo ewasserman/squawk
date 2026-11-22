@@ -125,9 +125,19 @@ than `~/.config/squawk`, for example to run two services on one machine.
 ### Python version (in progress)
 
 Squawk is being ported to Python (package `squawk` under `src/squawk/`, tests
-in `tests/`), so that installing it needs only uv. So far the identity,
-message envelopes and database are ported; they read and write the same files
-and messages as the Node version. Requires uv.
+in `tests/`), so that installing it needs only uv. The identity, message
+envelopes, database, background service, network transport, discovery,
+pairing and the command line are ported; they read and write the same files
+and messages as the Node version. Run it with `uv run squawk <command>`.
+Requires uv.
+
+The Python version has no MCP server. Claude sends with the command line
+(`squawk send`, and `squawk reply <msg id> "<text>"` to answer a message),
+and each message is shown to you first in a macOS dialog where you can edit
+it, then Send or Cancel. `squawk auto-send <contact> on` skips the dialog for
+one contact and `squawk auto-send --default on` for every contact without its
+own setting. If the dialog cannot be shown (not macOS, or no logged-in screen
+session), nothing is sent.
 
 ```bash
 uv sync

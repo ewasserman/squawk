@@ -29,6 +29,7 @@ from squawk.envelope import MESSAGE_KINDS, Envelope, MessageKind, create_envelop
 from squawk.identity import Identity, fingerprint, load_identity
 from squawk.rpc import RpcClient, RpcConnection, RpcError, RpcErrorCode, RpcHandler, RpcServer
 from squawk.store import (
+    DEFAULT_AUTO_SEND_KEY,
     DEFAULT_INBOUND_POLICY_KEY,
     UNSET,
     Contact,
@@ -149,6 +150,11 @@ class ContactInfo(TypedDict):
     fingerprint: str
     trust: Literal["paired", "blocked"]
     auto_send: bool
+    """Whether messages to this contact go out without asking the person first
+    (the contact's own setting, or the default)."""
+    auto_send_is_default: bool
+    """True when the contact has no auto-send setting of its own and follows
+    the default. Not in the Node version."""
     inbound_policy: InboundPolicy
     """The policy that applies to this contact's messages (their own or the default)."""
     policy_is_default: bool
@@ -498,19 +504,27 @@ class Daemon:
 
     def contacts(self) -> list[ContactInfo]:
         """Every contact, paired or blocked, sorted by name."""
-        infos: list[ContactInfo] = [
-            {
-                "name": c.name,
-                "key_id": c.public_key,
-                "fingerprint": fingerprint(key_from_id(c.public_key)),
-                "trust": c.trust,
-                "auto_send": c.auto_send,
-                "inbound_policy": self.store.inbound_policy_for(c.public_key),
-                "policy_is_default": c.inbound_policy is None,
-            }
-            for c in self.store.list_contacts()
-        ]
+        infos: list[ContactInfo] = []
+        for c in self.store.list_contacts():
+            auto_send, auto_send_is_default = self.store.auto_send_for(c.public_key)
+            infos.append(
+                {
+                    "name": c.name,
+                    "key_id": c.public_key,
+                    "fingerprint": fingerprint(key_from_id(c.public_key)),
+                    "trust": c.trust,
+                    "auto_send": auto_send,
+                    "auto_send_is_default": auto_send_is_default,
+                    "inbound_policy": self.store.inbound_policy_for(c.public_key),
+                    "policy_is_default": c.inbound_policy is None,
+                }
+            )
         return sorted(infos, key=lambda c: _name_sort_key(c["name"]))
+
+    def default_auto_send(self) -> bool:
+        """Whether messages to contacts with no auto-send setting of their own
+        go out without asking (off unless the person turned it on)."""
+        return self.store.get_setting(DEFAULT_AUTO_SEND_KEY) == "on"
 
     def status(self) -> StatusResult:
         sessions = sorted(self._sessions.values(), key=lambda s: s.active_seq, reverse=True)
@@ -543,7 +557,10 @@ class Daemon:
             assert obj is not None
             name = _string_field(obj, "contact", required=True, min_length=1)
             assert name is not None
-            auto_send = _bool_field(obj, "auto_send")
+            # null clears the contact's own auto-send setting so the default applies.
+            auto_send: bool | _Unset | None = UNSET
+            if "auto_send" in obj:
+                auto_send = None if obj["auto_send"] is None else _bool_field(obj, "auto_send")
             # null clears the contact's own policy so the default applies.
             policy: InboundPolicy | _Unset | None = UNSET
             if "inbound_policy" in obj:
@@ -554,9 +571,13 @@ class Daemon:
                         InboundPolicy, _enum_field(obj, "inbound_policy", _INBOUND_POLICIES)
                     )
             contact = self.resolve_contact(name)
-            self.store.update_contact(
-                contact.public_key, auto_send=auto_send, inbound_policy=policy
-            )
+
+            def update() -> None:
+                self.store.update_contact(contact.public_key, inbound_policy=policy)
+                if auto_send is not UNSET:
+                    self.store.set_auto_send(contact.public_key, auto_send)
+
+            self.store.transaction(update)
             return {
                 "contact": next(
                     (c for c in self.contacts() if c["key_id"] == contact.public_key), None
@@ -572,6 +593,15 @@ class Daemon:
             assert policy is not None
             self.store.set_setting(DEFAULT_INBOUND_POLICY_KEY, policy)
             return {"policy": policy}
+
+        def set_default_auto_send(params: Any, _connection: RpcConnection) -> dict[str, bool]:
+            obj = _params_object(params)
+            assert obj is not None
+            if "auto_send" not in obj:
+                raise _invalid("auto_send: required")
+            value = _bool_field(obj, "auto_send")
+            self.store.set_setting(DEFAULT_AUTO_SEND_KEY, "on" if value else "off")
+            return {"auto_send": bool(value)}
 
         def get_message(params: Any, _connection: RpcConnection) -> dict[str, MessageInfo]:
             obj = _params_object(params)
@@ -607,9 +637,16 @@ class Daemon:
         server.handle("register_session", register_session)
         server.handle("send", send)
         server.handle("peers", lambda _p, _c: {"peers": self.peers()})
-        server.handle("contacts", lambda _p, _c: {"contacts": self.contacts()})
+        server.handle(
+            "contacts",
+            lambda _p, _c: {
+                "contacts": self.contacts(),
+                "default_auto_send": self.default_auto_send(),
+            },
+        )
         server.handle("update_contact", update_contact)
         server.handle("set_default_policy", set_default_policy)
+        server.handle("set_default_auto_send", set_default_auto_send)
         server.handle("get_message", get_message)
         server.handle("inbox", inbox)
         server.handle("subscribe", subscribe)

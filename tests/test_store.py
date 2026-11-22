@@ -342,6 +342,27 @@ def test_stores_settings(store: Store) -> None:
     store.set_setting("k", "1")
     store.set_setting("k", "2")
     assert store.get_setting("k") == "2"
+    store.delete_setting("k")
+    assert store.get_setting("k") is None
+
+
+def test_auto_send_own_setting_wins_over_the_default(store: Store) -> None:
+    store.upsert_contact(bob.id, "bob")
+    assert store.auto_send_for(bob.id) == (False, True)
+    store.set_setting("default_auto_send", "on")
+    assert store.auto_send_for(bob.id) == (True, True)
+    off = store.set_auto_send(bob.id, False)
+    assert off.auto_send is False
+    assert store.auto_send_for(bob.id) == (False, False)
+    store.set_auto_send(bob.id, True)
+    store.set_setting("default_auto_send", "off")
+    assert store.auto_send_for(bob.id) == (True, False)
+    cleared = store.set_auto_send(bob.id, None)
+    assert cleared.auto_send is False
+    assert store.auto_send_for(bob.id) == (False, True)
+    with pytest.raises(KeyError):
+        store.set_auto_send(alice.id, True)
+    assert store.get_setting(f"auto_send:{alice.id}") is None
 
 
 def test_backs_a_replay_guard_with_the_seen_ids_table_across_reopen(

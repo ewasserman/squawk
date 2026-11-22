@@ -124,6 +124,17 @@ MessageState = Literal["queued", "sent", "acked", "failed", "unread", "read"]
 DEFAULT_INBOUND_POLICY_KEY = "default_inbound_policy"
 """Setting key holding the inbound policy for contacts that have none of their own."""
 
+DEFAULT_AUTO_SEND_KEY = "default_auto_send"
+"""Setting key holding "on" or "off": whether messages to contacts with no
+auto-send setting of their own go out without asking the person first."""
+
+AUTO_SEND_KEY_PREFIX = "auto_send:"
+"""Prefix of the setting key (followed by the contact's key id) that records
+a contact's own auto-send setting, "on" or "off". The contacts table's
+`auto_send` column cannot tell "off" from "never set", and changing that
+column would change the schema the Node version shares, so the choice is kept
+here. The column is still updated, for the Node version."""
+
 
 class _Unset(Enum):
     UNSET = "unset"
@@ -505,6 +516,38 @@ class Store:
         fallback = self.get_setting(DEFAULT_INBOUND_POLICY_KEY)
         return "auto_answer" if fallback == "auto_answer" else "show_first"
 
+    def set_auto_send(self, public_key: str, value: bool | None) -> Contact:
+        """Sets a contact's own auto-send setting, or with None clears it so the
+        default applies. Raises KeyError if there is no such contact."""
+
+        def run() -> Contact:
+            contact = self.update_contact(public_key, auto_send=bool(value))
+            key = AUTO_SEND_KEY_PREFIX + public_key
+            if value is None:
+                self.delete_setting(key)
+            else:
+                self.set_setting(key, "on" if value else "off")
+            return contact
+
+        return self.transaction(run)
+
+    def auto_send_for(self, public_key: str) -> tuple[bool, bool]:
+        """Whether messages to this contact go out without asking, and whether
+        that comes from the default (True) rather than the contact's own setting.
+
+        The contact's own setting wins. A contact whose `auto_send` column is
+        on but who has no recorded setting (turned on by the Node version)
+        counts as having it on. Otherwise the default setting applies, which
+        is off unless set.
+        """
+        own = self.get_setting(AUTO_SEND_KEY_PREFIX + public_key)
+        if own is not None:
+            return own == "on", False
+        contact = self.get_contact(public_key)
+        if contact is not None and contact.auto_send:
+            return True, False
+        return self.get_setting(DEFAULT_AUTO_SEND_KEY) == "on", True
+
     # Messages and threads
 
     def _insert_message(
@@ -805,6 +848,9 @@ class Store:
             key,
             value,
         )
+
+    def delete_setting(self, key: str) -> None:
+        self._run("DELETE FROM settings WHERE key = ?", key)
 
     # Seen message ids (replay protection)
 

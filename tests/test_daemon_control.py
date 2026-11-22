@@ -3,7 +3,7 @@ and stopping the background service as a separate process.
 
 This covers the parts of test/daemon-cli.test.ts that do not need the
 `squawk` command itself; the command-line tests (`squawk daemon start |
-status | stop | bogus` and their output) come with the CLI port.
+status | stop | bogus` and their output) are in test_cli.py.
 """
 
 import os
