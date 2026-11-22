@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from fake_inbox import FakeInbox, Inboxes
+from squawk import jsontext
 from squawk.config import pid_path, run_dir, socket_path
 from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import (
@@ -19,6 +20,7 @@ from squawk.daemon import (
     IncomingResult,
     MessageNotification,
     Transport,
+    parse_send_params,
 )
 from squawk.envelope import Envelope, create_envelope
 from squawk.identity import Identity, identity_from_secret_key, init_identity
@@ -280,6 +282,24 @@ async def test_repeated_labels_get_a_number_and_a_session_keeps_its_label(env: E
         "squawk@main-2",
         "squawk@main-3",
     ]
+
+
+async def test_a_numbered_label_stays_within_the_256_character_limit(env: Env) -> None:
+    longest = "x" * 256
+    first = await env.open_session(longest)
+    second = await env.open_session(longest)
+    assert first.label == longest
+    assert second.label.endswith("-2")
+    assert jsontext.js_length(second.label) <= 256
+    # Senders can name it: the send params and the envelope accept it.
+    parse_send_params({"to": "alice", "body": "hi", "session": second.label})
+    create_envelope(from_=alice.id, to=env.me.id, body="hi", session=second.label)
+    # Emoji count as two units; a cut never leaves a label over the limit.
+    emoji = "\U0001f600" * 128
+    one = await env.open_session(emoji)
+    two = await env.open_session(emoji)
+    assert one.label == emoji
+    assert jsontext.js_length(two.label) <= 256 and two.label.endswith("-2")
 
 
 async def test_falls_back_when_a_session_has_gone_away(env: Env) -> None:
