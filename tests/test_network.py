@@ -305,6 +305,22 @@ async def test_a_recipient_with_many_due_messages_does_not_hold_up_the_others(
         silent.close()
 
 
+async def test_concurrent_callers_share_one_dial_to_a_contact(net: Net) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    # A delivery and `squawk sessions bob` both need a connection at once.
+    first, second = await asyncio.gather(
+        alice.transport._link_to(bob.id), alice.transport._link_to(bob.id)
+    )
+    assert first is second
+    await wait_for(lambda: len(bob.transport._incoming_links) >= 1)
+    await asyncio.sleep(0.1)
+    assert len(bob.transport._incoming_links) == 1
+    await net.stop_node(alice)
+    await wait_for(lambda: first.closed)
+
+
 async def test_retries_after_the_receiver_restarts(net: Net) -> None:
     alice = await net.node("alice")
     bob_home = net.make_home("bob")

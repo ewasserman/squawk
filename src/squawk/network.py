@@ -550,6 +550,9 @@ class NetworkTransport(Transport):
         self._links: dict[str, PeerLink] = {}
         self._delivering: dict[str, asyncio.Task[None]] = {}
         """Deliveries in progress, by recipient key."""
+        self._dialing: dict[str, asyncio.Task[PeerLink]] = {}
+        """Connections being opened to contacts, by key; callers that need the
+        same contact meanwhile wait for the same one."""
         self._stopped = False
         self._incoming_links: set[PeerLink] = set()
         self._listen_port = 0
@@ -670,6 +673,9 @@ class NetworkTransport(Transport):
             if link.peer_key == key_id:
                 link.close(REFUSED_CODE, "blocked")
         self._links.pop(key_id, None)
+        dialing = self._dialing.pop(key_id, None)
+        if dialing is not None:
+            dialing.cancel()
 
     def find_peer(self, name_or_key: str) -> DiscoveredPeer | None:
         """A discovered peer by name or key id, for pairing."""
@@ -806,9 +812,32 @@ class NetworkTransport(Transport):
                 retry_later(item, _error_text(result))
 
     async def _link_to(self, recipient: str) -> PeerLink:
+        """An open, authenticated connection to a paired contact: the one
+        already open, the one being opened, or a new one. Only one dial per
+        contact runs at a time, so every connection opened ends up in
+        `_links`, where stop() and disconnect() find it."""
         existing = self._links.get(recipient)
         if existing is not None and existing.open:
             return existing
+        if self._stopped:
+            raise LinkError("the service is stopping")
+        dialing = self._dialing.get(recipient)
+        if dialing is None:
+            dialing = asyncio.ensure_future(self._open_link(recipient))
+            self._dialing[recipient] = dialing
+
+            def done(task: "asyncio.Task[PeerLink]") -> None:
+                if self._dialing.get(recipient) is task:
+                    del self._dialing[recipient]
+                # Nobody may be waiting any more; mark a failure as seen.
+                if not task.cancelled():
+                    task.exception()
+
+            dialing.add_done_callback(done)
+        # One caller giving up (cancelled) does not stop the dial the others wait for.
+        return await asyncio.shield(dialing)
+
+    async def _open_link(self, recipient: str) -> PeerLink:
         addresses = self.candidates(recipient)
         if not addresses:
             raise LinkError("recipient is not on the network")
@@ -828,6 +857,9 @@ class NetworkTransport(Transport):
         if link.authorization != "paired":
             link.close()
             raise LinkError("recipient is not a paired contact")
+        if self._stopped:
+            link.close(1001, "shutting down")
+            raise LinkError("the service is stopping")
         self._links[recipient] = link
 
         def forget() -> None:
