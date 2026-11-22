@@ -108,12 +108,35 @@ MIGRATIONS: tuple[str, ...] = (
     DELETE FROM outbox;
     DELETE FROM seen_ids;
     """,
+    # Python version only. The Claude Code sessions open on this machine, so
+    # that a restarted service still knows where to deliver, and which local
+    # session each conversation belongs to. The Node version ignores these
+    # tables.
+    """
+    CREATE TABLE sessions (
+        session_id    TEXT PRIMARY KEY,
+        label         TEXT NOT NULL,
+        base_label    TEXT NOT NULL,
+        repo          TEXT,
+        branch        TEXT,
+        cwd           TEXT NOT NULL,
+        socket_path   TEXT NOT NULL,
+        token         TEXT NOT NULL,
+        registered_at TEXT NOT NULL
+    );
+
+    CREATE TABLE thread_sessions (
+        thread_id  TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """,
 )
 """Schema migrations, applied in order. The database's `PRAGMA user_version`
 holds how many have been applied. Never edit or reorder an entry that has
-shipped; add a new one at the end instead. The text is the same as in
-src/store.ts
-apart from indentation."""
+shipped; add a new one at the end instead. The text of the first three is
+the same as in src/store.ts apart from indentation; the fourth exists only in
+the Python version (the Node version opens such a database and ignores it)."""
 
 Trust = Literal["paired", "blocked"]
 InboundPolicy = Literal["show_first", "auto_answer"]
@@ -197,6 +220,29 @@ class Thread:
     """First line of the first message in the thread, shortened."""
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    """A Claude Code session open on this machine, as registered by its
+    SessionStart hook."""
+
+    session_id: str
+    """Claude Code's id for the session."""
+    label: str
+    """The name people and other machines use for it, such as "squawk@main"
+    (unique among open sessions)."""
+    base_label: str
+    """The label before a "-2", "-3" was added to make it unique."""
+    repo: str | None
+    """The git repository's name, or None outside git."""
+    branch: str | None
+    cwd: str
+    socket_path: str
+    """The session's inbox socket (CLAUDE_CODE_MESSAGING_SOCKET)."""
+    token: str
+    """The session's inbox token (CLAUDE_CODE_MESSAGING_TOKEN)."""
+    registered_at: str
 
 
 SUBJECT_MAX = 120
@@ -851,6 +897,64 @@ class Store:
 
     def delete_setting(self, key: str) -> None:
         self._run("DELETE FROM settings WHERE key = ?", key)
+
+    # Claude Code sessions
+
+    def save_session(self, record: SessionRecord) -> None:
+        """Adds or replaces a session (by session id)."""
+        self._run(
+            """INSERT OR REPLACE INTO sessions
+             (session_id, label, base_label, repo, branch, cwd, socket_path, token,
+              registered_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            record.session_id,
+            record.label,
+            record.base_label,
+            record.repo,
+            record.branch,
+            record.cwd,
+            record.socket_path,
+            record.token,
+            record.registered_at,
+        )
+
+    def delete_session(self, session_id: str) -> bool:
+        """Forgets a session. Returns False if it was not registered."""
+        return self._run("DELETE FROM sessions WHERE session_id = ?", session_id).rowcount > 0
+
+    def list_sessions(self) -> list[SessionRecord]:
+        """Registered sessions, oldest registration first."""
+        return [
+            SessionRecord(
+                session_id=row["session_id"],
+                label=row["label"],
+                base_label=row["base_label"],
+                repo=row["repo"],
+                branch=row["branch"],
+                cwd=row["cwd"],
+                socket_path=row["socket_path"],
+                token=row["token"],
+                registered_at=row["registered_at"],
+            )
+            for row in self._all("SELECT * FROM sessions ORDER BY registered_at, rowid")
+        ]
+
+    def bind_thread(self, thread_id: str, session_id: str) -> None:
+        """Records that a conversation belongs to a local session, so later
+        messages in it go to that session."""
+        self._run(
+            """INSERT INTO thread_sessions (thread_id, session_id, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT (thread_id) DO UPDATE
+             SET session_id = excluded.session_id, updated_at = excluded.updated_at""",
+            thread_id,
+            session_id,
+            self._now_iso(),
+        )
+
+    def thread_session(self, thread_id: str) -> str | None:
+        """The session id a conversation belongs to, if one was recorded."""
+        row = self._one("SELECT session_id FROM thread_sessions WHERE thread_id = ?", thread_id)
+        return None if row is None else cast(str, row["session_id"])
 
     # Seen message ids (replay protection)
 

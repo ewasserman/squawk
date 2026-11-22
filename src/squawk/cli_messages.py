@@ -21,10 +21,23 @@ from squawk.cli_args import Opt, parse_args, string_value
 from squawk.cli_io import NOT_RUNNING_MESSAGE, CliIo, Command
 from squawk.config import squawk_home
 from squawk.confirm import ConfirmResult, Draft, dialog_confirm
-from squawk.daemon import ContactInfo, MessageInfo, MessageNotification, Peer, StatusResult
+from squawk.daemon import (
+    ContactInfo,
+    MessageInfo,
+    MessageNotification,
+    Peer,
+    SessionInfo,
+    StatusResult,
+)
 from squawk.daemon_control import DaemonControlError, connect_to_daemon
 from squawk.envelope import MESSAGE_KINDS
 from squawk.rpc import RpcClient, RpcError
+
+MESSAGING_SOCKET_ENV = "CLAUDE_CODE_MESSAGING_SOCKET"
+"""Set by Claude Code for hooks and Bash commands: the session's inbox socket."""
+
+MESSAGING_TOKEN_ENV = "CLAUDE_CODE_MESSAGING_TOKEN"
+"""Set by Claude Code for hooks and Bash commands: the token for that socket."""
 
 MESSAGE_NOTE = (
     "From another person's assistant via squawk. "
@@ -232,10 +245,33 @@ def format_service_status(status: StatusResult) -> str:
         f"Port:            {'none (no network transport)' if port is None else port}",
         f"Queued inbound:  {status['queued_inbound']}",
         f"Queued outbound: {status['queued_outbound']}",
-        f"Sessions:        {'none' if not status['sessions'] else ''}",
-        *(f"  {s['label']} (last active {s['last_active']})" for s in status["sessions"]),
+        f"Sessions:        {'none' if not status['sessions'] else ''}".rstrip(),
+        *(f"  {format_session_line(s)}" for s in status["sessions"]),
+        f"Catch-all:       {format_catch_all(status.get('catch_all'), status['sessions'])}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def format_session_line(session: SessionInfo) -> str:
+    """One local session for `status`: label, where it runs, whether it can be reached."""
+    where = (
+        session["cwd"] if session["branch"] is None else f"{session['branch']}, {session['cwd']}"
+    )
+    state = "reachable" if session["reachable"] else "NOT reachable (its inbox does not answer)"
+    marker = "  [catch-all]" if session["catch_all"] else ""
+    return f"{session['label']}  ({where})  {state}{marker}"
+
+
+def format_catch_all(label: str | None, sessions: list[SessionInfo]) -> str:
+    """The catch-all setting, and whether a session takes it now."""
+    if label is None:
+        return (
+            "none (messages that name no open session wait in `squawk inbox` "
+            "and you get a notification)"
+        )
+    if any(s["catch_all"] for s in sessions):
+        return label
+    return f"{label} (no open session has this label now)"
 
 
 SEND_USAGE = (
@@ -342,6 +378,11 @@ async def _confirm_and_send(command: str, client: RpcClient, draft: Draft, io: C
         params["thread_id"] = draft.thread_id
     if draft.in_reply_to is not None:
         params["in_reply_to"] = draft.in_reply_to
+    # Run from a Claude Code session, this names the session, so that answers
+    # in this conversation come back to it.
+    from_socket = io.env.get(MESSAGING_SOCKET_ENV)
+    if from_socket:
+        params["from_socket"] = from_socket
     sent = await client.call("send", params)
     delivered = await _wait_for_ack(client, sent["id"], io.ack_wait_s)
     name = draft.to_name

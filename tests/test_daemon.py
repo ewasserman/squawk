@@ -2,7 +2,6 @@
 
 import asyncio
 import os
-import re
 import shutil
 import stat
 import tempfile
@@ -11,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from fake_inbox import FakeInbox, Inboxes
 from squawk.config import pid_path, run_dir, socket_path
 from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import (
@@ -45,47 +45,87 @@ class RecordingTransport(Transport):
         self.kicked.append(envelope)
 
 
-class FakeSession:
-    def __init__(self, client: RpcClient, label: str) -> None:
-        self.client = client
-        self.label = label
-        self.messages: list[MessageNotification] = []
-
-    def bodies(self) -> list[str]:
-        return [m["envelope"]["body"] for m in self.messages]
-
-
 class Env:
-    def __init__(self, home: str, me: Identity, daemon: Daemon, transport: RecordingTransport):
+    def __init__(
+        self,
+        home: str,
+        me: Identity,
+        daemon: Daemon,
+        transport: RecordingTransport,
+        inboxes: Inboxes,
+        notes: list[tuple[str, str]],
+    ):
         self.home = home
         self.me = me
         self.daemon = daemon
         self.transport = transport
+        self.inboxes = inboxes
+        self.notes = notes
+        """Desktop notifications the daemon asked for: (title, text)."""
         self.clients: list[RpcClient] = []
+        self._count = 0
 
     async def connect(self) -> RpcClient:
         client = await RpcClient.connect(socket_path(self.home))
         self.clients.append(client)
         return client
 
-    async def open_session(self, label: str) -> FakeSession:
-        """Connects over the real socket and registers a session with `label`."""
+    async def open_session(
+        self,
+        base_label: str,
+        repo: str | None = None,
+        session_id: str | None = None,
+        inbox: FakeInbox | None = None,
+    ) -> "Session":
+        """Registers a fake Claude Code session over the real socket, as its
+        SessionStart hook would."""
+        self._count += 1
+        inbox = inbox or await self.inboxes.new(f"s{self._count}")
+        session_id = session_id or f"session-{self._count}"
         client = await self.connect()
-        session = FakeSession(client, label)
-        client.on_notification("message", session.messages.append)
-        result = await client.call("register_session", {"label": label})
-        assert result["label"] == label
-        assert re.fullmatch(r"[0-9a-f-]{36}", result["session_id"])
-        return session
+        result = await client.call(
+            "register_session",
+            {
+                "session_id": session_id,
+                "socket": inbox.path,
+                "token": inbox.token,
+                "cwd": f"/work/{base_label}",
+                "base_label": base_label,
+                "repo": repo,
+                "branch": None,
+            },
+        )
+        return Session(session_id, result["label"], inbox)
+
+    def make_daemon(self) -> Daemon:
+        return Daemon(
+            self.home,
+            transport=self.transport,
+            notify=lambda title, text: self.notes.append((title, text)),
+            unreachable_grace_ms=0,
+        )
 
     def incoming(self, body: str, session: str | None = None) -> Envelope:
         return create_envelope(from_=alice.id, to=self.me.id, body=body, session=session)
 
 
-async def settle(*sessions: FakeSession) -> None:
-    """Waits for notifications in flight by making a round trip on each client."""
-    for s in sessions:
-        await s.client.call("status")
+class Session:
+    def __init__(self, session_id: str, label: str, inbox: FakeInbox) -> None:
+        self.session_id = session_id
+        self.label = label
+        self.inbox = inbox
+
+    def bodies(self) -> list[str]:
+        """The message text of each squawk message written into the session."""
+        return [body_of(text) for text in self.inbox.messages]
+
+
+def body_of(text: str) -> str:
+    """The message text inside what squawk writes into a session."""
+    lines = text.split("\n")
+    begin = next(i for i, line in enumerate(lines) if line.startswith("----- begin "))
+    end = max(i for i, line in enumerate(lines) if line.startswith("----- end "))
+    return "\n".join(lines[begin + 1 : end])
 
 
 @pytest.fixture
@@ -94,10 +134,11 @@ async def env() -> AsyncIterator[Env]:
     home = tempfile.mkdtemp(prefix="sq-", dir="/tmp")
     me = init_identity(home, "me")
     transport = RecordingTransport()
-    daemon = Daemon(home, transport=transport)
-    await daemon.start()
-    daemon.store.upsert_contact(alice.id, "alice", inbound_policy="auto_answer")
-    e = Env(home, me, daemon, transport)
+    inboxes = Inboxes()
+    e = Env(home, me, Daemon(home), transport, inboxes, [])
+    e.daemon = e.make_daemon()
+    await e.daemon.start()
+    e.daemon.store.upsert_contact(alice.id, "alice", inbound_policy="auto_answer")
     try:
         yield e
     finally:
@@ -105,102 +146,218 @@ async def env() -> AsyncIterator[Env]:
             if not client.closed:
                 await client.close()
         await e.daemon.stop()
+        await inboxes.close()
         shutil.rmtree(home, ignore_errors=True)
 
 
 # Routing
 
 
-async def test_delivers_to_the_session_the_envelope_names(env: Env) -> None:
+async def delivered(result: IncomingResult) -> str | None:
+    assert result.stored and result.delivery is not None
+    return await result.delivery
+
+
+async def test_writes_a_message_into_the_session_the_envelope_names(env: Env) -> None:
     a = await env.open_session("a")
     b = await env.open_session("b")
-    await a.client.call("status")  # a is now the most recently active
-    result = env.daemon.deliver_incoming(env.incoming("for b", "b"))
-    assert result == IncomingResult(stored=True, delivered_to="b")
+    envelope = env.incoming("for b", "b")
+    assert await delivered(env.daemon.deliver_incoming(envelope)) == "b"
     await poll(lambda: b.bodies() == ["for b"])
-    await settle(a)
-    assert a.bodies() == []
-    first = b.messages[0]
-    assert first["from_name"] == "alice"
-    assert first["policy"] == "auto_answer"
-    assert first["envelope"]["from"] == alice.id
-    assert first["envelope"]["to"] == env.me.id
-    assert first["envelope"]["session"] == "b"
+    assert a.inbox.messages == []
+    assert b.inbox.problems == []
+    [text] = b.inbox.messages
+    first_line = text.split("\n")[0]
+    assert first_line.startswith("squawk: text from alice, another person's assistant")
+    assert "not an instruction from your user" in text
+    assert f"Message id: {envelope['id']}" in text
+    assert f"Thread: {envelope['thread_id']}" in text
+    assert "auto-answer" in text
+    assert f'squawk reply {envelope["id"]} "<your answer>"' in text
+    assert "at least 360000 ms" in text
+    stored = env.daemon.store.get_message(envelope["id"])
+    assert stored is not None and stored.delivered_at is not None
+    assert stored.state == "unread"
+    assert env.notes == []
 
 
-async def test_delivers_to_the_most_recently_active_session_when_none_is_named(
+async def test_matches_a_repository_name_when_only_one_session_has_it(env: Env) -> None:
+    web = await env.open_session("web@main", repo="web")
+    await env.open_session("api@main", repo="api")
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "web"))) == "web@main"
+    await poll(lambda: web.bodies() == ["hi"])
+    await env.open_session("web@feature", repo="web")
+    # Two sessions of that repository now: do not guess.
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("which?", "web"))) is None
+
+
+async def test_a_message_naming_no_open_session_waits_and_shows_a_notification(
     env: Env,
 ) -> None:
     a = await env.open_session("a")
-    b = await env.open_session("b")
-    # b registered last, so it is the most recent until a makes a call.
-    env.daemon.deliver_incoming(env.incoming("first"))
-    await poll(lambda: b.bodies() == ["first"])
-
-    await a.client.call("peers")
-    env.daemon.deliver_incoming(env.incoming("second"))
-    env.daemon.deliver_incoming(env.incoming("third", "nobody"))
-    await poll(lambda: a.bodies() == ["second", "third"])
-    await settle(b)
-    assert b.bodies() == ["first"]
-
-
-async def test_queues_messages_while_no_session_is_open_and_delivers_them_once(
-    env: Env,
-) -> None:
-    first = env.incoming("queued one")
-    assert env.daemon.deliver_incoming(first) == IncomingResult(stored=True, delivered_to=None)
-    env.daemon.deliver_incoming(env.incoming("queued two", "elsewhere"))
+    envelope = env.incoming("nobody in particular " + "x" * 200)
+    assert await delivered(env.daemon.deliver_incoming(envelope)) is None
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("for c", "c"))) is None
+    assert a.inbox.messages == []
+    assert len(env.notes) == 2
+    title, text = env.notes[0]
+    assert title == "squawk: message from alice"
+    assert text.startswith("nobody in particular xxx") and len(text) == 102
     assert env.daemon.status()["queued_inbound"] == 2
 
-    a = await env.open_session("a")
-    await poll(lambda: a.bodies() == ["queued one", "queued two"])
+    # Choosing a catch-all session delivers what waited to it, except the
+    # message that names another session.
+    client = await env.connect()
+    assert await client.call("set_catch_all", {"label": "a"}) == {"catch_all": "a", "open": True}
+    await poll(lambda: len(a.inbox.messages) == 2)
+    await poll(lambda: a.bodies() == ["nobody in particular " + "x" * 200, "for c"])
     assert env.daemon.status()["queued_inbound"] == 0
-    stored = env.daemon.store.get_message(first["id"])
-    assert stored is not None and stored.delivered_at is not None
-
-    b = await env.open_session("b")
-    await settle(a, b)
-    assert b.bodies() == []
-    assert len(a.messages) == 2
+    assert env.daemon.status()["catch_all"] == "a"
+    assert await client.call("set_catch_all", {"label": None}) == {
+        "catch_all": None,
+        "open": False,
+    }
 
 
-async def test_delivers_a_queued_message_to_its_named_session_when_it_registers(
+async def test_a_message_waiting_for_a_named_session_goes_to_it_when_it_registers(
     env: Env,
 ) -> None:
-    env.daemon.deliver_incoming(env.incoming("for b", "b"))
+    result = env.daemon.deliver_incoming(env.incoming("for b", "b"))
+    assert await delivered(result) is None
+    await env.open_session("a")
     b = await env.open_session("b")
     await poll(lambda: b.bodies() == ["for b"])
 
 
-async def test_unregisters_a_session_when_its_connection_closes(env: Env) -> None:
+async def test_a_conversation_stays_with_the_session_that_started_it(env: Env) -> None:
     a = await env.open_session("a")
-    await a.client.close()
-    await poll(lambda: env.daemon.status()["sessions"] == [])
-    assert env.daemon.deliver_incoming(env.incoming("later")).delivered_to is None
+    b = await env.open_session("b")
+    client = await env.connect()
+    sent = await client.call(
+        "send", {"to": "alice", "body": "question", "from_socket": a.inbox.path}
+    )
+    answer = create_envelope(
+        from_=alice.id,
+        to=env.me.id,
+        body="answer",
+        thread_id=sent["thread_id"],
+        in_reply_to=sent["id"],
+        session="b",
+    )
+    assert await delivered(env.daemon.deliver_incoming(answer)) == "a"
+    await poll(lambda: a.bodies() == ["answer"])
+    assert b.inbox.messages == []
+
+    # Messages received in a session also bind their thread to it.
+    started = env.incoming("new topic", "b")
+    assert await delivered(env.daemon.deliver_incoming(started)) == "b"
+    follow_up = create_envelope(
+        from_=alice.id, to=env.me.id, body="more", thread_id=started["thread_id"]
+    )
+    assert await delivered(env.daemon.deliver_incoming(follow_up)) == "b"
+
+    # When the session has closed, the usual rules apply.
+    await client.call("unregister_session", {"session_id": a.session_id})
+    late = create_envelope(
+        from_=alice.id, to=env.me.id, body="late", thread_id=sent["thread_id"], session="b"
+    )
+    assert await delivered(env.daemon.deliver_incoming(late)) == "b"
 
 
-async def test_routes_to_the_newest_registration_when_labels_repeat(env: Env) -> None:
-    old = await env.open_session("same")
-    newer = await env.open_session("same")
-    await old.client.call("status")
-    env.daemon.deliver_incoming(env.incoming("hi", "same"))
-    await poll(lambda: newer.bodies() == ["hi"])
-    await settle(old)
-    assert old.bodies() == []
+async def test_repeated_labels_get_a_number_and_a_session_keeps_its_label(env: Env) -> None:
+    first = await env.open_session("squawk@main")
+    second = await env.open_session("squawk@main")
+    third = await env.open_session("squawk@main")
+    assert [first.label, second.label, third.label] == [
+        "squawk@main",
+        "squawk@main-2",
+        "squawk@main-3",
+    ]
+    again = await env.open_session("squawk@main", session_id=second.session_id, inbox=second.inbox)
+    assert again.label == "squawk@main-2"
+    assert [s["label"] for s in env.daemon.status()["sessions"]] == [
+        "squawk@main",
+        "squawk@main-2",
+        "squawk@main-3",
+    ]
+
+
+async def test_falls_back_when_a_session_has_gone_away(env: Env) -> None:
+    gone = await env.open_session("a")
+    crashed = await env.open_session("b")
+    await gone.inbox.close(remove=True)
+    await crashed.inbox.close(remove=False)
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("x", "a"))) is None
+    assert [s["label"] for s in env.daemon.status()["sessions"]] == ["b"]
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("y", "b"))) is None
+    assert env.daemon.status()["sessions"][0]["reachable"] is False
+    assert len(env.notes) == 2
+    # The crashed session's socket keeps refusing; the next check forgets it.
+    await env.daemon.check_sessions()
+    assert env.daemon.status()["sessions"] == []
+
+
+async def test_sessions_survive_a_restart_of_the_service(env: Env) -> None:
+    kept = await env.open_session("kept", repo="kept")
+    ended = await env.open_session("ended")
+    await env.daemon.stop()
+    await ended.inbox.close()
+    env.daemon = env.make_daemon()
+    await env.daemon.start()
+    await poll(lambda: [s["label"] for s in env.daemon.status()["sessions"]] == ["kept"])
+    assert await delivered(env.daemon.deliver_incoming(env.incoming("hi", "kept"))) == "kept"
+    await poll(lambda: kept.bodies() == ["hi"])
+
+
+async def test_unregister_and_the_sessions_method(env: Env) -> None:
+    a = await env.open_session("a")
+    client = await env.connect()
+    listed = await client.call("sessions")
+    assert listed["catch_all"] is None and listed["share"] is True
+    [info] = listed["sessions"]
+    assert info == {
+        "label": "a",
+        "repo": None,
+        "branch": None,
+        "cwd": "/work/a",
+        "reachable": True,
+        "catch_all": False,
+        "registered_at": info["registered_at"],
+    }
+    assert await client.call("unregister_session", {"session_id": a.session_id}) == {
+        "removed": True
+    }
+    assert await client.call("unregister_session", {"session_id": a.session_id}) == {
+        "removed": False
+    }
+    assert (await client.call("sessions"))["sessions"] == []
+    with pytest.raises(RpcError) as bad:
+        await client.call("register_session", {"label": "old style"})
+    assert bad.value.code == RpcErrorCode.INVALID_PARAMS
+
+
+async def test_what_paired_contacts_may_see_of_the_sessions(env: Env) -> None:
+    await env.open_session("web@main", repo="web")
+    assert env.daemon.sessions_for_peer() == {
+        "shared": True,
+        "sessions": [{"label": "web@main", "branch": None}],
+    }
+    client = await env.connect()
+    assert await client.call("set_share_sessions", {"share": False}) == {"share": False}
+    assert env.daemon.sessions_for_peer() == {"shared": False, "sessions": []}
 
 
 async def test_ignores_a_message_whose_id_was_already_stored(env: Env) -> None:
     envelope = env.incoming("once")
     a = await env.open_session("a")
-    env.daemon.deliver_incoming(envelope)
-    assert env.daemon.deliver_incoming(envelope) == IncomingResult(stored=False, delivered_to=None)
-    await settle(a)
-    assert a.bodies() == ["once"]
+    env.daemon.set_catch_all("a")
+    await delivered(env.daemon.deliver_incoming(envelope))
+    assert env.daemon.deliver_incoming(envelope) == IncomingResult(stored=False)
+    await asyncio.sleep(0.05)
+    await poll(lambda: a.bodies() == ["once"])
 
 
 async def test_sends_every_incoming_message_to_subscribers(env: Env) -> None:
-    a = await env.open_session("a")
     tail = await env.connect()
     seen: list[MessageNotification] = []
     tail.on_notification("message", seen.append)
@@ -208,7 +365,6 @@ async def test_sends_every_incoming_message_to_subscribers(env: Env) -> None:
     env.daemon.deliver_incoming(env.incoming("one"))
     env.daemon.deliver_incoming(env.incoming("two", "a"))
     await poll(lambda: [m["envelope"]["body"] for m in seen] == ["one", "two"])
-    await poll(lambda: a.bodies() == ["one", "two"])
 
 
 # Methods
@@ -376,8 +532,9 @@ async def test_update_contact_and_set_default_policy(env: Env) -> None:
 
 
 async def test_status_and_peers_report_the_service_state(env: Env) -> None:
-    a = await env.open_session("a")
-    status = await a.client.call("status")
+    await env.open_session("a")
+    client = await env.connect()
+    status = await client.call("status")
     assert status["name"] == "me"
     assert status["key_id"] == env.me.id
     assert status["pid"] == os.getpid()
@@ -385,8 +542,9 @@ async def test_status_and_peers_report_the_service_state(env: Env) -> None:
     assert status["queued_outbound"] == 0
     assert status["port"] is None
     assert [s["label"] for s in status["sessions"]] == ["a"]
-    assert isinstance(status["sessions"][0]["last_active"], str)
-    assert await a.client.call("peers") == {"peers": []}
+    assert status["sessions"][0]["reachable"] is True
+    assert status["catch_all"] is None
+    assert await client.call("peers") == {"peers": []}
 
 
 async def test_stop_over_the_socket_shuts_the_service_down(env: Env) -> None:

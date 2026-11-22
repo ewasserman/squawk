@@ -1,14 +1,30 @@
 """squawkd: the background service. It owns the identity and the database,
-listens on a unix socket for local clients (Claude Code sessions, the CLI,
-`squawk tail`) speaking newline-delimited JSON-RPC 2.0, and routes incoming
-messages to those sessions.
+listens on a unix socket for local clients (the CLI, `squawk tail`, and the
+Claude Code session hooks) speaking newline-delimited JSON-RPC 2.0, and
+delivers incoming messages into Claude Code sessions.
+
+Claude Code sessions register through their SessionStart hook (`squawk hook
+session-start`), giving their inbox socket and token (see squawk.inbox), and
+unregister through SessionEnd. Registrations are kept in the database, so a
+restarted service still knows them; a session whose socket file is gone is
+forgotten. An incoming message goes to:
+
+  1. the local session that sent or received earlier messages in the same
+     conversation (thread), if it is open;
+  2. otherwise the session the sender named (by label, or by repository name
+     when exactly one open session has that repository);
+  3. otherwise the session the person chose to take messages nobody else
+     takes (`squawk sessions --catch-all <label>`);
+  4. otherwise no session: it waits unread, and a desktop notification tells
+     the person. It is delivered later if a session it matches registers.
 
 Network transports (mDNS discovery, the WebSocket listener) plug in through
 `deliver_incoming` (for messages that arrive) and the `Transport` class (for
 messages to send), so routing does not depend on how a message travels.
 
-This is the Python version of src/daemon.ts. Its socket methods take and
-return the same JSON, so clients of either version work with either service.
+This started as the Python version of src/daemon.ts. The methods both
+versions have take and return the same JSON, apart from the session methods
+and `status`'s session list, which are new.
 """
 
 import asyncio
@@ -17,8 +33,7 @@ import inspect
 import os
 import sys
 import unicodedata
-import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
@@ -27,6 +42,15 @@ from squawk.config import db_path, pid_path, run_dir, socket_path
 from squawk.encoding import is_key_id, key_from_id
 from squawk.envelope import MESSAGE_KINDS, Envelope, MessageKind, create_envelope
 from squawk.identity import Identity, fingerprint, load_identity
+from squawk.inbox import (
+    Notifier,
+    delivery_text,
+    find_session,
+    inbox_state,
+    notification_text,
+    post_to_inbox,
+    unique_label,
+)
 from squawk.rpc import RpcClient, RpcConnection, RpcError, RpcErrorCode, RpcHandler, RpcServer
 from squawk.store import (
     DEFAULT_AUTO_SEND_KEY,
@@ -34,6 +58,7 @@ from squawk.store import (
     UNSET,
     Contact,
     InboundPolicy,
+    SessionRecord,
     Store,
     StoredMessage,
 )
@@ -52,6 +77,28 @@ class Peer(TypedDict):
     host: str
     port: int
     paired: bool
+
+
+CATCH_ALL_KEY = "catch_all_session"
+"""Setting key holding the label of the session that takes messages no other
+session takes (absent: none)."""
+
+SHARE_SESSIONS_KEY = "share_sessions"
+"""Setting key holding "off" when paired contacts may not list this
+machine's sessions (absent or "on": they may)."""
+
+
+class PeerSession(TypedDict):
+    """A session as another machine sees it: no paths, no tokens."""
+
+    label: str
+    branch: str | None
+
+
+class PeerSessions(TypedDict):
+    shared: bool
+    """False when that person turned off sharing their session list."""
+    sessions: list[PeerSession]
 
 
 class Transport:
@@ -82,6 +129,10 @@ class Transport:
         """The TCP port other hosts connect to, if there is one."""
         return None
 
+    async def request_sessions(self, key_id: str) -> PeerSessions:
+        """Asks a contact's service for its list of sessions."""
+        raise RpcError(RpcErrorCode.APPLICATION_ERROR, "this service has no network transport")
+
 
 no_transport = Transport()
 """A transport that sends nothing; messages stay in the outbound queue."""
@@ -93,8 +144,10 @@ class IncomingResult:
 
     stored: bool
     """False if a message with the same id was already stored (nothing else happens)."""
-    delivered_to: str | None
-    """The label of the session it was pushed to, or None if it stays queued."""
+    delivery: "asyncio.Future[str | None] | None" = None
+    """Completes with the label of the session the message was written into,
+    or None if no session took it (it then waits unread). None when the
+    message was not stored."""
 
 
 class MessageNotification(TypedDict):
@@ -115,6 +168,9 @@ class SendParams(TypedDict):
     in_reply_to: NotRequired[str]
     session: NotRequired[str]
     """The label of the recipient's session that should get the message."""
+    from_socket: NotRequired[str]
+    """The inbox socket of the local Claude Code session sending it (from
+    CLAUDE_CODE_MESSAGING_SOCKET), so replies come back to that session."""
 
 
 class SendResult(TypedDict):
@@ -162,8 +218,17 @@ class ContactInfo(TypedDict):
 
 
 class SessionInfo(TypedDict):
+    """A local Claude Code session, as the `sessions` and `status` methods list it."""
+
     label: str
-    last_active: str
+    repo: str | None
+    branch: str | None
+    cwd: str
+    reachable: bool
+    """Whether its inbox socket accepted a connection at the last check."""
+    catch_all: bool
+    """Whether it takes messages no other session takes."""
+    registered_at: str
 
 
 class StatusResult(TypedDict):
@@ -176,18 +241,8 @@ class StatusResult(TypedDict):
     queued_outbound: int
     port: int | None
     """TCP port for other hosts, or None when the service has no network transport."""
-
-
-@dataclass
-class _Session:
-    id: str
-    label: str
-    connection: RpcConnection
-    registered_seq: int
-    """Order of registration; larger is newer."""
-    active_seq: int
-    """Order of the last call on this connection; larger is more recent."""
-    last_active: int
+    catch_all: str | None
+    """The label chosen to take messages no other session takes, if any."""
 
 
 # Checking params. These follow the zod schemas in src/daemon.ts: unknown
@@ -269,6 +324,7 @@ def parse_send_params(params: Any) -> SendParams:
         ("thread_id", 1, 128),
         ("in_reply_to", 1, 128),
         ("session", 0, 256),
+        ("from_socket", 1, 1024),
     ):
         value = _string_field(
             obj, key, required=False, min_length=min_length, max_length=max_length
@@ -295,6 +351,17 @@ async def _socket_answers(path: str) -> bool:
     return True
 
 
+def _log(text: str) -> None:
+    print(f"squawkd: {text}", file=sys.stderr, flush=True)
+
+
+def _optional_string(obj: Mapping[str, Any], key: str, max_length: int) -> str | None:
+    """A string field that may be missing or null."""
+    if obj.get(key) is None:
+        return None
+    return _string_field(obj, key, required=False, max_length=max_length)
+
+
 def _name_sort_key(name: str) -> tuple[str, str, str]:
     """Orders names roughly as JavaScript's `localeCompare` does: ignoring
     accents and case first, then accents, then lower case before upper case."""
@@ -314,17 +381,32 @@ class Daemon:
         *,
         transport: Transport | None = None,
         now: Callable[[], int] | None = None,
+        notify: Notifier | None = None,
+        session_check_interval_s: float = 60.0,
+        unreachable_grace_ms: int = 10 * 60_000,
     ) -> None:
+        """`notify` shows a desktop notification for a message no session
+        took (default: none; the service process passes the macOS one).
+        Sessions are checked every `session_check_interval_s` seconds; one
+        whose socket file is there but refuses connections for longer than
+        `unreachable_grace_ms` is forgotten."""
         self.home = home
         self.socket_path = socket_path(home)
         self.transport: Transport = no_transport if transport is None else transport
         self._now = now_ms if now is None else now
-        self._sessions: dict[RpcConnection, _Session] = {}
+        self._notify = notify
+        self._check_interval_s = session_check_interval_s
+        self._unreachable_grace_ms = unreachable_grace_ms
+        self._sessions: dict[str, SessionRecord] = {}
+        """Registered Claude Code sessions, by Claude session id."""
+        self._unreachable_since: dict[str, int] = {}
+        """Sessions whose inbox refused the last connection, and since when."""
+        self._delivery_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[Any]] = set()
         self._subscribers: set[RpcConnection] = set()
         self._identity: Identity | None = None
         self._store: Store | None = None
         self._server: RpcServer | None = None
-        self._seq = 0
         self._stopping: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
 
@@ -360,7 +442,8 @@ class Daemon:
             os.remove(self.socket_path)
 
         self._store = Store.open(db_path(self.home), now=self._now)
-        server = RpcServer(on_call=lambda connection, _method: self._touch(connection))
+        self._sessions = {s.session_id: s for s in self._store.list_sessions()}
+        server = RpcServer()
         self._register_methods(server)
         await server.listen(self.socket_path)
         os.chmod(self.socket_path, 0o600)
@@ -375,6 +458,9 @@ class Daemon:
             # network): shut down and report the failure.
             await self.stop()
             raise
+        # Re-check the sessions registered before a restart, deliver what
+        # waited meanwhile, and keep checking.
+        self._spawn(self._watch_sessions())
 
     async def stop(self) -> None:
         """Stops listening, closes every connection and the store. Safe to call twice."""
@@ -386,9 +472,11 @@ class Daemon:
         try:
             await self.transport.stop()
         finally:
+            for task in list(self._tasks):
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
             if self._server is not None:
                 await self._server.close()
-            self._sessions.clear()
             self._subscribers.clear()
             if self._server is not None:
                 for path in (self.socket_path, pid_path(self.home)):
@@ -405,27 +493,259 @@ class Daemon:
         received_at: int | None = None,
         remote_address: str | None = None,
     ) -> IncomingResult:
-        """Saves a message that arrived from another host and routes it:
-          1. to the session whose label the envelope names, if one is open;
-          2. otherwise to the most recently active session;
-          3. with no session open, it stays queued and is pushed when a session registers.
-        Every subscriber also gets it. A duplicate (same id) is ignored.
+        """Saves a message that arrived from another host, passes it to every
+        subscriber, and starts delivering it into a session (see the module
+        description for which one). A duplicate (same id) is ignored.
 
-        `received_at` (milliseconds since the epoch) defaults to now;
-        `remote_address` is where it came from, for logging.
+        Must be called from inside the running event loop. `received_at`
+        (milliseconds since the epoch) defaults to now; `remote_address` is
+        where it came from, for logging.
         """
         stored = self.store.save_incoming(
             envelope, self._now() if received_at is None else received_at
         )
         if not stored:
-            return IncomingResult(stored=False, delivered_to=None)
+            return IncomingResult(stored=False)
         notification = self._notification(envelope)
         for subscriber in list(self._subscribers):
             subscriber.notify("message", notification)
-        target = self._session_by_label(envelope.get("session")) or self._most_recently_active()
-        if target is not None and self._push(target, envelope["id"], notification):
-            return IncomingResult(stored=True, delivered_to=target.label)
-        return IncomingResult(stored=True, delivered_to=None)
+        delivery = self._spawn(self._deliver_new(envelope["id"]))
+        return IncomingResult(stored=True, delivery=delivery)
+
+    # Sessions
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> "asyncio.Task[Any]":
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _is_reachable(self, session_id: str) -> bool:
+        return session_id not in self._unreachable_since
+
+    def _open_sessions(self) -> list[SessionRecord]:
+        """Registered sessions whose inbox answered at the last check."""
+        return [s for s in self._sessions.values() if self._is_reachable(s.session_id)]
+
+    def catch_all_label(self) -> str | None:
+        return self.store.get_setting(CATCH_ALL_KEY)
+
+    def shares_sessions(self) -> bool:
+        return self.store.get_setting(SHARE_SESSIONS_KEY) != "off"
+
+    def register_session(
+        self,
+        *,
+        session_id: str,
+        socket: str,
+        token: str,
+        cwd: str,
+        base_label: str,
+        repo: str | None = None,
+        branch: str | None = None,
+    ) -> SessionRecord:
+        """Records a Claude Code session (or updates it, when the same session
+        registers again) and starts delivering messages waiting for it.
+
+        The label is `base_label`, with "-2", "-3", ... added when another
+        open session already has it. A session registering again keeps its
+        label.
+        """
+        previous = self._sessions.get(session_id)
+        # Another registration with the same socket is a session that ended
+        # without unregistering; its socket now belongs to this one.
+        for other in list(self._sessions.values()):
+            if other.socket_path == socket and other.session_id != session_id:
+                self._forget(other.session_id)
+        if previous is not None and previous.base_label == base_label:
+            label = previous.label
+        else:
+            label = unique_label(
+                base_label,
+                (s.label for s in self._sessions.values() if s.session_id != session_id),
+            )
+        record = SessionRecord(
+            session_id=session_id,
+            label=label,
+            base_label=base_label,
+            repo=repo,
+            branch=branch,
+            cwd=cwd,
+            socket_path=socket,
+            token=token,
+            registered_at=previous.registered_at
+            if previous is not None
+            else iso_from_ms(self._now()),
+        )
+        self.store.save_session(record)
+        self._sessions[session_id] = record
+        self._unreachable_since.pop(session_id, None)
+        self._spawn(self._deliver_waiting())
+        return record
+
+    def unregister_session(self, session_id: str) -> bool:
+        """Forgets a session that ended. Returns False if it was not registered."""
+        known = session_id in self._sessions
+        self._forget(session_id)
+        return known
+
+    def _forget(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+        self._unreachable_since.pop(session_id, None)
+        self.store.delete_session(session_id)
+
+    def session_by_socket(self, path: str | None) -> SessionRecord | None:
+        if not path:
+            return None
+        return next((s for s in self._sessions.values() if s.socket_path == path), None)
+
+    async def check_sessions(self) -> None:
+        """Checks every session's inbox socket: forgets sessions whose socket
+        file is gone (or has refused connections for too long), and marks the
+        rest reachable or not. Delivers waiting messages if a session became
+        reachable."""
+        became_reachable = False
+        for session in list(self._sessions.values()):
+            state = await inbox_state(session.socket_path)
+            if session.session_id not in self._sessions:
+                continue  # unregistered meanwhile
+            if state == "gone":
+                _log(f"session {session.label} ended (its inbox socket is gone)")
+                self._forget(session.session_id)
+            elif state == "refused":
+                since = self._unreachable_since.setdefault(session.session_id, self._now())
+                if self._now() - since >= self._unreachable_grace_ms:
+                    _log(f"session {session.label} ended (its inbox refuses connections)")
+                    self._forget(session.session_id)
+            elif self._unreachable_since.pop(session.session_id, None) is not None:
+                became_reachable = True
+        if became_reachable:
+            await self._deliver_waiting()
+
+    async def _watch_sessions(self) -> None:
+        while True:
+            try:
+                await self.check_sessions()
+                await self._deliver_waiting()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _log(f"checking sessions failed: {err}")
+            await asyncio.sleep(self._check_interval_s)
+
+    def set_catch_all(self, label: str | None) -> None:
+        """Chooses (by label) the session that takes messages no other session
+        takes, or with None clears the choice. Delivers waiting messages to it."""
+        if label is None:
+            self.store.delete_setting(CATCH_ALL_KEY)
+        else:
+            self.store.set_setting(CATCH_ALL_KEY, label)
+            self._spawn(self._deliver_waiting())
+
+    def route(
+        self, message: StoredMessage, exclude: set[str] | None = None
+    ) -> SessionRecord | None:
+        """The session an incoming message goes to, or None (see the module
+        description). Sessions in `exclude` (by id) are not considered."""
+        candidates = [
+            s for s in self._open_sessions() if exclude is None or s.session_id not in exclude
+        ]
+        bound = self.store.thread_session(message.thread_id)
+        if bound is not None:
+            owner = next((s for s in candidates if s.session_id == bound), None)
+            if owner is not None:
+                return owner
+        named = find_session(candidates, message.session)
+        if named is not None:
+            return named
+        return find_session(candidates, self.catch_all_label())
+
+    async def _deliver_new(self, message_id: str) -> str | None:
+        """Delivers a message that just arrived; notifies the person if no
+        session takes it."""
+        delivered = await self._deliver_waiting([message_id])
+        label = delivered.get(message_id)
+        if label is None and self._notify is not None:
+            message = self.store.get_message(message_id)
+            if message is not None and message.delivered_at is None:
+                envelope = self._envelope_of(message)
+                try:
+                    self._notify(
+                        *notification_text(self._notification(envelope)["from_name"], envelope)
+                    )
+                except Exception as err:
+                    _log(f"could not show a notification: {err}")
+        return label
+
+    async def _deliver_waiting(self, ids: list[str] | None = None) -> dict[str, str | None]:
+        """Writes waiting incoming messages (all of them, or those in `ids`)
+        into the sessions they go to. Returns the label each one went to,
+        or None for those that keep waiting."""
+        results: dict[str, str | None] = {}
+        async with self._delivery_lock:
+            if self._store is None or self._stopping is not None:
+                return results
+            waiting = self.store.undelivered_incoming()
+            if ids is not None:
+                waiting = [m for m in waiting if m.id in ids]
+            for message in waiting:
+                results[message.id] = await self._deliver_one(message)
+        return results
+
+    async def _deliver_one(self, message: StoredMessage) -> str | None:
+        tried: set[str] = set()
+        envelope = self._envelope_of(message)
+        notification = self._notification(envelope)
+        auto_send, _ = self.store.auto_send_for(message.peer)
+        text = delivery_text(
+            envelope,
+            from_name=notification["from_name"],
+            policy=notification["policy"],
+            auto_send=auto_send,
+        )
+        while True:
+            target = self.route(message, tried)
+            if target is None:
+                return None
+            tried.add(target.session_id)
+            try:
+                await post_to_inbox(target.socket_path, target.token, text)
+            except (OSError, TimeoutError) as err:
+                _log(f"could not write message {message.id} into session {target.label}: {err}")
+                if os.path.exists(target.socket_path):
+                    self._unreachable_since.setdefault(target.session_id, self._now())
+                else:
+                    self._forget(target.session_id)
+                continue
+            self.store.mark_delivered(message.id)
+            self.store.bind_thread(message.thread_id, target.session_id)
+            return target.label
+
+    def session_infos(self) -> list[SessionInfo]:
+        """The registered sessions, oldest first."""
+        catch_all = find_session(self._open_sessions(), self.catch_all_label())
+        return [
+            {
+                "label": s.label,
+                "repo": s.repo,
+                "branch": s.branch,
+                "cwd": s.cwd,
+                "reachable": self._is_reachable(s.session_id),
+                "catch_all": catch_all is not None and catch_all.session_id == s.session_id,
+                "registered_at": s.registered_at,
+            }
+            for s in self._sessions.values()
+        ]
+
+    def sessions_for_peer(self) -> PeerSessions:
+        """What a paired contact may see of this machine's sessions: labels
+        and branches of reachable ones, or nothing if sharing is off."""
+        if not self.shares_sessions():
+            return {"shared": False, "sessions": []}
+        return {
+            "shared": True,
+            "sessions": [{"label": s.label, "branch": s.branch} for s in self._open_sessions()],
+        }
 
     async def send(self, params: SendParams) -> SendResult:
         """Creates, saves and queues a message to a contact, then tells the transport.
@@ -457,6 +777,10 @@ class Daemon:
             created_at=self._now(),
         )
         self.store.queue_outgoing(envelope)
+        # Answers in this conversation come back to the session that sent it.
+        sender = self.session_by_socket(params.get("from_socket"))
+        if sender is not None:
+            self.store.bind_thread(envelope["thread_id"], sender.session_id)
         try:
             kicked = self.transport.kick(envelope)
             if inspect.isawaitable(kicked):
@@ -527,27 +851,101 @@ class Daemon:
         return self.store.get_setting(DEFAULT_AUTO_SEND_KEY) == "on"
 
     def status(self) -> StatusResult:
-        sessions = sorted(self._sessions.values(), key=lambda s: s.active_seq, reverse=True)
         return {
             "name": self.identity.name,
             "key_id": self.identity.id,
             "fingerprint": fingerprint(self.identity.public_key),
             "pid": os.getpid(),
-            "sessions": [
-                {"label": s.label, "last_active": iso_from_ms(s.last_active)} for s in sessions
-            ],
+            "sessions": self.session_infos(),
             "queued_inbound": self.store.count_undelivered_incoming(),
             "queued_outbound": self.store.count_outbound(),
             "port": self.transport.port,
+            "catch_all": self.catch_all_label(),
         }
 
     def _register_methods(self, server: RpcServer) -> None:
-        def register_session(params: Any, connection: RpcConnection) -> dict[str, str]:
+        def register_session(params: Any, _connection: RpcConnection) -> dict[str, Any]:
             obj = _params_object(params)
             assert obj is not None
-            label = _string_field(obj, "label", required=True, min_length=1, max_length=256)
-            assert label is not None
-            return self._register_session(connection, label)
+
+            def required(key: str, max_length: int, min_length: int = 1) -> str:
+                value = _string_field(
+                    obj, key, required=True, min_length=min_length, max_length=max_length
+                )
+                assert value is not None
+                return value
+
+            record = self.register_session(
+                session_id=required("session_id", 256),
+                socket=required("socket", 1024),
+                token=required("token", 1024, 0),
+                cwd=required("cwd", 4096, 0),
+                base_label=required("base_label", 256),
+                repo=_optional_string(obj, "repo", 256),
+                branch=_optional_string(obj, "branch", 256),
+            )
+            catch_all = find_session(self._open_sessions(), self.catch_all_label())
+            return {
+                "label": record.label,
+                "catch_all": catch_all is not None and catch_all.session_id == record.session_id,
+            }
+
+        def unregister_session(params: Any, _connection: RpcConnection) -> dict[str, bool]:
+            obj = _params_object(params)
+            assert obj is not None
+            session_id = _string_field(obj, "session_id", required=True, min_length=1)
+            assert session_id is not None
+            return {"removed": self.unregister_session(session_id)}
+
+        async def sessions(_params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            await self.check_sessions()
+            return {
+                "sessions": self.session_infos(),
+                "catch_all": self.catch_all_label(),
+                "share": self.shares_sessions(),
+            }
+
+        def set_catch_all(params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            obj = _params_object(params)
+            assert obj is not None
+            if "label" not in obj:
+                raise _invalid("label: required")
+            label = _optional_string(obj, "label", 256)
+            self.set_catch_all(label or None)
+            match = find_session(self._open_sessions(), self.catch_all_label())
+            return {"catch_all": self.catch_all_label(), "open": match is not None}
+
+        def set_share_sessions(params: Any, _connection: RpcConnection) -> dict[str, bool]:
+            obj = _params_object(params)
+            assert obj is not None
+            share = _bool_field(obj, "share")
+            if share is None:
+                raise _invalid("share: required")
+            self.store.set_setting(SHARE_SESSIONS_KEY, "on" if share else "off")
+            return {"share": share}
+
+        async def peer_sessions(params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            obj = _params_object(params)
+            assert obj is not None
+            name = _string_field(obj, "peer", required=True, min_length=1)
+            assert name is not None
+            contact = self.resolve_contact(name)
+            if contact.trust != "paired":
+                raise RpcError(RpcErrorCode.APPLICATION_ERROR, f'"{contact.name}" is blocked')
+            try:
+                result = await self.transport.request_sessions(contact.public_key)
+            except RpcError:
+                raise
+            except Exception as err:
+                raise RpcError(
+                    RpcErrorCode.APPLICATION_ERROR,
+                    f"could not get {contact.name}'s sessions: {err or type(err).__name__}",
+                ) from err
+            return {"contact": contact.name, **result}
+
+        async def status(_params: Any, _connection: RpcConnection) -> StatusResult:
+            await self.check_sessions()
+            return self.status()
 
         async def send(params: Any, _connection: RpcConnection) -> SendResult:
             return await self.send(parse_send_params(params))
@@ -635,6 +1033,11 @@ class Daemon:
             return {"ok": True}
 
         server.handle("register_session", register_session)
+        server.handle("unregister_session", unregister_session)
+        server.handle("sessions", sessions)
+        server.handle("set_catch_all", set_catch_all)
+        server.handle("set_share_sessions", set_share_sessions)
+        server.handle("peer_sessions", peer_sessions)
         server.handle("send", send)
         server.handle("peers", lambda _p, _c: {"peers": self.peers()})
         server.handle(
@@ -650,72 +1053,12 @@ class Daemon:
         server.handle("get_message", get_message)
         server.handle("inbox", inbox)
         server.handle("subscribe", subscribe)
-        server.handle("status", lambda _p, _c: self.status())
+        server.handle("status", status)
         server.handle("stop", stop)
 
     def _spawn_stop(self) -> None:
         if self._stopping is None:
             self._stopping = asyncio.ensure_future(self._stop())
-
-    def _register_session(self, connection: RpcConnection, label: str) -> dict[str, str]:
-        is_new = connection not in self._sessions
-        self._seq += 1
-        session = _Session(
-            id=str(uuid.uuid4()),
-            label=label,
-            connection=connection,
-            registered_seq=self._seq,
-            active_seq=self._seq,
-            last_active=self._now(),
-        )
-        self._sessions[connection] = session
-        if is_new:
-            connection.on_close(lambda: self._sessions.pop(connection, None))
-        # Push queued messages after the response has been written.
-        asyncio.get_running_loop().call_soon(self._flush_queued, session)
-        return {"session_id": session.id, "label": label}
-
-    def _flush_queued(self, registered: _Session) -> None:
-        """Pushes undelivered incoming messages now that `registered` has opened."""
-        if self._store is None or self._stopping is not None or registered.connection.closed:
-            return
-        for message in self.store.undelivered_incoming():
-            target = self._session_by_label(message.session) or registered
-            envelope = self._envelope_of(message)
-            self._push(target, message.id, self._notification(envelope))
-
-    def _push(self, session: _Session, message_id: str, notification: MessageNotification) -> bool:
-        if not session.connection.notify("message", notification):
-            return False
-        self.store.mark_delivered(message_id)
-        return True
-
-    def _touch(self, connection: RpcConnection) -> None:
-        session = self._sessions.get(connection)
-        if session is None:
-            return
-        self._seq += 1
-        session.active_seq = self._seq
-        session.last_active = self._now()
-
-    def _session_by_label(self, label: str | None) -> _Session | None:
-        """The newest registration with this label, if any is open."""
-        if label is None:
-            return None
-        best: _Session | None = None
-        for session in self._sessions.values():
-            if session.label == label and (
-                best is None or session.registered_seq > best.registered_seq
-            ):
-                best = session
-        return best
-
-    def _most_recently_active(self) -> _Session | None:
-        best: _Session | None = None
-        for session in self._sessions.values():
-            if best is None or session.active_seq > best.active_seq:
-                best = session
-        return best
 
     def _notification(self, envelope: Envelope) -> MessageNotification:
         contact = self.store.get_contact(envelope["from"])

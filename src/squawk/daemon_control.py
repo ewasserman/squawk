@@ -91,6 +91,8 @@ async def start_daemon(
             stdout=log,
             stderr=log,
             env={**(os.environ if env is None else env), "SQUAWK_HOME": home},
+            # Not the caller's folder, which the service would otherwise keep in use.
+            cwd=home,
             start_new_session=True,
         )
     finally:

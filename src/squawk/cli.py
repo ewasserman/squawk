@@ -1,8 +1,9 @@
 """The `squawk` command.
 
-The subcommands live in three tables: the contact commands
-(cli_contacts.py), the identity and service commands (here), and the message
-commands (cli_messages.py). `main` finds a command by name and `squawk help`
+The subcommands live in tables: setup and uninstall (cli_setup.py), the
+contact commands (cli_contacts.py), the identity and service commands
+(here), the message commands (cli_messages.py) and the session commands
+(cli_sessions.py). `main` finds a command by name and `squawk help`
 lists them all in that order. cli_io.py explains how to add one.
 """
 
@@ -13,9 +14,11 @@ from collections.abc import Sequence
 from squawk.cli_args import Opt, ParseArgsError, parse_args, string_value
 from squawk.cli_contacts import CONTACT_COMMANDS
 from squawk.cli_io import CliIo, Command, quiet_stdout
-from squawk.cli_messages import MESSAGE_COMMANDS
+from squawk.cli_messages import MESSAGE_COMMANDS, format_service_status
+from squawk.cli_sessions import SESSION_COMMANDS
+from squawk.cli_setup import SETUP_COMMANDS, SetupError
 from squawk.config import squawk_home
-from squawk.daemon import DaemonRunningError, StatusResult
+from squawk.daemon import DaemonRunningError
 from squawk.daemon_control import (
     DaemonControlError,
     daemon_status,
@@ -51,20 +54,6 @@ async def _whoami(args: list[str], io: CliIo) -> int:
     return 0
 
 
-def _format_status(status: StatusResult) -> str:
-    lines = [
-        f"squawkd is running (pid {status['pid']})",
-        f"Name:            {status['name']}",
-        f"Key:             {status['key_id']}",
-        f"Fingerprint:     {status['fingerprint']}",
-        f"Queued inbound:  {status['queued_inbound']}",
-        f"Queued outbound: {status['queued_outbound']}",
-        f"Sessions:        {'none' if not status['sessions'] else ''}",
-        *(f"  {s['label']} (last active {s['last_active']})" for s in status["sessions"]),
-    ]
-    return "\n".join(lines) + "\n"
-
-
 async def _daemon(args: list[str], io: CliIo) -> int:
     _, positionals = parse_args(args, allow_positionals=True)
     action = positionals[0] if positionals else None
@@ -90,7 +79,7 @@ async def _daemon(args: list[str], io: CliIo) -> int:
         if status is None:
             io.stdout("squawkd is not running\n")
             return 1
-        io.stdout(_format_status(status))
+        io.stdout(format_service_status(status))
         return 0
     if action == "run":
         load_identity(home)
@@ -101,11 +90,13 @@ async def _daemon(args: list[str], io: CliIo) -> int:
 
 
 COMMANDS: dict[str, Command] = {
+    **SETUP_COMMANDS,
     **CONTACT_COMMANDS,
     "init": Command("create this machine's key pair (--name <display name>)", _init),
     "whoami": Command("print this machine's display name, key and fingerprint", _whoami),
     "daemon": Command("control the background service (start | stop | status | run)", _daemon),
     **MESSAGE_COMMANDS,
+    **SESSION_COMMANDS,
 }
 """Every subcommand, in the order `squawk help` lists them."""
 
@@ -132,7 +123,13 @@ async def run(argv: Sequence[str], io: CliIo | None = None) -> int:
         return 2
     try:
         return await command.run(rest, io)
-    except (IdentityExistsError, NoIdentityError, DaemonRunningError, DaemonControlError) as err:
+    except (
+        IdentityExistsError,
+        NoIdentityError,
+        DaemonRunningError,
+        DaemonControlError,
+        SetupError,
+    ) as err:
         io.stderr(f"squawk: {err}\n")
         return 1
     except ParseArgsError as err:

@@ -190,7 +190,7 @@ def test_python_reads_a_database_written_by_node(tmp_path: Path) -> None:
     )
     store = Store.open(path, now=lambda: NOW)
     try:
-        assert store.schema_version() == 3
+        assert store.schema_version() == 4  # Node wrote 3; Python adds its own 4th
         contact = store.get_contact(bob.id)
         assert contact is not None
         assert (contact.name, contact.auto_send, contact.inbound_policy) == (
@@ -231,7 +231,7 @@ def test_node_reads_a_database_written_by_python(tmp_path: Path) -> None:
     store.close()
 
     result = node({"op": "readStore", "path": path, "now": NOW})
-    assert result["schemaVersion"] == 3
+    assert result["schemaVersion"] == 4  # Node leaves a newer schema alone
     [contact] = result["contacts"]
     assert contact["name"] == "Bob \u00e9"
     assert contact["autoSend"] is True

@@ -3,7 +3,8 @@ directory until it receives SIGTERM or SIGINT, or a client calls `stop`.
 
 Started by `daemon_control.start_daemon` as `python -m squawk.daemon_main`.
 Reads SQUAWK_HOME (the home directory), SQUAWK_PORT (the WebSocket port; 0 or
-unset picks a free one) and SQUAWK_NO_MDNS=1 (turns discovery off).
+unset picks a free one), SQUAWK_NO_MDNS=1 (turns discovery off) and
+SQUAWK_NO_NOTIFY=1 (no desktop notifications, for tests).
 """
 
 import asyncio
@@ -13,6 +14,7 @@ import sys
 
 from squawk.config import squawk_home
 from squawk.daemon import Daemon
+from squawk.inbox import macos_notify
 from squawk.network import NetworkTransport
 from squawk.pairing import Pairing
 from squawk.timefmt import iso_from_ms, now_ms
@@ -29,7 +31,8 @@ async def run_daemon(home: str | None = None) -> None:
         port=int(os.environ.get("SQUAWK_PORT") or 0),
         discovery=False if os.environ.get("SQUAWK_NO_MDNS") == "1" else None,
     )
-    daemon = Daemon(home, transport=transport)
+    notify = None if os.environ.get("SQUAWK_NO_NOTIFY") == "1" else macos_notify
+    daemon = Daemon(home, transport=transport, notify=notify)
     await daemon.start()
     pairing = Pairing(daemon, transport)
     pairing.start()

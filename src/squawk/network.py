@@ -23,6 +23,12 @@ signature, the recipient, the timestamp and that the id is new), hands it to
 the daemon, and answers `ack`. Messages without an ack stay in the store's
 outbound queue and are retried with backoff.
 
+A dialling side may also send `sessions-req` (with a request id); the
+receiver answers `sessions` with the labels and branches of the Claude Code
+sessions open on its machine, or an empty list if its person turned sharing
+off. Paths and inbox tokens are never sent. This exchange is new in the
+Python version; a Node service does not answer it.
+
 Other frame types (used by pairing) can be added with `on_frame`.
 
 This is the Python version of src/network.ts and speaks the same protocol,
@@ -34,6 +40,7 @@ import contextlib
 import re
 import socket
 import sys
+import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -46,7 +53,7 @@ from websockets.protocol import State
 
 from squawk import jsontext
 from squawk.crypto import ed25519_sign, ed25519_verify, random_bytes
-from squawk.daemon import Peer, Transport
+from squawk.daemon import Peer, PeerSession, PeerSessions, Transport
 from squawk.discovery import Advertisement, DiscoveredPeer, Discovery
 from squawk.encoding import from_base64url, is_key_id, key_from_id, to_base64url
 from squawk.envelope import (
@@ -434,6 +441,33 @@ def _error_text(err: BaseException) -> str:
     return str(err) or type(err).__name__
 
 
+SESSIONS_REQUEST = "sessions-req"
+SESSIONS_ANSWER = "sessions"
+MAX_PEER_SESSIONS = 100
+
+
+def parse_sessions_answer(frame: Frame) -> PeerSessions:
+    """Checks a `sessions` frame from another service and keeps only what is
+    expected: at most 100 sessions, each a label and an optional branch."""
+    raw = frame.get("sessions")
+    sessions: list[PeerSession] = []
+    if isinstance(raw, list):
+        for item in raw[:MAX_PEER_SESSIONS]:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            branch = item.get("branch")
+            if not isinstance(label, str) or label == "":
+                continue
+            sessions.append(
+                {
+                    "label": jsontext.js_slice(label, 256),
+                    "branch": jsontext.js_slice(branch, 256) if isinstance(branch, str) else None,
+                }
+            )
+    return {"shared": frame.get("shared") is not False, "sessions": sessions}
+
+
 class NetworkTransport(Transport):
     """The daemon's transport: a WebSocket listener for other hosts, mDNS
     discovery, and delivery of the outbound queue with retries.
@@ -448,6 +482,7 @@ class NetworkTransport(Transport):
       handshake_timeout_ms: how long the connection handshake may take.
       max_queue_age_ms: how long a message may wait in the outbound queue
         before squawk gives up and marks it failed. Default 7 days.
+      sessions_timeout_ms: how long to wait for a contact's list of sessions.
     """
 
     def __init__(
@@ -461,6 +496,7 @@ class NetworkTransport(Transport):
         ack_timeout_ms: int = 10_000,
         handshake_timeout_ms: int = 10_000,
         max_queue_age_ms: int = DEFAULT_MAX_QUEUE_AGE_MS,
+        sessions_timeout_ms: int = 5_000,
     ) -> None:
         self._port_option = port
         self._host = host
@@ -470,6 +506,7 @@ class NetworkTransport(Transport):
         self._ack_timeout_ms = ack_timeout_ms
         self._handshake_timeout_ms = handshake_timeout_ms
         self._max_queue_age_ms = max_queue_age_ms
+        self._sessions_timeout_ms = sessions_timeout_ms
         self._daemon: Daemon | None = None
         self._server: Server | None = None
         self.discovery: Discovery | None = None
@@ -791,6 +828,59 @@ class NetworkTransport(Transport):
             stop_frames()
             stop_close()
 
+    async def request_sessions(self, key_id: str) -> PeerSessions:
+        """Asks a paired contact's service which Claude Code sessions are open
+        there. Raises `LinkError` if it cannot be reached or does not answer
+        in time (a Node service never answers)."""
+        store = self._require_daemon().store
+        contact = store.get_contact(key_id)
+        if contact is None or contact.trust != "paired":
+            raise LinkError("not a paired contact")
+        link = await self._link_to(key_id)
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        answer: asyncio.Future[PeerSessions] = loop.create_future()
+
+        def on_frame(frame: Frame) -> None:
+            if (
+                frame["t"] == SESSIONS_ANSWER
+                and frame.get("id") == request_id
+                and not answer.done()
+            ):
+                answer.set_result(parse_sessions_answer(frame))
+
+        def on_close() -> None:
+            if not answer.done():
+                answer.set_exception(LinkError("connection closed before an answer"))
+
+        stop_frames = link.on_frame(on_frame)
+        stop_close = link.on_close(on_close)
+        try:
+            link.send({"t": SESSIONS_REQUEST, "id": request_id})
+            return await asyncio.wait_for(answer, self._sessions_timeout_ms / 1000)
+        except TimeoutError:
+            raise LinkError(
+                "their squawk service did not answer (it may be an older version that "
+                "cannot list sessions)"
+            ) from None
+        finally:
+            stop_frames()
+            stop_close()
+
+    def _answer_sessions(self, link: PeerLink, frame: Frame) -> None:
+        request_id = frame.get("id")
+        if link.authorization != "paired" or not isinstance(request_id, str):
+            return
+        answer = self._require_daemon().sessions_for_peer()
+        link.send(
+            {
+                "t": SESSIONS_ANSWER,
+                "id": jsontext.js_slice(request_id, 128),
+                "shared": answer["shared"],
+                "sessions": answer["sessions"],
+            }
+        )
+
     def _authorize(self, key: str, link: PeerLink) -> Authorization:
         contact = None if self._daemon is None else self._daemon.store.get_contact(key)
         if contact is not None and contact.trust == "blocked":
@@ -808,10 +898,14 @@ class NetworkTransport(Transport):
         if isinstance(remote, tuple) and remote:
             remote_address = str(remote[0]).removeprefix("::ffff:")
 
+        def on_frame(ready: PeerLink, frame: Frame) -> None:
+            if frame["t"] == "msg":
+                self._receive(ready, frame)
+            elif frame["t"] == SESSIONS_REQUEST:
+                self._answer_sessions(ready, frame)
+
         def on_ready(ready: PeerLink) -> None:
-            ready.on_frame(
-                lambda frame: self._receive(ready, frame) if frame["t"] == "msg" else None
-            )
+            ready.on_frame(lambda frame: on_frame(ready, frame))
             if self.on_link is not None:
                 self.on_link(ready)
 
