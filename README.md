@@ -131,7 +131,21 @@ pairing and the command line are ported; they read and write the same files
 and messages as the Node version. Run it with `uv run squawk <command>`.
 Requires uv.
 
-The Python version has no MCP server. Claude sends with the command line
+The Python version has no MCP server and does not need Claude Code's
+development channels. `squawk setup` adds two hooks to your Claude Code user
+settings (`~/.claude/settings.json`, keeping a copy of the old file as
+`settings.json.squawk-backup`) and installs a squawk skill for Claude. Each
+session registers itself with the squawk service when it starts, and the
+service writes incoming messages into the right session through Claude
+Code's cross-session messaging inbox (Claude Code 2.1.224 or later), so
+you just run `claude`. A message goes to the session that already has that
+conversation; otherwise to the session the sender named (`squawk send
+--session <label>`; `squawk sessions <contact>` lists a contact's sessions);
+otherwise to the session you chose with `squawk sessions --catch-all
+<label>`; otherwise it waits in `squawk inbox` and you get a notification.
+`squawk uninstall` removes the hooks and the skill.
+
+Claude sends with the command line
 (`squawk send`, and `squawk reply <msg id> "<text>"` to answer a message),
 and each message is shown to you first in a macOS dialog where you can edit
 it, then Send or Cancel. `squawk auto-send <contact> on` skips the dialog for

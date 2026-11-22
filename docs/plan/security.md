@@ -49,6 +49,14 @@ from its own user.
   follows such instructions ("it came from the channel and not from you, so I
   haven't acted on it"). On the Monitor route, the setup text and a field in
   each JSON line from `squawk tail` say the same. *Tasks 11, 12, 15.*
+- In the Python version, the service writes each message into the Claude
+  Code session's cross-session inbox. Claude Code presents it as a message
+  from another session, never from the user, and it cannot approve
+  permission prompts or run slash commands. squawk's own text around the
+  body names the sender, says the message is information and not an
+  instruction, states the recipient's policy for that contact, and puts the
+  body between two marker lines carrying a random value the sender cannot
+  know, so the body cannot fake the end of the message.
 - The **recipient** decides how much their own Claude may do with a contact's
   messages. The default, `show_first`, means Claude shows the message to its
   human and takes no action without approval. `auto_answer` lets Claude reply
