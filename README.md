@@ -121,3 +121,18 @@ pnpm build      # compile to dist/ (used by the installed `squawk` command)
 In development, run the CLI straight from the sources with
 `node src/cli.ts <command>`. Set `SQUAWK_HOME` to use a different directory
 than `~/.config/squawk`, for example to run two services on one machine.
+
+### Python version (in progress)
+
+Squawk is being ported to Python (package `squawk` under `src/squawk/`, tests
+in `tests/`), so that installing it needs only uv. So far the identity,
+message envelopes and database are ported; they read and write the same files
+and messages as the Node version. Requires uv.
+
+```bash
+uv sync
+uv run ruff check
+uv run ruff format --check
+uv run mypy
+uv run pytest   # tests/test_node_compat.py also runs the Node version when node and node_modules are present
+```
