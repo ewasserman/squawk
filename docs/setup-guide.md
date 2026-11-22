@@ -98,9 +98,20 @@ squawk sessions
 ```
 
 Each session is labelled with its git repository and branch, for example
-`api-server@main`. Your colleague's Claude can see these labels (not your
-files or folders) to pick the right session; `squawk sessions --share off`
-stops that.
+`api-server@main`. Your colleague's Claude can see the labels (not your
+files or folders) of the sessions you allow, to pick the right one. Nothing
+is allowed at first, so allow the projects you work on together:
+
+```bash
+squawk sessions --allow 'your-org/*'   # by the owner/repository of the git remote
+squawk sessions --allow '*'            # or every session
+squawk sessions --deny 'some-org/*'    # hide these even if allowed
+```
+
+`squawk sessions` shows each session's project and whether it is visible.
+A session that is not visible cannot be listed or addressed by your
+colleague, but can still send messages and get the answers. The README
+describes the patterns.
 
 Now try it:
 
@@ -160,6 +171,7 @@ Restart open Claude Code sessions so they pick up the new version.
 | `squawk peers` shows nobody | Check both Macs are on the same network (not a guest network), the service is running on both (`squawk status`), and the Local Network permission is allowed (step 2). Then `squawk daemon stop && squawk daemon start` on both. |
 | `pair` says the other person "is not waiting to pair" | They need to run `squawk pair --accept` first; it waits for 2 minutes. |
 | `pair` cannot find the name | Use the exact name shown by `squawk peers`, in quotes if it has spaces. You can also give `host:port` from `squawk peers`. |
+| Your colleague sees none of your sessions, or a message naming one waits in `squawk inbox` | `squawk sessions` shows `no` under VISIBLE for sessions your allow and deny lists hide. Allow their project: `squawk sessions --allow '<owner>/*'`. |
 | `squawk sessions` lists no sessions | Restart Claude Code (sessions opened before `setup` are not registered). Check `claude --version` is 2.1.224 or later and that `/hooks` in Claude lists squawk's SessionStart hook. |
 | A message says "queued, not yet delivered" | The other service did not answer. It keeps retrying for up to 7 days; check `squawk peers` on both sides. |
 | No dialog appears when Claude sends | The dialog needs a logged-in screen session on the Mac. Check `squawk contacts`: with auto-send on, no dialog is shown. |

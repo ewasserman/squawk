@@ -259,6 +259,8 @@ def format_session_line(session: SessionInfo) -> str:
     )
     state = "reachable" if session["reachable"] else "NOT reachable (its inbox does not answer)"
     marker = "  [catch-all]" if session["catch_all"] else ""
+    if session.get("visible") is False:
+        marker += "  [hidden from contacts]"
     return f"{session['label']}  ({where})  {state}{marker}"
 
 
