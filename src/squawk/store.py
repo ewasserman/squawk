@@ -136,6 +136,11 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE messages ADD COLUMN error TEXT;
     """,
+    # The relay each contact uses, learned during pairing (NULL: not known).
+    # squawk 0.1 ignores the extra column.
+    """
+    ALTER TABLE contacts ADD COLUMN relay_url TEXT;
+    """,
 )
 """Schema migrations, applied in order. The database's `PRAGMA user_version`
 holds how many have been applied. Never edit or reorder an entry that has
@@ -147,7 +152,8 @@ Trust = Literal["paired", "blocked"]
 InboundPolicy = Literal["show_first", "auto_answer"]
 Direction = Literal["in", "out"]
 MessageState = Literal["queued", "sent", "acked", "failed", "unread", "read"]
-"""Outgoing: queued, sent, acked, failed. Incoming: unread, read."""
+"""Outgoing: queued, sent, acked, failed. Incoming: unread, read. "sent" means
+a relay holds the message and the recipient's receipt has not arrived yet."""
 
 DEFAULT_INBOUND_POLICY_KEY = "default_inbound_policy"
 """Setting key holding the inbound policy for contacts that have none of their own."""
@@ -183,6 +189,8 @@ class Contact:
     """None means "use the default inbound policy setting"."""
     created_at: str
     updated_at: str
+    relay_url: str | None = None
+    """The relay this contact uses, if known (learned during pairing)."""
 
 
 @dataclass(frozen=True)
@@ -275,6 +283,7 @@ def _to_contact(row: sqlite3.Row) -> Contact:
         inbound_policy=row["inbound_policy"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        relay_url=row["relay_url"],
     )
 
 
@@ -481,6 +490,7 @@ class Store:
         trust: Trust | None = None,
         auto_send: bool | None = None,
         inbound_policy: InboundPolicy | _Unset | None = UNSET,
+        relay_url: str | None = None,
     ) -> Contact:
         """Adds a contact, or updates the name and any given fields of an existing one."""
         now = self._now_iso()
@@ -490,8 +500,9 @@ class Store:
             if existing is None:
                 self._run(
                     """INSERT INTO contacts
-                     (public_key, name, trust, auto_send, inbound_policy, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                     (public_key, name, trust, auto_send, inbound_policy, created_at, updated_at,
+                      relay_url)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     public_key,
                     name,
                     trust or "paired",
@@ -499,6 +510,7 @@ class Store:
                     None if inbound_policy is UNSET else inbound_policy,
                     now,
                     now,
+                    relay_url,
                 )
             else:
                 self.update_contact(
@@ -507,6 +519,7 @@ class Store:
                     trust=trust,
                     auto_send=auto_send,
                     inbound_policy=inbound_policy,
+                    relay_url=relay_url,
                 )
 
         self.transaction(run)
@@ -532,6 +545,7 @@ class Store:
         trust: Trust | None = None,
         auto_send: bool | None = None,
         inbound_policy: InboundPolicy | _Unset | None = UNSET,
+        relay_url: str | None = None,
     ) -> Contact:
         """Changes the given fields of a contact. Raises KeyError if there is no such contact.
 
@@ -551,6 +565,9 @@ class Store:
         if inbound_policy is not UNSET:
             sets.append("inbound_policy = ?")
             values.append(inbound_policy)
+        if relay_url is not None:
+            sets.append("relay_url = ?")
+            values.append(relay_url)
         sets.append("updated_at = ?")
         values.append(self._now_iso())
         result = self._run(
@@ -893,6 +910,57 @@ class Store:
             item = _to_outbound(row)
             grouped.setdefault(item.recipient, []).append(item)
         return grouped
+
+    def mark_relayed(self, message_id: str, wait_until: int) -> bool:
+        """Records that a relay has stored a queued message for its recipient.
+        The message is marked "sent" and stays in the outbound queue, not due
+        again before `wait_until` (milliseconds since the epoch), until the
+        recipient's receipt arrives (`mark_acknowledged` or `mark_failed`)
+        or the queue's age limit fails it. Returns False if it was not queued."""
+
+        def run() -> bool:
+            updated = self._run(
+                """UPDATE outbox SET next_attempt_at = ?, last_error = NULL
+                 WHERE message_id = ?""",
+                wait_until,
+                message_id,
+            )
+            if updated.rowcount == 0:
+                return False
+            self._run(
+                """UPDATE messages SET state = 'sent', sent_at = ?
+                 WHERE id = ? AND direction = 'out'""",
+                self._now_iso(),
+                message_id,
+            )
+            return True
+
+        return self.transaction(run)
+
+    def count_relayed(self) -> int:
+        """How many queued messages a relay holds, waiting for the recipient's receipt."""
+        row = self._one(
+            """SELECT count(*) AS n FROM outbox o JOIN messages m ON m.id = o.message_id
+             WHERE m.state = 'sent'"""
+        )
+        assert row is not None
+        return int(row["n"])
+
+    def make_due(self, recipient: str | None = None) -> int:
+        """Makes queued messages (to `recipient`, or to everyone) due now,
+        except those a relay already holds. Used when a route to the
+        recipient may just have opened. Returns how many were changed."""
+        now = self._now()
+        where = "" if recipient is None else "AND recipient = ?"
+        params: list[_Param] = [now, now]
+        if recipient is not None:
+            params.append(recipient)
+        return self._run(
+            f"""UPDATE outbox SET next_attempt_at = ?
+             WHERE next_attempt_at > ? {where}
+               AND message_id NOT IN (SELECT id FROM messages WHERE state = 'sent')""",
+            *params,
+        ).rowcount
 
     def get_outbound(self, message_id: str) -> OutboundItem | None:
         row = self._one("SELECT * FROM outbox WHERE message_id = ?", message_id)

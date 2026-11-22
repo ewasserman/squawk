@@ -5,7 +5,8 @@ Started by `daemon_control.start_daemon` as `python -m squawk.daemon_main`.
 Reads SQUAWK_HOME (the home directory), SQUAWK_PORT (the WebSocket port; 0 or
 unset reuses the port of the last run if it is free, otherwise picks a free
 one), SQUAWK_NO_MDNS=1 (turns discovery off) and
-SQUAWK_NO_NOTIFY=1 (no desktop notifications, for tests).
+SQUAWK_NO_NOTIFY=1 (no desktop notifications, for tests). The relay to use,
+if any, comes from the service's settings (`squawk relay set`).
 """
 
 import asyncio
@@ -13,11 +14,13 @@ import os
 import signal
 import sys
 
-from squawk.config import squawk_home
+from squawk.config import db_path, squawk_home
 from squawk.daemon import Daemon
 from squawk.inbox import macos_notify
 from squawk.network import NetworkTransport
 from squawk.pairing import Pairing
+from squawk.relay_client import RelayClient, relay_client_from_settings
+from squawk.store import Store
 from squawk.timefmt import iso_from_ms, now_ms
 
 
@@ -47,10 +50,19 @@ def write_last_port(home: str, port: int) -> None:
         _log(f"could not remember the port: {err}")
 
 
+def _relay_client(home: str) -> RelayClient | None:
+    store = Store.open(db_path(home))
+    try:
+        return relay_client_from_settings(store.get_setting)
+    finally:
+        store.close()
+
+
 async def run_daemon(home: str | None = None) -> None:
     """Runs the service in this process until it stops."""
     home = squawk_home() if home is None else home
     transport = NetworkTransport(
+        relay=_relay_client(home),
         port=int(os.environ.get("SQUAWK_PORT") or 0),
         preferred_port=read_last_port(home),
         discovery=False if os.environ.get("SQUAWK_NO_MDNS") == "1" else None,

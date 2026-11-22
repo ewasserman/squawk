@@ -41,7 +41,7 @@ import re
 import socket
 import sys
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -66,15 +66,22 @@ from squawk.envelope import (
     seal,
 )
 from squawk.identity import Identity, fingerprint
-from squawk.store import OutboundItem
+from squawk.store import Contact, OutboundItem
 from squawk.timefmt import iso_from_ms, now_ms
 
 if TYPE_CHECKING:
     from squawk.daemon import Daemon
+    from squawk.relay_client import RelayClient
 
 PROTOCOL_VERSION = 1
 _AUTH_PREFIX = "squawk ws auth v1"
 _MAX_PAYLOAD = 1 << 20
+
+
+Route = Callable[["Contact", list[OutboundItem]], Awaitable[tuple[list[OutboundItem], str | None]]]
+"""One way to deliver messages to a contact: takes the contact and the
+messages, delivers what it can, and returns the messages still to be
+delivered and why (or None)."""
 
 
 @dataclass(frozen=True)
@@ -517,6 +524,14 @@ class NetworkTransport(Transport):
       max_queue_age_ms: how long a message may wait in the outbound queue
         before squawk gives up and marks it failed. Default 7 days.
       sessions_timeout_ms: how long to wait for a contact's list of sessions.
+      relay: a `RelayClient` for the relay this service uses, or None.
+
+    Routes. Each due message is tried on each route in turn until one takes
+    it: first directly over the local network, then through the relay (if
+    there is one, it is connected, and the contact uses the same relay or
+    its relay is not known). A message the relay stored is marked "sent"
+    and waits in the queue for the recipient's receipt; it is not sent again
+    by any route. More routes can be added to `_routes`.
     """
 
     def __init__(
@@ -532,7 +547,9 @@ class NetworkTransport(Transport):
         handshake_timeout_ms: int = 10_000,
         max_queue_age_ms: int = DEFAULT_MAX_QUEUE_AGE_MS,
         sessions_timeout_ms: int = 5_000,
+        relay: "RelayClient | None" = None,
     ) -> None:
+        self.relay = relay
         self._port_option = port
         self._preferred_port = preferred_port
         self._host = host
@@ -616,8 +633,17 @@ class NetworkTransport(Transport):
             )
             self.discovery.on("up", self._peer_came_online)
             await self.discovery.start()
+        if self.relay is not None:
+            self.relay.on_ready.append(self._relay_came_up)
+            await self.relay.start(daemon)
         self._timer = asyncio.ensure_future(self._tick())
         self.flush()
+
+    def _relay_came_up(self) -> None:
+        """Messages waiting for a route may go through the relay now."""
+        if self._daemon is not None and not self._stopped:
+            self._daemon.store.make_due()
+            self.flush()
 
     async def _tick(self) -> None:
         while True:
@@ -633,6 +659,8 @@ class NetworkTransport(Transport):
         self._stopped = True
         if self._timer is not None:
             self._timer.cancel()
+        if self.relay is not None:
+            await self.relay.stop()
         in_progress = [*self._delivering.values(), *self._dialing.values()]
         for task in in_progress:
             task.cancel()
@@ -794,31 +822,89 @@ class NetworkTransport(Transport):
 
     async def _deliver_to(self, recipient: str, items: list[OutboundItem]) -> None:
         store = self._require_daemon().store
-
-        def retry_later(item: OutboundItem, error: str) -> None:
+        contact = store.get_contact(recipient)
+        errors: list[str] = []
+        remaining = items
+        if contact is None or contact.trust != "paired":
+            errors.append("recipient is not a paired contact")
+        else:
+            for route in self._routes():
+                remaining, error = await route(contact, remaining)
+                if error is not None:
+                    errors.append(error)
+                if not remaining:
+                    return
+        for item in remaining:
             with contextlib.suppress(Exception):
                 if store.get_outbound(item.message_id) is not None:
-                    store.record_attempt(item.message_id, error=error)
+                    store.record_attempt(item.message_id, error="; ".join(errors) or None)
 
+    def _routes(self) -> list[Route]:
+        """The routes to try, in order."""
+        return [self._send_direct, self._send_by_relay]
+
+    async def _send_direct(
+        self, contact: Contact, items: list[OutboundItem]
+    ) -> tuple[list[OutboundItem], str | None]:
+        """Sends over a direct connection on the local network. Returns the
+        items still to be delivered and why, if any."""
+        store = self._require_daemon().store
         try:
-            contact = store.get_contact(recipient)
-            if contact is None or contact.trust != "paired":
-                raise LinkError("recipient is not a paired contact")
-            link = await self._link_to(recipient)
+            link = await self._link_to(contact.public_key)
         except Exception as err:
-            for item in items:
-                retry_later(item, _error_text(err))
-            return
+            return items, _error_text(err)
         results = await asyncio.gather(
             *(self._send_one(link, item) for item in items), return_exceptions=True
         )
+        remaining: list[OutboundItem] = []
+        error: str | None = None
         for item, result in zip(items, results, strict=True):
             if isinstance(result, PermanentRefusal):
                 _log(f"message {item.message_id} failed: {result}")
                 with contextlib.suppress(Exception):
                     store.mark_failed(item.message_id, _error_text(result))
             elif isinstance(result, BaseException):
-                retry_later(item, _error_text(result))
+                remaining.append(item)
+                error = _error_text(result)
+        return remaining, error
+
+    async def _send_by_relay(
+        self, contact: Contact, items: list[OutboundItem]
+    ) -> tuple[list[OutboundItem], str | None]:
+        """Leaves the messages in the contact's mailbox at the relay. Each
+        stored one waits in the queue, marked "sent", for the receipt."""
+        relay = self.relay
+        if relay is None:
+            return items, None
+        if not relay.connected:
+            return items, "relay: not connected"
+        if contact.relay_url is not None and contact.relay_url != relay.url:
+            return items, "relay: the contact uses a different relay"
+        from squawk.relay_client import RelayRefused
+
+        daemon = self._require_daemon()
+        store = daemon.store
+        remaining: list[OutboundItem] = []
+        error: str | None = None
+        for item in items:
+            envelope = cast(Any, {**item.envelope, "sent_at": iso_from_ms(now_ms())})
+            try:
+                await relay.deposit(item.message_id, seal(envelope, daemon.identity))
+            except RelayRefused as err:
+                if err.permanent:
+                    _log(f"message {item.message_id} failed: {err}")
+                    with contextlib.suppress(Exception):
+                        store.mark_failed(item.message_id, f"relay: {err}")
+                    continue
+                remaining.append(item)
+                error = f"relay: {err}"
+                continue
+            except Exception as err:
+                remaining.append(item)
+                error = f"relay: {_error_text(err)}"
+                continue
+            store.mark_relayed(item.message_id, now_ms() + self._max_queue_age_ms)
+        return remaining, error
 
     async def _link_to(self, recipient: str) -> PeerLink:
         """An open, authenticated connection to a paired contact: the one
