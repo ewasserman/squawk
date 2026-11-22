@@ -540,6 +540,132 @@ async def test_candidates_come_from_the_resolver_then_mdns_then_the_saved_addres
     ]
 
 
+class ChangingBackend:
+    """An mDNS network whose answer for a service can change; answers come
+    only when browsing starts and when asked again."""
+
+    def __init__(self, service: RawService) -> None:
+        self.service = service
+        self.on_up: Callable[[RawService], None] | None = None
+        self.queries = 0
+
+    async def publish(self, instance_name: str, port: int, txt: dict[str, str]) -> None:
+        pass
+
+    async def browse(
+        self, on_up: Callable[[RawService], None], on_down: Callable[[RawService], None]
+    ) -> None:
+        self.on_up = on_up
+        on_up(self.service)
+
+    def query(self) -> None:
+        self.queries += 1
+        if self.on_up is not None:
+            self.on_up(self.service)
+
+    async def destroy(self) -> None:
+        pass
+
+
+def advert_for(who: Node, host: str, port: int, addresses: list[str]) -> RawService:
+    return RawService(
+        name=f"{who.daemon.identity.name} (x)",
+        host=host,
+        port=port,
+        addresses=addresses,
+        txt={
+            "name": who.daemon.identity.name,
+            "id": who.id,
+            "fp": fingerprint(who.daemon.identity.public_key),
+            "port": str(port),
+        },
+    )
+
+
+async def start_with_discovery(net: Net, name: str, backend: Any) -> Node:
+    home = net.make_home(name)
+    transport = NetworkTransport(
+        host="127.0.0.1",
+        discovery=Discovery(
+            Advertisement(name=name, key_id="unused", fingerprint="00", port=0),
+            backend=backend,
+        ),
+        retry_interval_ms=50,
+        ack_timeout_ms=2000,
+        handshake_timeout_ms=2000,
+    )
+    daemon = Daemon(home, transport=transport)
+    await daemon.start()
+    net.running.append(daemon)
+    return Node(home, daemon, transport)
+
+
+async def test_looks_a_contact_up_again_when_every_known_address_fails(net: Net) -> None:
+    bob = await net.node("bob")
+    closed = await net.node("closed")
+    stale_port = closed.port
+    await net.stop_node(closed)
+    # Discovery first saw Bob at an address that no longer answers, as after
+    # his host was renamed; asked again, it gives the right one.
+    backend = ChangingBackend(advert_for(bob, "127.0.0.1", stale_port, []))
+    alice = await start_with_discovery(net, "alice", backend)
+    pair(alice, bob)
+    backend.service = advert_for(bob, "127.0.0.1", bob.port, [])
+
+    sent = await alice.daemon.send({"to": "bob", "body": "found you"})
+
+    await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+    assert backend.queries >= 1
+
+
+async def test_reaches_a_contact_at_a_remembered_ip_when_its_host_name_is_gone(
+    net: Net,
+) -> None:
+    home = net.make_home("alice")
+    transport = NetworkTransport(
+        host="127.0.0.1",
+        discovery=False,
+        retry_interval_ms=50,
+        ack_timeout_ms=2000,
+        handshake_timeout_ms=2000,
+    )
+    daemon = Daemon(home, transport=transport)
+    await daemon.start()
+    net.running.append(daemon)
+    alice = Node(home, daemon, transport)
+    bob = await net.node("bob")
+    pair(alice, bob)
+    daemon.store.set_setting(f"address:{bob.id}", f"bob-gone.invalid:{bob.port}")
+    daemon.store.set_setting(f"addresses:{bob.id}", f'["127.0.0.1:{bob.port}"]')
+
+    sent = await daemon.send({"to": "bob", "body": "still here"})
+
+    await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+
+
+async def test_remembers_the_ip_a_contact_was_reached_at(net: Net) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    sent = await alice.daemon.send({"to": "bob", "body": "hi"})
+    await wait_for(lambda: alice.daemon.store.acked_at(sent["id"]))
+    saved = alice.daemon.store.get_setting(f"addresses:{bob.id}")
+    assert saved == f'["127.0.0.1:{bob.port}"]'
+
+
+async def test_remembers_where_a_paired_contact_connects_from(net: Net) -> None:
+    alice = await net.node("alice")
+    bob = await net.node("bob")
+    pair(alice, bob)
+    # Bob knows Alice's port from earlier, under a host name.
+    bob.daemon.store.set_setting(f"address:{alice.id}", f"alice-old.invalid:{alice.port}")
+    sent = await alice.daemon.send({"to": "bob", "body": "hi"})
+    await wait_for(lambda: bob.daemon.store.get_message(sent["id"]))
+    saved = await wait_for(lambda: bob.daemon.store.get_setting(f"addresses:{alice.id}"))
+    # The test resolver gives Alice's port first; the IP is where she connected from.
+    assert saved == f'["127.0.0.1:{alice.port}"]'
+
+
 def test_dialable_refuses_ipv6_link_local_addresses() -> None:
     assert dialable("192.168.1.9")
     assert dialable("hal.local")

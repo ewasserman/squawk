@@ -177,7 +177,7 @@ class PeerLink:
         self.ws = ws
         self.outgoing = outgoing
         self.remote_address = remote_address
-        """The other side's IP address, for incoming connections."""
+        """The other side's IP address."""
         self.peer_key: str | None = None
         """The other side's key id, once it has proved it holds that key."""
         self.authorization: Authorization = False
@@ -432,6 +432,41 @@ def dialable(host: str) -> bool:
 def address_setting_key(key_id: str) -> str:
     """The settings key under which a contact's last known address is kept."""
     return f"address:{key_id}"
+
+
+def recent_addresses_setting_key(key_id: str) -> str:
+    """The settings key under which a contact's recent addresses are kept, as
+    a JSON list of "host:port" strings, most recent first."""
+    return f"addresses:{key_id}"
+
+
+MAX_RECENT_ADDRESSES = 4
+"""How many recent addresses are kept per contact."""
+
+
+def _format_address(address: Address) -> str:
+    return f"{address.host}:{address.port}"
+
+
+def _parse_address(text: object) -> Address | None:
+    if not isinstance(text, str):
+        return None
+    host, _, port = text.rpartition(":")
+    try:
+        number = int(port)
+    except ValueError:
+        return None
+    if not host or not 0 < number <= 65535:
+        return None
+    return Address(host, number)
+
+
+def _peer_ip(ws: ClientConnection | ServerConnection) -> str | None:
+    """The IP address at the other end of a connection."""
+    remote = ws.remote_address
+    if isinstance(remote, tuple) and remote:
+        return str(remote[0]).removeprefix("::ffff:")
+    return None
 
 
 def _listening_socket(host: str | None, port: int) -> socket.socket:
@@ -721,10 +756,42 @@ class NetworkTransport(Transport):
             address_setting_key(key_id)
         )  # fmt: skip
         if saved:
-            host, _, port = saved.rpartition(":")
-            with contextlib.suppress(ValueError):
-                add(Address(host, int(port)))
+            add(_parse_address(saved))
+        for address in self._recent_addresses(key_id):
+            add(address)
         return found
+
+    def _recent_addresses(self, key_id: str) -> list[Address]:
+        """Addresses at which this contact was recently reached, or from which
+        it recently connected to us, most recent first."""
+        if self._daemon is None:
+            return []
+        text = self._daemon.store.get_setting(recent_addresses_setting_key(key_id))
+        if not text:
+            return []
+        try:
+            items = jsontext.parse(text)
+        except ValueError:
+            return []
+        if not isinstance(items, list):
+            return []
+        return [a for a in (_parse_address(item) for item in items) if a is not None]
+
+    def _remember_addresses(self, key_id: str, *addresses: Address) -> None:
+        """Puts addresses that worked at the front of the contact's recent
+        addresses. Only addresses proved by an authenticated connection are
+        saved, never ones that mDNS merely advertised."""
+        if self._daemon is None:
+            return
+        recent: list[Address] = []
+        for address in [*addresses, *self._recent_addresses(key_id)]:
+            if dialable(address.host) and address not in recent:
+                recent.append(address)
+        recent = recent[:MAX_RECENT_ADDRESSES]
+        self._daemon.store.set_setting(
+            recent_addresses_setting_key(key_id),
+            jsontext.stringify([_format_address(a) for a in recent]),
+        )
 
     async def dial(self, address: Address, expect_key: str | None = None) -> PeerLink:
         """Opens and authenticates a connection to `address`, expecting `expect_key` if given."""
@@ -752,6 +819,7 @@ class NetworkTransport(Transport):
             outgoing=True,
             expect_key=expect_key,
             timeout_ms=self._handshake_timeout_ms,
+            remote_address=_peer_ip(ws),
         )
         try:
             await link.ready
@@ -847,21 +915,34 @@ class NetworkTransport(Transport):
         return await asyncio.shield(dialing)
 
     async def _open_link(self, recipient: str) -> PeerLink:
-        addresses = self.candidates(recipient)
-        if not addresses:
-            raise LinkError("recipient is not on the network")
+        tried: list[Address] = []
         link: PeerLink | None = None
         address: Address | None = None
         last_error: BaseException | None = None
-        for candidate in addresses:
-            try:
-                link = await self.dial(candidate, recipient)
-                address = candidate
-                break
-            except Exception as err:
-                last_error = err
+
+        async def try_each(addresses: list[Address]) -> None:
+            nonlocal link, address, last_error
+            for candidate in addresses:
+                if link is not None:
+                    return
+                if candidate in tried:
+                    continue
+                tried.append(candidate)
+                try:
+                    link = await self.dial(candidate, recipient)
+                    address = candidate
+                except Exception as err:
+                    last_error = err
+
+        await try_each(self.candidates(recipient))
+        if link is None and self.discovery is not None and not self._stopped:
+            # Every known address failed. The contact's host may have been
+            # renamed or have moved; ask the network where its key is now.
+            await self.discovery.lookup(recipient)
+            await try_each(self.candidates(recipient))
         if link is None or address is None:
-            assert last_error is not None
+            if last_error is None:
+                raise LinkError("recipient is not on the network")
             raise last_error
         if link.authorization != "paired":
             link.close()
@@ -877,8 +958,12 @@ class NetworkTransport(Transport):
 
         link.on_close(forget)
         self._require_daemon().store.set_setting(
-            address_setting_key(recipient), f"{address.host}:{address.port}"
+            address_setting_key(recipient), _format_address(address)
         )
+        reached = [address]
+        if link.remote_address is not None:
+            reached.insert(0, Address(link.remote_address, address.port))
+        self._remember_addresses(recipient, *reached)
         return link
 
     async def _send_one(self, link: PeerLink, item: OutboundItem) -> None:
@@ -989,10 +1074,7 @@ class NetworkTransport(Transport):
 
     async def _accept_incoming(self, ws: ServerConnection) -> None:
         daemon = self._require_daemon()
-        remote = ws.remote_address
-        remote_address: str | None = None
-        if isinstance(remote, tuple) and remote:
-            remote_address = str(remote[0]).removeprefix("::ffff:")
+        remote_address = _peer_ip(ws)
 
         def on_frame(ready: PeerLink, frame: Frame) -> None:
             if frame["t"] == "msg":
@@ -1002,6 +1084,7 @@ class NetworkTransport(Transport):
 
         def on_ready(ready: PeerLink) -> None:
             ready.on_frame(lambda frame: on_frame(ready, frame))
+            self._note_incoming_address(ready)
             if self.on_link is not None:
                 self.on_link(ready)
 
@@ -1021,6 +1104,18 @@ class NetworkTransport(Transport):
         except LinkError:
             await _discard(link)
         await link.wait_closed()
+
+    def _note_incoming_address(self, link: PeerLink) -> None:
+        """A paired contact that connects to us shows where it is now. Its
+        listening port is not the port it connected from, so the address is
+        saved with the port it was last reached at, if known."""
+        key = link.peer_key
+        if link.authorization != "paired" or key is None or link.remote_address is None:
+            return
+        known = self.candidates(key)
+        if not known:
+            return
+        self._remember_addresses(key, Address(link.remote_address, known[0].port))
 
     def _receive(self, link: PeerLink, frame: Frame) -> None:
         daemon = self._require_daemon()
