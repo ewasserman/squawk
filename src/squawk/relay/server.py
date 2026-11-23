@@ -212,6 +212,7 @@ class RelayServer:
         self._store: RelayStore | None = None
         self._server: Server | None = None
         self._purge_task: asyncio.Task[None] | None = None
+        self._access_task: asyncio.Task[None] | None = None
         self.identity: Identity | None = None
 
     # Starting and stopping.
@@ -222,6 +223,7 @@ class RelayServer:
         self.identity = identity_from_secret_key("relay", store.secret_key())
         store.delete_all_invites()
         self.purge()
+        self._enforce_access()
         self._server = await serve(
             self._handle,
             self._host,
@@ -233,13 +235,15 @@ class RelayServer:
             ping_timeout=self.limits.ping_timeout_s,
         )
         self._purge_task = asyncio.create_task(self._purge_loop())
+        self._access_task = asyncio.create_task(self._access_loop())
 
     async def stop(self) -> None:
-        if self._purge_task is not None:
-            self._purge_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._purge_task
-            self._purge_task = None
+        for task in (self._purge_task, self._access_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._purge_task = self._access_task = None
         server = self._server
         if server is not None:
             self._server = None
@@ -297,6 +301,34 @@ class RelayServer:
             if room.expires_at <= now:
                 self._end_room(room, notify=[room.creator, room.joiner])
         self._rates.forget_full(self._rate_table())
+
+    # Access.
+
+    async def _access_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.limits.access_check_interval_s)
+            try:
+                self.reload_access()
+            except Exception as err:
+                _log(f"checking the access file failed: {type(err).__name__}: {err}")
+
+    def reload_access(self) -> None:
+        """Has the access policy reread its file if it changed (the relay does
+        this every `access_check_interval_s` and on SIGHUP), then closes the
+        connections and deletes the mailboxes of keys it now refuses."""
+        if self.access.reload():
+            self._enforce_access()
+
+    def _enforce_access(self) -> None:
+        refused = Decision.REFUSED
+        for client in list(self._clients.values()):
+            if self.access.decide(client.key) is refused:
+                self._drop(client)
+                client.close(NOT_PERMITTED_CODE, "not permitted")
+        for key in self.store.mailbox_keys():
+            if self.access.decide(key) is refused:
+                self.store.delete_mailbox(key)
+                _log(f"deleted the mailbox of {key}, which may no longer use the relay")
 
     def _rate_table(self) -> dict[str, Rate]:
         """Each rate limit counter's name and its limit."""

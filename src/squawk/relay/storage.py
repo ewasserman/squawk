@@ -188,6 +188,10 @@ class RelayStore:
 
         self.transaction(delete)
 
+    def mailbox_keys(self) -> list[str]:
+        """The key id of every mailbox."""
+        return [str(r[0]) for r in self.db.execute("SELECT key_id FROM mailboxes")]
+
     def has_mailbox(self, key_id: str) -> bool:
         row = self.db.execute("SELECT 1 FROM mailboxes WHERE key_id = ?", (key_id,)).fetchone()
         return row is not None

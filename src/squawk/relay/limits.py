@@ -71,6 +71,9 @@ class RelayLimits:
     ping_timeout_s: float = 60.0
     purge_interval_s: float = 60.0
     """How often expired messages, invites and pairing rooms are removed."""
+    access_check_interval_s: float = 30.0
+    """How often the relay checks whether its allowed keys or allowed users
+    file changed (docs/plan/relay-access.md asks for at least once a minute)."""
 
 
 class RateLimiter:

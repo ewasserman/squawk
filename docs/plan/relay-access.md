@@ -190,6 +190,12 @@ own reference; text after `#` is ignored. Reread on change and on `SIGHUP`,
 as above. A key no longer listed is refused, its connection closed, and its
 mailbox deleted.
 
+If the file cannot be read, or has a line that does not start with a key id,
+the relay refuses to start; once running, it keeps the keys it read before
+and logs why. A half-saved or mistyped file then changes nothing, instead of
+locking people out and deleting their mailboxes. Starting in `keys` mode
+deletes the mailboxes of keys that are not listed.
+
 ## What the relay stores (additions)
 
 - each GitHub user that has signed in: numeric id, current login, when they

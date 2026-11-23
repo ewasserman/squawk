@@ -24,6 +24,8 @@ from squawk.relay.access import (
     OPEN_WARNING,
     AccessMode,
     AccessPolicy,
+    AllowedKeysError,
+    KeysAccess,
     OpenAccess,
     default_access_mode,
 )
@@ -59,6 +61,7 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "data": Opt("string"),
             "trust-forwarded-for": Opt("boolean"),
             "access": Opt("string"),
+            "allowed-keys": Opt("string"),
         },
     )
     port_text = string_value(values, "port")
@@ -69,7 +72,16 @@ async def _serve(args: list[str], io: CliIo) -> int:
         port = int(port_text)
     host = string_value(values, "host") or DEFAULT_HOST
     trust_forwarded_for = values.get("trust-forwarded-for") is True
-    access = _access_policy(string_value(values, "access"), host, trust_forwarded_for)
+    try:
+        access = _access_policy(
+            string_value(values, "access"),
+            host,
+            trust_forwarded_for,
+            allowed_keys=string_value(values, "allowed-keys"),
+        )
+    except AllowedKeysError as err:
+        io.stderr(f"squawk relay serve: {err}\n")
+        return 1
     data_dir = string_value(values, "data") or relay_data_dir(io.env)
     relay = RelayServer(
         data_dir,
@@ -87,12 +99,18 @@ async def _serve(args: list[str], io: CliIo) -> int:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, stop.set)
                 handled.append(sig)
+    # SIGHUP rereads the allowed keys or allowed users file.
+    with contextlib.suppress(NotImplementedError, RuntimeError, AttributeError):
+        loop.add_signal_handler(signal.SIGHUP, relay.reload_access)
+        handled.append(signal.SIGHUP)
     try:
         io.stdout(f"squawk relay listening on ws://{host}:{relay.port}\n")
         io.stdout(f"Relay key: {relay.key_id}\n")
         io.stdout(f"Data:      {data_dir}\n")
         if access.mode == "open":
             io.stdout(f"{OPEN_WARNING}\n")
+        elif isinstance(access, KeysAccess):
+            io.stdout(f"Access:    keys ({len(access.keys)} allowed in {access.path})\n")
         else:
             io.stdout(f"Access:    {access.mode}\n")
         await stop.wait()
@@ -104,10 +122,13 @@ async def _serve(args: list[str], io: CliIo) -> int:
     return 0
 
 
-def _access_policy(given: str | None, host: str, trust_forwarded_for: bool) -> AccessPolicy:
+def _access_policy(
+    given: str | None, host: str, trust_forwarded_for: bool, *, allowed_keys: str | None
+) -> AccessPolicy:
     """The access policy `--access` asks for. Without `--access`, only a
     relay that nothing but this machine can reach defaults to open; any
-    other relay must be told who may use it."""
+    other relay must be told who may use it. Raises `AllowedKeysError` if
+    the allowed keys file cannot be used."""
     mode: AccessMode | None
     if given is None:
         mode = default_access_mode(host, trust_forwarded_for)
@@ -124,6 +145,12 @@ def _access_policy(given: str | None, host: str, trust_forwarded_for: bool) -> A
         mode = given
     else:
         raise ParseArgsError(f'"{given}" is not an access mode (open, keys or github)')
+    if allowed_keys is not None and mode != "keys":
+        raise ParseArgsError("--allowed-keys is used only with --access keys")
+    if mode == "keys":
+        if allowed_keys is None:
+            raise ParseArgsError("--access keys needs --allowed-keys FILE")
+        return KeysAccess(allowed_keys)
     if mode != "open":
         raise ParseArgsError(f"--access {mode} is not available yet")
     return OpenAccess()
@@ -319,7 +346,9 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
         _status,
     ),
     "serve": Command(
-        "run the relay server (--host, --port, --data, --trust-forwarded-for, --access)", _serve
+        "run the relay server (--host, --port, --data, --trust-forwarded-for, --access,"
+        " --allowed-keys)",
+        _serve,
     ),
 }
 

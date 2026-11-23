@@ -121,6 +121,18 @@ async def test_relay_serve_refuses_an_unknown_access_mode(tmp_path: Any) -> None
     assert '"everyone" is not an access mode' in "".join(err)
 
 
+async def test_relay_serve_checks_the_allowed_keys_options(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    missing = os.path.join(str(tmp_path), "nope")
+    assert await run(["relay", "serve", "--access", "keys"], io) == 2
+    assert "--access keys needs --allowed-keys FILE" in "".join(err)
+    assert await run(["relay", "serve", "--allowed-keys", missing], io) == 2
+    assert "--allowed-keys is used only with --access keys" in "".join(err)
+    assert await run(["relay", "serve", "--access", "keys", "--allowed-keys", missing], io) == 1
+    assert f"squawk relay serve: cannot read {missing}" in "".join(err)
+
+
 async def test_relay_without_a_subcommand_prints_usage(tmp_path: Any) -> None:
     err: list[str] = []
     io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})

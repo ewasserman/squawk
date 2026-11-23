@@ -3,8 +3,11 @@
 import asyncio
 import itertools
 import os
+import re
+import signal
 import sqlite3
 import stat
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -13,6 +16,8 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from squawk import jsontext
+from squawk.cli import run
+from squawk.cli_io import CliIo
 from squawk.crypto import ed25519_random_secret_key, ed25519_sign, random_bytes
 from squawk.encoding import to_base64url
 from squawk.identity import Identity, identity_from_secret_key
@@ -20,10 +25,13 @@ from squawk.network import auth_message
 from squawk.relay import Rate, RelayLimits, RelayServer
 from squawk.relay.access import (
     AccessMode,
+    AllowedKeysError,
     Decision,
+    KeysAccess,
     OpenAccess,
     default_access_mode,
     is_loopback_host,
+    parse_allowed_keys,
 )
 from squawk.relay.invite_code import ALPHABET, code_hash, new_code, normalize_code
 from squawk.relay.limits import DAY_MS, MINUTE_MS, RateLimiter
@@ -1133,3 +1141,176 @@ def test_rate_limiter_refills_over_time() -> None:
     clock.advance(MINUTE_MS)
     limiter.forget_full({"k": rate})
     assert limiter._buckets == {}
+
+
+# Keys mode (docs/plan/relay-access.md, "The allowed keys file").
+
+
+def write_keys(path: str, *lines: str) -> None:
+    """Writes the allowed keys file, making sure its change is noticed even
+    when two writes fall in the same clock tick."""
+    try:
+        previous = os.stat(path).st_mtime_ns
+    except OSError:
+        previous = 0
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("".join(f"{line}\n" for line in lines))
+    mtime = max(time.time_ns(), previous + 1_000_000)
+    os.utime(path, ns=(mtime, mtime))
+
+
+@pytest.fixture
+def keys_file(tmp_path: Any) -> str:
+    path = os.path.join(str(tmp_path), "allowed-keys")
+    write_keys(path, "# who may use the relay", f"{alice.id}  Alice's laptop  # since May", "")
+    return path
+
+
+def test_allowed_keys_file_lines() -> None:
+    text = f"# comment\n\n{alice.id}\n  {bob.id}\tBob # work\n{carol.id} # Carol\n"
+    assert parse_allowed_keys(text) == {alice.id: "", bob.id: "Bob", carol.id: ""}
+
+
+def test_allowed_keys_file_names_every_line_that_is_not_a_key() -> None:
+    with pytest.raises(AllowedKeysError) as info:
+        parse_allowed_keys(f"{alice.id}\nalice\n\n{alice.id[:-1]} short\n")
+    assert str(info.value) == (
+        f"line 2: 'alice' is not a squawk key id; line 4: {alice.id[:-1]!r} is not a squawk key id"
+    )
+
+
+def test_a_missing_allowed_keys_file_is_an_error(tmp_path: Any) -> None:
+    with pytest.raises(AllowedKeysError, match="cannot read"):
+        KeysAccess(os.path.join(str(tmp_path), "nope"))
+
+
+async def test_keys_mode_admits_listed_keys_and_refuses_others(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(access=KeysAccess(keys_file))
+    ws, hello = await open_ws(relay)
+    assert hello["access"] == "keys"
+    await ws.close()
+    admitted = await login(relay, alice)
+    assert admitted.ok["t"] == "ok"
+    refused = await login(relay, bob, expect_ok=False)
+    assert await close_code(refused.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(bob.id)
+    await admitted.close()
+
+
+async def test_a_key_removed_from_the_file_is_disconnected_and_its_mailbox_deleted(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    write_keys(keys_file, alice.id, bob.id)
+    relay = await start_relay(access=KeysAccess(keys_file))
+    a = await login(relay, alice)
+    b = await login(relay, bob)
+    await a.allow(bob)
+    await b.allow(alice)
+    assert (await b.deposit(alice))["t"] == "deposited"
+
+    write_keys(keys_file, bob.id)
+    relay.reload_access()
+
+    assert await close_code(a.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+    assert relay.store.usage(alice.id, 0).messages == 0
+    # Bob is still connected, and can no longer leave messages for Alice.
+    assert (await b.deposit(alice))["reason"] == "not-allowed"
+    again = await login(relay, alice, expect_ok=False)
+    assert await close_code(again.ws) == (4003, "not permitted")
+    await b.close()
+
+
+async def test_a_key_added_to_the_file_is_admitted_after_a_reload(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(access=KeysAccess(keys_file))
+    write_keys(keys_file, alice.id, bob.id)
+    relay.reload_access()
+    b = await login(relay, bob)
+    await b.close()
+
+
+async def test_a_file_with_a_bad_line_changes_nothing(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    access = KeysAccess(keys_file)
+    relay = await start_relay(access=access)
+    a = await login(relay, alice)
+    write_keys(keys_file, "alice", bob.id)
+    relay.reload_access()
+    assert access.keys == {alice.id: "Alice's laptop"}
+    await a.allow(bob)  # still connected
+    await a.close()
+
+
+async def test_a_deleted_file_changes_nothing(start_relay: RelayFactory, keys_file: str) -> None:
+    access = KeysAccess(keys_file)
+    relay = await start_relay(access=access)
+    os.remove(keys_file)
+    relay.reload_access()
+    a = await login(relay, alice)
+    await a.close()
+
+
+async def test_the_relay_notices_a_changed_file_by_itself(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(
+        RelayLimits(access_check_interval_s=0.05), access=KeysAccess(keys_file)
+    )
+    a = await login(relay, alice)
+    write_keys(keys_file, bob.id)
+    assert await close_code(a.ws) == (4003, "not permitted")
+
+
+async def test_starting_in_keys_mode_deletes_the_mailboxes_of_keys_not_listed(
+    start_relay: RelayFactory, keys_file: str, data_dir: str
+) -> None:
+    store = RelayStore.open(data_dir)
+    store.touch_mailbox(alice.id, START_MS)
+    store.touch_mailbox(bob.id, START_MS)
+    store.close()
+    relay = await start_relay(access=KeysAccess(keys_file))
+    assert relay.store.mailbox_keys() == [alice.id]
+
+
+async def test_sighup_rereads_the_allowed_keys_file(tmp_path: Any, keys_file: str) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(stdout=out.append, stderr=out.append, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop)
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--port", "0", "--data", data, "--access", "keys"]
+    task = asyncio.create_task(run([*args, "--allowed-keys", keys_file], io))
+    try:
+        port = int(await wait_for_text(out, r"listening on ws://127\.0\.0\.1:(\d+)\n", 1))
+        assert f"Access:    keys (1 allowed in {keys_file})\n" in "".join(out)
+        relay = PortOnly(port)
+        a = await login(relay, alice)  # type: ignore[arg-type]
+        write_keys(keys_file, bob.id)
+        os.kill(os.getpid(), signal.SIGHUP)
+        assert await close_code(a.ws) == (4003, "not permitted")
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, 5) == 0
+
+
+class PortOnly:
+    """Enough of a RelayServer for `open_ws`, for a relay started by the CLI."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+
+
+async def wait_for_text(out: list[str], pattern: str, group: int, timeout: float = 5.0) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        match = re.search(pattern, "".join(out))
+        if match is not None:
+            return match.group(group)
+        if loop.time() > deadline:
+            raise AssertionError(f"timed out waiting for {pattern!r} in {''.join(out)!r}")
+        await asyncio.sleep(0.02)
