@@ -3,8 +3,11 @@
 import asyncio
 import itertools
 import os
+import re
+import signal
 import sqlite3
 import stat
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -13,14 +16,40 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from squawk import jsontext
+from squawk.cli import run
+from squawk.cli_io import CliIo
 from squawk.crypto import ed25519_random_secret_key, ed25519_sign, random_bytes
 from squawk.encoding import to_base64url
 from squawk.identity import Identity, identity_from_secret_key
 from squawk.network import auth_message
 from squawk.relay import Rate, RelayLimits, RelayServer
+from squawk.relay.access import (
+    AccessMode,
+    AllowedKeysError,
+    AllowedUsersError,
+    Decision,
+    GitHubAccess,
+    KeysAccess,
+    OpenAccess,
+    default_access_mode,
+    is_loopback_host,
+    parse_allowed_keys,
+    parse_allowed_users,
+)
+from squawk.relay.github import (
+    Denied,
+    DeviceCode,
+    Expired,
+    GitHubError,
+    GitHubUser,
+    Pending,
+    PollAnswer,
+    Token,
+)
 from squawk.relay.invite_code import ALPHABET, code_hash, new_code, normalize_code
-from squawk.relay.limits import DAY_MS, MINUTE_MS, RateLimiter
-from squawk.relay.storage import DB_FILE
+from squawk.relay.limits import DAY_MS, HOUR_MS, MINUTE_MS, RateLimiter
+from squawk.relay.storage import DB_FILE, KeyOwner, RelayStore
+from squawk.timefmt import iso_from_ms
 from squawk.version import VERSION
 
 Frame = dict[str, Any]
@@ -160,8 +189,12 @@ async def start_relay(data_dir: str, clock: Clock) -> AsyncIterator[RelayFactory
     """Starts relays on free ports with the fake clock; stops them afterwards."""
     running: list[RelayServer] = []
 
-    async def start(limits: RelayLimits | None = None, directory: str | None = None) -> RelayServer:
-        relay = RelayServer(directory or data_dir, port=0, limits=limits, now=clock)
+    async def start(
+        limits: RelayLimits | None = None,
+        directory: str | None = None,
+        access: Any = None,
+    ) -> RelayServer:
+        relay = RelayServer(directory or data_dir, port=0, limits=limits, now=clock, access=access)
         await relay.start()
         running.append(relay)
         return relay
@@ -191,7 +224,99 @@ async def test_hello_carries_the_relay_key_and_a_challenge(relay: RelayServer) -
     assert hello["v"] == 1
     assert hello["key"] == relay.key_id
     assert len(hello["challenge"]) >= 43
+    assert hello["access"] == "open"
     await ws.close()
+
+
+class FixedAccess:
+    """An access policy with a fixed answer for each key (ADMITTED otherwise)."""
+
+    def __init__(self, mode: AccessMode, answers: dict[str, Decision]) -> None:
+        self._mode: AccessMode = mode
+        self.answers = answers
+
+    @property
+    def mode(self) -> AccessMode:
+        return self._mode
+
+    def decide(self, key: str) -> Decision:
+        return self.answers.get(key, Decision.ADMITTED)
+
+
+async def test_hello_names_the_access_mode(start_relay: RelayFactory) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {}))
+    ws, hello = await open_ws(relay)
+    assert hello["access"] == "keys"
+    await ws.close()
+
+
+@pytest.mark.parametrize("decision", [Decision.REFUSED, Decision.UNKNOWN])
+async def test_a_key_the_access_mode_does_not_admit_is_closed_with_4003_and_gets_no_mailbox(
+    start_relay: RelayFactory, decision: Decision
+) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {alice.id: decision}))
+    client = await login(relay, alice, expect_ok=False)
+    assert await close_code(client.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+    admitted = await login(relay, bob)
+    assert admitted.ok["t"] == "ok"
+    assert relay.store.has_mailbox(bob.id)
+    await admitted.close()
+
+
+async def test_the_access_check_comes_after_the_signature_check(start_relay: RelayFactory) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {alice.id: Decision.REFUSED}))
+    client = await login(relay, alice, signer=bob, expect_ok=False)
+    assert await close_code(client.ws) == (4001, "bad signature")
+
+
+def test_open_access_admits_every_key() -> None:
+    assert OpenAccess().mode == "open"
+    assert OpenAccess().decide(alice.id) is Decision.ADMITTED
+
+
+@pytest.mark.parametrize(
+    ("host", "trust_forwarded_for", "expected"),
+    [
+        ("127.0.0.1", False, "open"),
+        ("127.0.0.2", False, "open"),
+        ("::1", False, "open"),
+        ("localhost", False, "open"),
+        ("127.0.0.1", True, None),
+        ("0.0.0.0", False, None),
+        ("::", False, None),
+        ("192.168.1.10", False, None),
+        ("relay.example.net", False, None),
+    ],
+)
+def test_open_is_the_default_only_for_a_relay_only_this_machine_can_reach(
+    host: str, trust_forwarded_for: bool, expected: str | None
+) -> None:
+    assert default_access_mode(host, trust_forwarded_for) == expected
+    assert is_loopback_host(host) == (expected is not None or trust_forwarded_for)
+
+
+def test_deleting_a_mailbox_removes_its_allow_list_waiting_messages_and_invite() -> None:
+    store = RelayStore.open_memory()
+    for key in (alice.id, bob.id):
+        store.touch_mailbox(key, START_MS)
+    store.set_allowed(alice.id, [bob.id])
+    store.set_allowed(bob.id, [alice.id])
+    store.add_message(bob.id, alice.id, "m1", "{}", START_MS)
+    store.add_message(alice.id, bob.id, "m2", "{}", START_MS)
+    store.add_invite("hash", alice.id, START_MS + 1000)
+
+    store.delete_mailbox(alice.id)
+
+    assert not store.has_mailbox(alice.id)
+    assert not store.is_allowed(alice.id, bob.id)
+    assert store.usage(alice.id, 0).messages == 0
+    assert store.invite_creator("hash") is None
+    # Bob's mailbox, his allow list and the message waiting for him are his.
+    assert store.has_mailbox(bob.id)
+    assert store.is_allowed(bob.id, alice.id)
+    assert store.usage(bob.id, 0).messages == 1
+    store.close()
 
 
 async def test_auth_answers_ok_with_the_number_waiting(relay: RelayServer) -> None:
@@ -1030,3 +1155,712 @@ def test_rate_limiter_refills_over_time() -> None:
     clock.advance(MINUTE_MS)
     limiter.forget_full({"k": rate})
     assert limiter._buckets == {}
+
+
+# Keys mode (docs/plan/relay-access.md, "The allowed keys file").
+
+
+def write_keys(path: str, *lines: str) -> None:
+    """Writes the allowed keys file, making sure its change is noticed even
+    when two writes fall in the same clock tick."""
+    try:
+        previous = os.stat(path).st_mtime_ns
+    except OSError:
+        previous = 0
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("".join(f"{line}\n" for line in lines))
+    mtime = max(time.time_ns(), previous + 1_000_000)
+    os.utime(path, ns=(mtime, mtime))
+
+
+@pytest.fixture
+def keys_file(tmp_path: Any) -> str:
+    path = os.path.join(str(tmp_path), "allowed-keys")
+    write_keys(path, "# who may use the relay", f"{alice.id}  Alice's laptop  # since May", "")
+    return path
+
+
+def test_allowed_keys_file_lines() -> None:
+    text = f"# comment\n\n{alice.id}\n  {bob.id}\tBob # work\n{carol.id} # Carol\n"
+    assert parse_allowed_keys(text) == {alice.id: "", bob.id: "Bob", carol.id: ""}
+
+
+def test_allowed_keys_file_names_every_line_that_is_not_a_key() -> None:
+    with pytest.raises(AllowedKeysError) as info:
+        parse_allowed_keys(f"{alice.id}\nalice\n\n{alice.id[:-1]} short\n")
+    assert str(info.value) == (
+        f"line 2: 'alice' is not a squawk key id; line 4: {alice.id[:-1]!r} is not a squawk key id"
+    )
+
+
+def test_a_missing_allowed_keys_file_is_an_error(tmp_path: Any) -> None:
+    with pytest.raises(AllowedKeysError, match="cannot read"):
+        KeysAccess(os.path.join(str(tmp_path), "nope"))
+
+
+async def test_keys_mode_admits_listed_keys_and_refuses_others(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(access=KeysAccess(keys_file))
+    ws, hello = await open_ws(relay)
+    assert hello["access"] == "keys"
+    await ws.close()
+    admitted = await login(relay, alice)
+    assert admitted.ok["t"] == "ok"
+    refused = await login(relay, bob, expect_ok=False)
+    assert await close_code(refused.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(bob.id)
+    await admitted.close()
+
+
+async def test_a_key_removed_from_the_file_is_disconnected_and_its_mailbox_deleted(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    write_keys(keys_file, alice.id, bob.id)
+    relay = await start_relay(access=KeysAccess(keys_file))
+    a = await login(relay, alice)
+    b = await login(relay, bob)
+    await a.allow(bob)
+    await b.allow(alice)
+    assert (await b.deposit(alice))["t"] == "deposited"
+
+    write_keys(keys_file, bob.id)
+    relay.reload_access()
+
+    assert await close_code(a.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+    assert relay.store.usage(alice.id, 0).messages == 0
+    # Bob is still connected, and can no longer leave messages for Alice.
+    assert (await b.deposit(alice))["reason"] == "not-allowed"
+    again = await login(relay, alice, expect_ok=False)
+    assert await close_code(again.ws) == (4003, "not permitted")
+    await b.close()
+
+
+async def test_a_key_added_to_the_file_is_admitted_after_a_reload(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(access=KeysAccess(keys_file))
+    write_keys(keys_file, alice.id, bob.id)
+    relay.reload_access()
+    b = await login(relay, bob)
+    await b.close()
+
+
+async def test_a_file_with_a_bad_line_changes_nothing(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    access = KeysAccess(keys_file)
+    relay = await start_relay(access=access)
+    a = await login(relay, alice)
+    write_keys(keys_file, "alice", bob.id)
+    relay.reload_access()
+    assert access.keys == {alice.id: "Alice's laptop"}
+    await a.allow(bob)  # still connected
+    await a.close()
+
+
+async def test_a_deleted_file_changes_nothing(start_relay: RelayFactory, keys_file: str) -> None:
+    access = KeysAccess(keys_file)
+    relay = await start_relay(access=access)
+    os.remove(keys_file)
+    relay.reload_access()
+    a = await login(relay, alice)
+    await a.close()
+
+
+async def test_the_relay_notices_a_changed_file_by_itself(
+    start_relay: RelayFactory, keys_file: str
+) -> None:
+    relay = await start_relay(
+        RelayLimits(access_check_interval_s=0.05), access=KeysAccess(keys_file)
+    )
+    a = await login(relay, alice)
+    write_keys(keys_file, bob.id)
+    assert await close_code(a.ws) == (4003, "not permitted")
+
+
+async def test_starting_in_keys_mode_deletes_no_mailboxes(
+    start_relay: RelayFactory, keys_file: str, data_dir: str
+) -> None:
+    store = RelayStore.open(data_dir)
+    store.touch_mailbox(alice.id, START_MS)
+    store.touch_mailbox(bob.id, START_MS)
+    store.close()
+    relay = await start_relay(access=KeysAccess(keys_file))
+    assert sorted(relay.store.mailbox_keys()) == sorted([alice.id, bob.id])
+
+
+def test_a_file_that_lists_no_keys_is_refused_at_start(tmp_path: Any) -> None:
+    path = os.path.join(str(tmp_path), "allowed-keys")
+    write_keys(path, "# nobody", "")
+    with pytest.raises(AllowedKeysError, match="lists no keys"):
+        KeysAccess(path)
+
+
+def test_taking_keys_out_waits_for_two_readings_that_agree(keys_file: str) -> None:
+    access = KeysAccess(keys_file)
+    write_keys(keys_file, "")  # an editor emptied the file while saving it
+    assert access.reload() is False
+    write_keys(keys_file, alice.id, bob.id)  # and then wrote it out
+    assert access.reload() is True  # adding a key is applied at once
+    assert access.decide(bob.id) is Decision.ADMITTED
+    write_keys(keys_file, bob.id)
+    assert access.reload() is False
+    assert access.decide(alice.id) is Decision.ADMITTED
+    assert access.reload() is True  # the second reading agrees
+    assert access.decide(alice.id) is Decision.REFUSED
+
+
+def test_sighup_applies_a_removal_at_once_even_when_size_and_time_are_unchanged(
+    keys_file: str,
+) -> None:
+    write_keys(keys_file, alice.id)
+    access = KeysAccess(keys_file)
+    stat_before = os.stat(keys_file)
+    with open(keys_file, "w", encoding="utf-8") as file:
+        file.write(f"{bob.id}\n")  # a key of the same length
+    os.utime(keys_file, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    assert access.reload(force=True) is True
+    assert access.decide(alice.id) is Decision.REFUSED
+    assert access.decide(bob.id) is Decision.ADMITTED
+
+
+async def test_sighup_rereads_the_allowed_keys_file(tmp_path: Any, keys_file: str) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(stdout=out.append, stderr=out.append, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop)
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--port", "0", "--data", data, "--access", "keys"]
+    task = asyncio.create_task(run([*args, "--allowed-keys", keys_file], io))
+    try:
+        port = int(await wait_for_text(out, r"listening on ws://127\.0\.0\.1:(\d+)\n", 1))
+        assert f"Access:    keys (1 allowed in {keys_file})\n" in "".join(out)
+        relay = PortOnly(port)
+        a = await login(relay, alice)  # type: ignore[arg-type]
+        write_keys(keys_file, bob.id)
+        os.kill(os.getpid(), signal.SIGHUP)
+        assert await close_code(a.ws) == (4003, "not permitted")
+    finally:
+        stop.set()
+        assert await asyncio.wait_for(task, 5) == 0
+
+
+class PortOnly:
+    """Enough of a RelayServer for `open_ws`, for a relay started by the CLI."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+
+
+async def wait_for_text(out: list[str], pattern: str, group: int, timeout: float = 5.0) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        match = re.search(pattern, "".join(out))
+        if match is not None:
+            return match.group(group)
+        if loop.time() > deadline:
+            raise AssertionError(f"timed out waiting for {pattern!r} in {''.join(out)!r}")
+        await asyncio.sleep(0.02)
+
+
+# GitHub mode (docs/plan/relay-access.md, "Signing in with GitHub").
+
+
+class FakeGitHub:
+    """Stands in for GitHub. Each poll for the token gives the next of
+    `answers`; once they run out, the person has approved and `user` is who
+    they are. While `hold` is set and not yet released, polls wait for it, so
+    a sign-in stays in progress."""
+
+    def __init__(self) -> None:
+        self.user: GitHubUser = GitHubUser("alice", 101)
+        self.answers: list[PollAnswer | GitHubError] = []
+        self.code_error: GitHubError | None = None
+        self.hold: asyncio.Event | None = None
+        self.codes_given = 0
+
+    async def request_device_code(self) -> DeviceCode:
+        if self.code_error is not None:
+            raise self.code_error
+        self.codes_given += 1
+        return DeviceCode(
+            device_code="device-secret",
+            user_code="ABCD-1234",
+            verification_uri="https://github.com/login/device",
+            expires_in=900,
+            interval=5,
+        )
+
+    async def poll_token(self, device_code: str) -> PollAnswer:
+        if self.hold is not None:
+            await self.hold.wait()
+        if self.answers:
+            answer = self.answers.pop(0)
+            if isinstance(answer, GitHubError):
+                raise answer
+            return answer
+        return Token("gho_token")
+
+    async def read_user(self, token: str) -> GitHubUser:
+        return self.user
+
+
+class SecondsClock:
+    """A clock in seconds that moves only when the sign-in sleeps, so tests
+    never wait for GitHub's polling interval."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        await asyncio.sleep(0)
+
+
+@pytest.fixture
+def users_file(tmp_path: Any) -> str:
+    path = os.path.join(str(tmp_path), "allowed-users")
+    write_keys(path, "# who may use the relay", "alice", "Bob  202  # pinned", "")
+    return path
+
+
+@pytest.fixture
+def github() -> FakeGitHub:
+    return FakeGitHub()
+
+
+def github_access(path: str, github: FakeGitHub, max_keys_per_user: int = 5) -> GitHubAccess:
+    seconds = SecondsClock()
+    return GitHubAccess(
+        path,
+        github,
+        max_keys_per_user=max_keys_per_user,
+        sleep=seconds.sleep,
+        clock=seconds,
+    )
+
+
+async def start_sign_in(
+    relay: RelayServer, identity: Identity, *, now_ms: int = START_MS
+) -> Client:
+    """Connects as `identity`, which the relay has not seen, and sends
+    `login-start`. Returns the client once the relay has sent the code.
+    `now_ms` is the time on the relay's clock, from which the code expires."""
+    client = await login(relay, identity, expect_ok=False)
+    assert await client.recv() == {"t": "login-required", "provider": "github"}
+    await client.send({"t": "login-start"})
+    code = await client.recv()
+    assert code == {
+        "t": "login",
+        "verification_uri": "https://github.com/login/device",
+        "user_code": "ABCD-1234",
+        "expires_at": iso_from_ms(now_ms + 900_000),
+    }
+    return client
+
+
+async def sign_in_fails(relay: RelayServer, identity: Identity, reason: str) -> None:
+    client = await start_sign_in(relay, identity)
+    assert await client.recv() == {"t": "login-failed", "reason": reason}
+    assert await close_code(client.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(identity.id)
+    assert relay.store.key_owner(identity.id) is None
+
+
+async def busy_sign_in(relay: RelayServer, identity: Identity) -> None:
+    client = await login(relay, identity, expect_ok=False)
+    assert (await client.recv())["t"] == "login-required"
+    await client.send({"t": "login-start"})
+    assert await client.recv() == {"t": "login-failed", "reason": "busy"}
+    assert await close_code(client.ws) == (4003, "not permitted")
+
+
+def test_allowed_users_file_lines() -> None:
+    text = "# comment\n\nalice\n  Bob\t202 # work\ncarol-x   # Carol\n"
+    assert parse_allowed_users(text) == {"alice": None, "bob": 202, "carol-x": None}
+
+
+def test_allowed_users_file_names_every_line_that_is_not_a_user() -> None:
+    with pytest.raises(AllowedUsersError) as info:
+        parse_allowed_users("alice\n-bob\ncarol x\ndave 12 13\nALICE\nerin 0\n")
+    assert str(info.value) == (
+        "line 2: '-bob' is not a GitHub user name; "
+        "line 3: after the user name there can only be a numeric GitHub id; "
+        "line 4: after the user name there can only be a numeric GitHub id; "
+        "line 5: 'ALICE' is listed more than once; "
+        "line 6: 0 is not a GitHub id"
+    )
+
+
+def test_a_missing_allowed_users_file_is_an_error(tmp_path: Any, github: FakeGitHub) -> None:
+    with pytest.raises(AllowedUsersError, match="cannot read"):
+        github_access(os.path.join(str(tmp_path), "nope"), github)
+
+
+async def test_a_new_key_signs_in_with_github_and_carries_on(
+    start_relay: RelayFactory,
+    users_file: str,
+    github: FakeGitHub,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    ws, hello = await open_ws(relay)
+    assert hello["access"] == "github"
+    await ws.close()
+    client = await start_sign_in(relay, alice)
+    assert await client.recv() == {"t": "ok", "waiting": 0, "user": "alice"}
+    assert relay.store.key_owner(alice.id) == KeyOwner(101, "alice")
+    assert relay.store.has_mailbox(alice.id)
+    await client.allow(bob)  # an admitted connection like any other
+    assert "their GitHub id is 101" in capsys.readouterr().err
+    await client.close()
+
+
+async def test_a_key_that_signed_in_before_is_admitted_at_once(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    first = await start_sign_in(relay, alice)
+    assert (await first.recv())["t"] == "ok"
+    await first.close()
+    again = await login(relay, alice)
+    assert again.ok == {"t": "ok", "waiting": 0}
+    assert github.codes_given == 1
+    await again.close()
+
+
+async def test_a_sign_in_the_person_declines_fails_as_denied(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.answers = [Pending(), Denied()]
+    await sign_in_fails(relay, alice, "denied")
+
+
+async def test_a_sign_in_github_says_has_expired_fails_as_expired(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.answers = [Pending(), Expired()]
+    await sign_in_fails(relay, alice, "expired")
+
+
+async def test_a_sign_in_is_given_up_when_the_code_runs_out(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.answers = [Pending()] * 1000  # 900 seconds at one poll every 5
+    await sign_in_fails(relay, alice, "expired")
+
+
+async def test_a_sign_in_fails_as_error_when_github_cannot_be_reached_for_the_code(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.code_error = GitHubError("Could not reach GitHub")
+    client = await login(relay, alice, expect_ok=False)
+    assert (await client.recv())["t"] == "login-required"
+    await client.send({"t": "login-start"})
+    assert await client.recv() == {"t": "login-failed", "reason": "error"}
+    assert await close_code(client.ws) == (4003, "not permitted")
+
+
+async def test_a_sign_in_fails_as_error_when_github_fails_while_polling(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.answers = [Pending(), GitHubError("GitHub answered 502")]
+    await sign_in_fails(relay, alice, "error")
+
+
+async def test_a_github_user_not_in_the_file_is_not_permitted(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.user = GitHubUser("mallory", 666)
+    await sign_in_fails(relay, alice, "not-permitted")
+
+
+async def test_a_name_first_used_by_one_account_refuses_another_account(
+    start_relay: RelayFactory,
+    users_file: str,
+    github: FakeGitHub,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    first = await start_sign_in(relay, alice)
+    assert (await first.recv())["user"] == "alice"
+    # Another account with the same name (written in another case), as after
+    # the first account was renamed and someone took the name.
+    github.user = GitHubUser("ALICE", 999)
+    await sign_in_fails(relay, bob, "not-permitted")
+    assert "that name first signed in here as GitHub id 101" in capsys.readouterr().err
+    await first.close()
+
+
+async def test_an_id_in_the_file_admits_only_that_account(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.user = GitHubUser("bob", 303)
+    await sign_in_fails(relay, alice, "not-permitted")
+    github.user = GitHubUser("bob", 202)
+    client = await start_sign_in(relay, bob)
+    assert await client.recv() == {"t": "ok", "waiting": 0, "user": "bob"}
+    await client.close()
+
+
+async def test_a_user_may_sign_in_at_most_the_most_keys_allowed(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github, max_keys_per_user=1))
+    first = await start_sign_in(relay, alice)
+    assert (await first.recv())["t"] == "ok"
+    await sign_in_fails(relay, bob, "not-permitted")
+    await first.close()
+
+
+async def test_a_new_key_that_does_not_send_login_start_in_time_is_closed(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(
+        RelayLimits(login_start_timeout_s=0.1), access=github_access(users_file, github)
+    )
+    client = await login(relay, alice, expect_ok=False)
+    assert (await client.recv())["t"] == "login-required"
+    assert await close_code(client.ws) == (4003, "not permitted")
+    assert github.codes_given == 0
+
+
+async def test_a_frame_other_than_login_start_closes_the_connection(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    client = await login(relay, alice, expect_ok=False)
+    assert (await client.recv())["t"] == "login-required"
+    await client.send({"t": "fetch", "req": "r1"})
+    assert await close_code(client.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+
+
+async def test_neither_timeout_applies_once_the_sign_in_has_started(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(
+        RelayLimits(auth_timeout_s=0.05, login_start_timeout_s=0.05),
+        access=github_access(users_file, github),
+    )
+    github.hold = asyncio.Event()
+    client = await start_sign_in(relay, alice)
+    await client.nothing_more(0.3)
+    github.hold.set()
+    assert (await client.recv())["t"] == "ok"
+    await client.close()
+
+
+async def test_sign_ins_started_from_one_address_are_rate_limited(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub, clock: Clock
+) -> None:
+    relay = await start_relay(
+        RelayLimits(sign_in_rate_per_ip=Rate(1, HOUR_MS)), access=github_access(users_file, github)
+    )
+    github.answers = [Denied()]
+    await sign_in_fails(relay, alice, "denied")
+    await busy_sign_in(relay, alice)
+    assert github.codes_given == 1
+    clock.advance(HOUR_MS)
+    again = await start_sign_in(relay, alice, now_ms=clock.ms)
+    assert (await again.recv())["t"] == "ok"
+    await again.close()
+
+
+async def test_at_most_two_sign_ins_are_in_progress_from_one_address(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.hold = asyncio.Event()
+    a = await start_sign_in(relay, alice)
+    b = await start_sign_in(relay, bob)
+    await busy_sign_in(relay, carol)
+    github.hold.set()
+    assert (await a.recv())["t"] == "ok"
+    assert (await b.recv())["t"] == "ok"
+    await a.close()
+    await b.close()
+
+
+async def test_sign_ins_in_progress_on_the_whole_relay_are_limited(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(
+        RelayLimits(max_sign_ins=1, max_sign_ins_per_ip=5),
+        access=github_access(users_file, github),
+    )
+    github.hold = asyncio.Event()
+    a = await start_sign_in(relay, alice)
+    await busy_sign_in(relay, bob)
+    github.hold.set()
+    assert (await a.recv())["t"] == "ok"
+    await a.close()
+    # The finished sign-in no longer counts.
+    b = await start_sign_in(relay, bob)
+    assert (await b.recv())["t"] == "ok"
+    await b.close()
+
+
+async def test_a_sign_in_ends_when_its_connection_closes(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(RelayLimits(max_sign_ins=1), access=github_access(users_file, github))
+    github.hold = asyncio.Event()
+    a = await start_sign_in(relay, alice)
+    await a.close()
+    for _ in range(100):
+        if not relay._sign_in_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert relay._sign_in_tasks == set()
+    # The closed one no longer counts against the limit.
+    b = await start_sign_in(relay, bob)
+    github.hold.set()
+    assert (await b.recv())["t"] == "ok"
+    assert relay.store.key_owner(alice.id) is None
+    await b.close()
+
+
+async def test_stopping_the_relay_ends_sign_ins_in_progress(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    github.hold = asyncio.Event()
+    a = await start_sign_in(relay, alice)
+    await asyncio.wait_for(relay.stop(), 3)
+    with pytest.raises(ConnectionClosed):
+        await a.recv()
+
+
+async def test_a_user_taken_out_of_the_file_is_disconnected_and_their_mailboxes_deleted(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    github.user = GitHubUser("bob", 202)
+    b = await start_sign_in(relay, bob)
+    assert (await b.recv())["t"] == "ok"
+    await a.allow(bob)
+    await b.allow(alice)
+    assert (await b.deposit(alice))["t"] == "deposited"
+
+    write_keys(users_file, "bob 202")
+    relay.reload_access()
+
+    assert await close_code(a.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+    assert relay.store.usage(alice.id, 0).messages == 0
+    assert (await b.deposit(alice))["reason"] == "not-allowed"
+    # The key is forgotten: it counts toward nobody's keys, and its owner is
+    # asked to sign in again (and refused then if still not listed).
+    assert relay.store.key_owner(alice.id) is None
+    again = await login(relay, alice, expect_ok=False)
+    assert await again.recv() == {"t": "login-required", "provider": "github"}
+    await again.close()
+    await b.close()
+
+
+async def test_a_renamed_account_stays_admitted_when_its_id_is_pinned_under_the_new_name(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    owner = relay.store.key_owner(alice.id)
+    assert owner is not None
+    write_keys(users_file, f"alice-renamed {owner.github_id}", "bob 202")
+    relay.reload_access()
+    await a.allow(bob)  # still connected
+    await a.close()
+
+
+async def test_pinning_another_id_in_the_file_disconnects_the_account_that_signed_in(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    write_keys(users_file, "alice 555", "bob 202")
+    relay.reload_access()
+    assert await close_code(a.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+
+
+async def test_a_users_file_with_a_bad_line_changes_nothing(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    access = github_access(users_file, github)
+    relay = await start_relay(access=access)
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    write_keys(users_file, "bob 202", "not a user")
+    relay.reload_access()
+    assert access.users == {"alice": None, "bob": 202}
+    await a.allow(bob)  # still connected
+    await a.close()
+
+
+async def test_the_relay_notices_a_changed_users_file_by_itself(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(
+        RelayLimits(access_check_interval_s=0.05), access=github_access(users_file, github)
+    )
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    write_keys(users_file, "bob")
+    assert await close_code(a.ws) == (4003, "not permitted")
+
+
+async def test_after_a_restart_a_user_no_longer_listed_is_refused_but_nothing_is_deleted(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub, data_dir: str
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    await relay.stop()
+    write_keys(users_file, "bob 202")
+    restarted = await start_relay(access=github_access(users_file, github))
+    assert restarted.store.has_mailbox(alice.id)
+    assert restarted.store.key_owner(alice.id) == KeyOwner(101, "alice")
+    again = await login(restarted, alice, expect_ok=False)
+    assert await close_code(again.ws) == (4003, "not permitted")
+
+
+def test_taking_a_user_out_waits_for_two_readings_that_agree(
+    users_file: str, github: FakeGitHub
+) -> None:
+    access = github_access(users_file, github)
+    write_keys(users_file, "")  # an editor emptied the file while saving it
+    assert access.reload() is False
+    write_keys(users_file, "alice", "bob 202", "carol")
+    assert access.reload() is True  # adding a user is applied at once
+    write_keys(users_file, "alice", "bob 303", "carol")  # pinned to another id
+    assert access.reload() is False
+    assert access.reload() is True
+    assert access.users["bob"] == 303
+    write_keys(users_file, "alice")
+    assert access.reload(force=True) is True  # SIGHUP applies it at once
+    assert set(access.users) == {"alice"}
+
+
+def test_a_users_file_that_lists_no_users_is_refused_at_start(
+    tmp_path: Any, github: FakeGitHub
+) -> None:
+    path = os.path.join(str(tmp_path), "allowed-users")
+    write_keys(path, "# nobody", "")
+    with pytest.raises(AllowedUsersError, match="lists no users"):
+        github_access(path, github)

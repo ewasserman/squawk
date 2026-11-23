@@ -78,7 +78,7 @@ data directory. Its key id is sent in `hello`; it is not secret and is not
 checked against anything in this epic (see threat 16).
 
 ```
-relay  -> client  {"t":"hello", "v":1, "key":<relay key id>, "challenge":<32 random bytes, base64url>}
+relay  -> client  {"t":"hello", "v":1, "key":<relay key id>, "challenge":<32 random bytes, base64url>, "access":"open"|"keys"|"github"}
 client -> relay   {"t":"auth",  "v":1, "key":<client key id>, "sig":<base64url>}
 relay  -> client  {"t":"ok", "waiting":<number of messages in the mailbox>}
 ```
@@ -101,6 +101,15 @@ If the signature does not verify, the relay closes the connection with code
 `4001` and reason `bad signature`. A client that has not sent a valid `auth`
 within 10 seconds is disconnected. Any frame other than `auth` before `ok`
 closes the connection.
+
+`access` says how the relay decides who may use it
+([relay-access.md](relay-access.md)); a missing `access` means `open`. After
+a valid signature the relay asks its access mode about the key. A key it does
+not admit is disconnected with code `4003`, reason `not permitted`, and gets
+no mailbox. In `github` mode, a key the relay has not seen before gets
+`{"t":"login-required","provider":"github"}` instead of `ok`, and its owner
+signs in with GitHub before the relay answers `ok` (see "Signing in with
+GitHub" in [relay-access.md](relay-access.md)).
 
 There is one connection per key. If a second connection authenticates with
 the same key, the relay closes the older one with code `4002`, reason

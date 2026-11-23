@@ -1,6 +1,8 @@
 # The squawk relay server. For local testing: `docker compose up relay`.
 # In production a proxy in front of it terminates TLS (wss://); then add
 # --trust-forwarded-for so per-address limits see the real client address.
+# It listens on 0.0.0.0 inside the container, so it must be told who may use
+# it: the default command admits anyone who can reach it (--access open).
 FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.9.5 /uv /usr/local/bin/uv
@@ -25,4 +27,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=4)"]
 
 ENTRYPOINT ["/app/.venv/bin/squawk", "relay", "serve"]
-CMD ["--host", "0.0.0.0", "--port", "8765", "--data", "/data"]
+CMD ["--host", "0.0.0.0", "--port", "8765", "--data", "/data", "--access", "open"]

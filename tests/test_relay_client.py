@@ -2,6 +2,7 @@
 through the relay when there is no direct route, and directly when there is."""
 
 import asyncio
+import contextlib
 import os
 import shutil
 import sqlite3
@@ -9,11 +10,16 @@ import tempfile
 from collections.abc import AsyncIterator, Callable
 
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
+from websockets.exceptions import ConnectionClosed
 
+from squawk import jsontext
+from squawk.crypto import ed25519_random_secret_key
 from squawk.daemon import SHARE_SESSIONS_KEY, Daemon
-from squawk.identity import init_identity
+from squawk.identity import identity_from_secret_key, init_identity
 from squawk.network import Address, LinkError, NetworkTransport
 from squawk.relay import RelayServer
+from squawk.relay.access import Decision, KeysAccess
 from squawk.relay.storage import DB_FILE
 from squawk.relay_client import (
     RELAY_ALLOW_PLAIN_KEY,
@@ -294,3 +300,110 @@ async def test_says_when_a_contact_has_not_allowed_us_at_the_relay(setup: Setup)
     alice.store.upsert_contact(bob.identity.id, "bob", trust="paired")
     with pytest.raises(LinkError, match="does not list you as a contact"):
         await transport_of(alice).request_sessions(bob.identity.id)
+
+
+# A relay that does not let this service in (docs/plan/relay-access.md, "The client").
+
+
+class CountingKeysAccess(KeysAccess):
+    """Keys mode that counts how often the relay asked about a key."""
+
+    asked = 0
+
+    def decide(self, key: str) -> Decision:
+        self.asked += 1
+        return super().decide(key)
+
+
+async def test_a_relay_that_refuses_the_key_is_tried_again_only_later(tmp_path: object) -> None:
+    keys_file = os.path.join(str(tmp_path), "allowed-keys")
+    with open(keys_file, "w", encoding="utf-8") as file:
+        file.write(f"{make_key_id()} someone else\n")
+    access = CountingKeysAccess(keys_file)
+    relay = RelayServer(os.path.join(str(tmp_path), "relay"), port=0, access=access)
+    await relay.start()
+    s = Setup(relay)
+    home = s.make_home("alice")
+    client = RelayClient(s.url, allow_plain=True, backoff_min_ms=50, refused_retry_ms=60 * 60_000)
+    transport = NetworkTransport(host="127.0.0.1", discovery=False, relay=client)
+    daemon = Daemon(home, transport=transport)
+    await daemon.start()
+    try:
+        await wait_for(lambda: client.access_problem == "not-permitted")
+        assert client.last_error == "not permitted by this relay; ask the person who runs it"
+        status = daemon.relay_status()
+        assert status is not None and status.get("access_problem") == "not-permitted"
+
+        # It does not keep knocking: no new attempt while it waits.
+        asked = access.asked
+        await asyncio.sleep(0.3)
+        assert access.asked == asked
+
+        # The operator lists the key; asked to try again, the client gets in.
+        with open(keys_file, "w", encoding="utf-8") as file:
+            file.write(f"{daemon.identity.id} alice\n")
+        relay.reload_access()
+        client.retry_now()
+        await wait_for(lambda: client.connected)
+        assert client.access_problem is None
+
+        # Taken out of the file while connected: refused again.
+        with open(keys_file, "w", encoding="utf-8") as file:
+            file.write("\n")
+        os.utime(keys_file, ns=(1, 1))
+        relay.reload_access()
+        await wait_for(lambda: client.access_problem == "not-permitted")
+        assert not client.connected
+    finally:
+        await daemon.stop()
+        await relay.stop()
+        for h in s.homes:
+            shutil.rmtree(h, ignore_errors=True)
+
+
+async def test_a_relay_that_wants_a_sign_in_is_reported_and_not_retried_at_once(
+    tmp_path: object,
+) -> None:
+    connections = 0
+
+    async def wants_sign_in(ws: ServerConnection) -> None:
+        nonlocal connections
+        connections += 1
+        await ws.send(
+            jsontext.stringify(
+                {
+                    "t": "hello",
+                    "v": 1,
+                    "key": make_key_id(),
+                    "challenge": "c" * 43,
+                    "access": "github",
+                }
+            )
+        )
+        await ws.recv()
+        await ws.send(jsontext.stringify({"t": "login-required", "provider": "github"}))
+        with contextlib.suppress(ConnectionClosed):
+            await ws.recv()
+
+    async with serve(wants_sign_in, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        home = tempfile.mkdtemp(prefix="sq-", dir="/tmp")
+        init_identity(home, "alice")
+        client = RelayClient(f"ws://127.0.0.1:{port}", allow_plain=True, backoff_min_ms=50)
+        transport = NetworkTransport(host="127.0.0.1", discovery=False, relay=client)
+        daemon = Daemon(home, transport=transport)
+        await daemon.start()
+        try:
+            await wait_for(lambda: client.access_problem == "needs-sign-in")
+            assert client.last_error == "needs sign-in: run `squawk relay login`"
+            await asyncio.sleep(0.3)
+            assert connections == 1
+            client.retry_now()
+            await wait_for(lambda: connections == 2)
+        finally:
+            await daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+
+def make_key_id() -> str:
+    return identity_from_secret_key("x", ed25519_random_secret_key()).id

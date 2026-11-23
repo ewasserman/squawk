@@ -5,8 +5,10 @@ them. The protocol is described in docs/plan/relay.md.
 Each connection starts with the relay's `hello` (its key and a random
 challenge); the client answers `auth` with its key and a signature over
 `auth_message(challenge, client key, relay key)` from `squawk.network`, and
-the relay answers `ok`. After that every frame is handled by one of the
-`_on_*` methods below.
+the relay asks its access policy (`squawk.relay.access`) whether the key
+may use it, and answers `ok` or closes the connection. In GitHub mode a key
+the relay has not seen before is first asked to sign in (`_sign_in`). After
+that every frame is handled by one of the `_on_*` methods below.
 
 All state that must survive a restart (the relay's key, mailboxes, allow
 lists, waiting messages, open invites) is in SQLite (`RelayStore`). What
@@ -32,6 +34,14 @@ from squawk.encoding import from_base64url, is_key_id, key_from_id, to_base64url
 from squawk.envelope import EnvelopeValidationError, Sealed, parse_sealed
 from squawk.identity import Identity, identity_from_secret_key
 from squawk.network import REFUSED_CODE, auth_message
+from squawk.relay.access import (
+    NOT_PERMITTED_CODE,
+    AccessPolicy,
+    Decision,
+    GitHubAccess,
+    OpenAccess,
+)
+from squawk.relay.github import GitHubError, SignedIn, SignInDenied, SignInError, SignInExpired
 from squawk.relay.invite_code import code_hash, new_code, normalize_code
 from squawk.relay.limits import Rate, RateLimiter, RelayLimits
 from squawk.relay.storage import RelayStore
@@ -64,6 +74,14 @@ _INVITE_CREATE = "invite-create"
 _JOIN_PER_CONNECTION = "invite-join-connection"
 _JOIN_PER_IP = "invite-join-ip"
 _CONNECT = "connect"
+_SIGN_IN = "sign-in"
+
+# Reason codes for `login-failed` (docs/plan/relay-access.md).
+LOGIN_NOT_PERMITTED = "not-permitted"
+LOGIN_DENIED = "denied"
+LOGIN_EXPIRED = "expired"
+LOGIN_BUSY = "busy"
+LOGIN_ERROR = "error"
 
 # Frames that must carry a `req`.
 _NEEDS_REQ = frozenset({"allow", "deposit", "fetch", "forward", "invite-create", "invite-join"})
@@ -195,8 +213,10 @@ class RelayServer:
         limits: RelayLimits | None = None,
         now: Callable[[], int] | None = None,
         trust_forwarded_for: bool = False,
+        access: AccessPolicy | None = None,
     ) -> None:
         self._data_dir = data_dir
+        self.access: AccessPolicy = OpenAccess() if access is None else access
         self._trust_forwarded_for = trust_forwarded_for
         self._host = host
         self._port = port
@@ -208,6 +228,11 @@ class RelayServer:
         self._store: RelayStore | None = None
         self._server: Server | None = None
         self._purge_task: asyncio.Task[None] | None = None
+        self._access_task: asyncio.Task[None] | None = None
+        self._sign_in_tasks: set[asyncio.Task[tuple[str | None, str | None]]] = set()
+        """Sign-ins waiting for GitHub, cancelled when the relay stops."""
+        self._sign_ins_by_ip: dict[str, int] = {}
+        """How many sign-ins are in progress from each IP address."""
         self.identity: Identity | None = None
 
     # Starting and stopping.
@@ -217,6 +242,8 @@ class RelayServer:
         self._store = store
         self.identity = identity_from_secret_key("relay", store.secret_key())
         store.delete_all_invites()
+        if isinstance(self.access, GitHubAccess):
+            self.access.use_store(store)
         self.purge()
         self._server = await serve(
             self._handle,
@@ -229,13 +256,17 @@ class RelayServer:
             ping_timeout=self.limits.ping_timeout_s,
         )
         self._purge_task = asyncio.create_task(self._purge_loop())
+        self._access_task = asyncio.create_task(self._access_loop())
 
     async def stop(self) -> None:
-        if self._purge_task is not None:
-            self._purge_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._purge_task
-            self._purge_task = None
+        for task in (self._purge_task, self._access_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._purge_task = self._access_task = None
+        for sign_in_task in list(self._sign_in_tasks):
+            sign_in_task.cancel()
         server = self._server
         if server is not None:
             self._server = None
@@ -247,6 +278,8 @@ class RelayServer:
                     if connection.transport is not None:
                         connection.transport.abort()
         if self._store is not None:
+            if isinstance(self.access, GitHubAccess):
+                self.access.use_store(None)
             self._store.close()
             self._store = None
 
@@ -294,6 +327,44 @@ class RelayServer:
                 self._end_room(room, notify=[room.creator, room.joiner])
         self._rates.forget_full(self._rate_table())
 
+    # Access.
+
+    async def _access_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.limits.access_check_interval_s)
+            try:
+                self.reload_access(force=False)
+            except Exception as err:
+                _log(f"checking the access file failed: {type(err).__name__}: {err}")
+
+    def reload_access(self, force: bool = True) -> None:
+        """Has the access policy reread its file, then closes the connections
+        and deletes the mailboxes of keys it now refuses. The relay does this
+        every `access_check_interval_s` with `force` False, so that taking
+        keys out waits for a second reading of the file; SIGHUP and other
+        explicit requests apply the file at once. In GitHub mode the keys refused
+        include every key of a user taken out of the file."""
+        if self.access.reload(force):
+            self._enforce_access()
+
+    def reload_access_logged(self) -> None:
+        """`reload_access` for a signal handler: logs a failure instead of raising."""
+        try:
+            self.reload_access()
+        except Exception as err:
+            _log(f"rereading the access file failed: {type(err).__name__}: {err}")
+
+    def _enforce_access(self) -> None:
+        refused = Decision.REFUSED
+        for client in list(self._clients.values()):
+            if self.access.decide(client.key) is refused:
+                self._drop(client)
+                client.close(NOT_PERMITTED_CODE, "not permitted")
+        for key in self.store.mailbox_keys():
+            if self.access.decide(key) is refused:
+                self.store.delete_mailbox(key)
+                _log(f"deleted the mailbox of {key}, which may no longer use the relay")
+
     def _rate_table(self) -> dict[str, Rate]:
         """Each rate limit counter's name and its limit."""
         limits = self.limits
@@ -305,6 +376,7 @@ class RelayServer:
             _JOIN_PER_CONNECTION: limits.invite_join_rate_per_connection,
             _JOIN_PER_IP: limits.invite_join_rate_per_ip,
             _CONNECT: limits.connect_rate_per_ip,
+            _SIGN_IN: limits.sign_in_rate_per_ip,
         }
 
     def _oldest_kept(self) -> int:
@@ -337,12 +409,24 @@ class RelayServer:
         key = await self._authenticate(ws)
         if key is None:
             return
-        client = _Client(
-            ws, key, _remote_ip(ws, self._trust_forwarded_for), self.limits.max_queued_bytes
-        )
+        ip = _remote_ip(ws, self._trust_forwarded_for)
+        user: str | None = None
+        decision = self.access.decide(key)
+        if decision is Decision.UNKNOWN and isinstance(self.access, GitHubAccess):
+            user = await self._sign_in(ws, self.access, key, ip)
+            if user is None:
+                return
+            if self.access.decide(key) is not Decision.ADMITTED:
+                # The allowed users file changed while the sign-in finished.
+                await ws.close(NOT_PERMITTED_CODE, "not permitted")
+                return
+        elif decision is not Decision.ADMITTED:
+            await ws.close(NOT_PERMITTED_CODE, "not permitted")
+            return
+        client = _Client(ws, key, ip, self.limits.max_queued_bytes)
         writer = asyncio.create_task(client.write_loop())
         try:
-            self._admit(client)
+            self._admit(client, user)
             async for data in ws:
                 self._on_data(client, data)
         except ConnectionClosed:
@@ -365,6 +449,7 @@ class RelayServer:
                         "v": PROTOCOL_VERSION,
                         "key": self.key_id,
                         "challenge": challenge,
+                        "access": self.access.mode,
                     }
                 )
             )
@@ -399,8 +484,122 @@ class RelayServer:
             return None
         return key
 
-    def _admit(self, client: _Client) -> None:
-        """Makes `client` the connection for its key, closing any older one."""
+    # Signing in with GitHub (docs/plan/relay-access.md).
+
+    async def _sign_in(
+        self, ws: ServerConnection, access: GitHubAccess, key: str, ip: str
+    ) -> str | None:
+        """Asks the owner of `key`, which the relay has not seen before, to
+        sign in with GitHub. Returns their GitHub login once they have and
+        `key` is recorded as theirs, or None after closing the connection."""
+        try:
+            await ws.send(jsontext.stringify({"t": "login-required", "provider": "github"}))
+            data = await asyncio.wait_for(ws.recv(), self.limits.login_start_timeout_s)
+        except TimeoutError:
+            await ws.close(NOT_PERMITTED_CODE, "not permitted")
+            return None
+        except ConnectionClosed:
+            return None
+        frame = _parse_frame(data)
+        if frame is None or frame["t"] != "login-start":
+            await ws.close(NOT_PERMITTED_CODE, "not permitted")
+            return None
+        # From here on neither the authentication timeout nor the wait for
+        # `login-start` applies: the person may take as long as GitHub gives
+        # them, and the usual pings keep the connection alive.
+        if not self._start_sign_in(ip):
+            await _login_failed(ws, LOGIN_BUSY)
+            return None
+        task = asyncio.create_task(self._run_sign_in(ws, access, key))
+        self._sign_in_tasks.add(task)
+        # Reading at the same time notices the connection closing (and a
+        # client that sends a frame instead of waiting), which ends the sign-in.
+        reader = asyncio.create_task(ws.recv())
+        try:
+            await asyncio.wait({task, reader}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            self._end_sign_in(ip)
+            self._sign_in_tasks.discard(task)
+            task.cancel()
+            reader.cancel()
+            for waited in (task, reader):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waited
+        if task.cancelled():
+            await ws.close(NOT_PERMITTED_CODE, "not permitted")
+            return None
+        error = task.exception()
+        if error is not None:
+            if not isinstance(error, ConnectionClosed):
+                _log(f"signing in failed: {type(error).__name__}: {error}")
+                await _login_failed(ws, LOGIN_ERROR)
+            return None
+        reason, login = task.result()
+        if reason is not None:
+            await _login_failed(ws, reason)
+            return None
+        return login
+
+    def _start_sign_in(self, ip: str) -> bool:
+        """Counts a sign-in starting from `ip`, or returns False if that
+        would go over a limit on sign-ins."""
+        limits = self.limits
+        if (
+            sum(self._sign_ins_by_ip.values()) >= limits.max_sign_ins
+            or self._sign_ins_by_ip.get(ip, 0) >= limits.max_sign_ins_per_ip
+            or self._rates.take(_SIGN_IN, ip, limits.sign_in_rate_per_ip) is not None
+        ):
+            return False
+        self._sign_ins_by_ip[ip] = self._sign_ins_by_ip.get(ip, 0) + 1
+        return True
+
+    def _end_sign_in(self, ip: str) -> None:
+        left = self._sign_ins_by_ip.get(ip, 0) - 1
+        if left > 0:
+            self._sign_ins_by_ip[ip] = left
+        else:
+            self._sign_ins_by_ip.pop(ip, None)
+
+    async def _run_sign_in(
+        self, ws: ServerConnection, access: GitHubAccess, key: str
+    ) -> tuple[str | None, str | None]:
+        """Runs GitHub's device flow for `key`. Returns (None, login) when
+        the person signed in as a user who may use the relay, otherwise
+        (the `login-failed` reason, None)."""
+        try:
+            code = await access.request_device_code()
+        except GitHubError as err:
+            _log(f"signing in with GitHub failed: {err}")
+            return LOGIN_ERROR, None
+        expires_at = self._now() + code.expires_in * 1000
+        await ws.send(
+            jsontext.stringify(
+                {
+                    "t": "login",
+                    "verification_uri": code.verification_uri,
+                    "user_code": code.user_code,
+                    "expires_at": iso_from_ms(expires_at),
+                }
+            )
+        )
+        match await access.wait_for_approval(code):
+            case SignedIn(user=user):
+                if self._store is None:
+                    return LOGIN_ERROR, None  # the relay is stopping
+                if not access.admit_signed_in(key, user, self._now()):
+                    return LOGIN_NOT_PERMITTED, None
+                return None, user.login
+            case SignInDenied():
+                return LOGIN_DENIED, None
+            case SignInExpired():
+                return LOGIN_EXPIRED, None
+            case SignInError(message=message):
+                _log(f"signing in with GitHub failed: {message}")
+                return LOGIN_ERROR, None
+
+    def _admit(self, client: _Client, user: str | None = None) -> None:
+        """Makes `client` the connection for its key, closing any older one.
+        `user` is the GitHub login its owner just signed in as, if they did."""
         older = self._clients.get(client.key)
         if older is not None:
             self._drop(older)
@@ -408,7 +607,10 @@ class RelayServer:
         self._clients[client.key] = client
         self.store.touch_mailbox(client.key, self._now())
         waiting = self.store.usage(client.key, self._oldest_kept()).messages
-        client.send({"t": "ok", "waiting": waiting})
+        ok: Frame = {"t": "ok", "waiting": waiting}
+        if user is not None:
+            ok["user"] = user
+        client.send(ok)
 
     def _drop(self, client: _Client) -> None:
         """Forgets everything tied to a connection that closed or was replaced:
@@ -705,6 +907,13 @@ def _parse_frame(data: str | bytes) -> Frame | None:
     if not isinstance(frame, dict) or not isinstance(frame.get("t"), str):
         return None
     return frame
+
+
+async def _login_failed(ws: ServerConnection, reason: str) -> None:
+    """Tells the client its sign-in did not work out and closes the connection."""
+    with contextlib.suppress(ConnectionClosed):
+        await ws.send(jsontext.stringify({"t": "login-failed", "reason": reason}))
+    await ws.close(NOT_PERMITTED_CODE, "not permitted")
 
 
 def _refuse(

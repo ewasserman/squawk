@@ -19,7 +19,21 @@ from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
 from squawk.relay import RelayServer
-from squawk.relay_client import RELAY_URL_KEY
+from squawk.relay.access import (
+    ACCESS_MODES,
+    DEFAULT_MAX_KEYS_PER_USER,
+    OPEN_WARNING,
+    AccessMode,
+    AccessPolicy,
+    AllowedKeysError,
+    AllowedUsersError,
+    GitHubAccess,
+    KeysAccess,
+    OpenAccess,
+    default_access_mode,
+)
+from squawk.relay.github import UrllibGitHub
+from squawk.relay_client import NEEDS_SIGN_IN_TEXT, NOT_PERMITTED_TEXT, RELAY_URL_KEY
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
 from squawk.store import Store
@@ -50,6 +64,11 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "port": Opt("string", "p"),
             "data": Opt("string"),
             "trust-forwarded-for": Opt("boolean"),
+            "access": Opt("string"),
+            "allowed-keys": Opt("string"),
+            "allowed-users": Opt("string"),
+            "github-client-id": Opt("string"),
+            "max-keys-per-user": Opt("string"),
         },
     )
     port_text = string_value(values, "port")
@@ -59,12 +78,27 @@ async def _serve(args: list[str], io: CliIo) -> int:
             raise ParseArgsError(f'"{port_text}" is not a port number (0-65535)')
         port = int(port_text)
     host = string_value(values, "host") or DEFAULT_HOST
+    trust_forwarded_for = values.get("trust-forwarded-for") is True
+    try:
+        access = _access_policy(
+            string_value(values, "access"),
+            host,
+            trust_forwarded_for,
+            allowed_keys=string_value(values, "allowed-keys"),
+            allowed_users=string_value(values, "allowed-users"),
+            github_client_id=string_value(values, "github-client-id"),
+            max_keys_per_user=string_value(values, "max-keys-per-user"),
+        )
+    except (AllowedKeysError, AllowedUsersError) as err:
+        io.stderr(f"squawk relay serve: {err}\n")
+        return 1
     data_dir = string_value(values, "data") or relay_data_dir(io.env)
     relay = RelayServer(
         data_dir,
         host=host,
         port=port,
-        trust_forwarded_for=values.get("trust-forwarded-for") is True,
+        trust_forwarded_for=trust_forwarded_for,
+        access=access,
     )
     await relay.start()
     stop = io.stop if io.stop is not None else asyncio.Event()
@@ -75,10 +109,22 @@ async def _serve(args: list[str], io: CliIo) -> int:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.add_signal_handler(sig, stop.set)
                 handled.append(sig)
+    # SIGHUP rereads the allowed keys or allowed users file.
+    with contextlib.suppress(NotImplementedError, RuntimeError, AttributeError):
+        loop.add_signal_handler(signal.SIGHUP, relay.reload_access_logged)
+        handled.append(signal.SIGHUP)
     try:
         io.stdout(f"squawk relay listening on ws://{host}:{relay.port}\n")
         io.stdout(f"Relay key: {relay.key_id}\n")
         io.stdout(f"Data:      {data_dir}\n")
+        if access.mode == "open":
+            io.stdout(f"{OPEN_WARNING}\n")
+        elif isinstance(access, KeysAccess):
+            io.stdout(f"Access:    keys ({len(access.keys)} allowed in {access.path})\n")
+        elif isinstance(access, GitHubAccess):
+            io.stdout(f"Access:    github ({len(access.users)} users in {access.path})\n")
+        else:
+            io.stdout(f"Access:    {access.mode}\n")
         await stop.wait()
     finally:
         for sig in handled:
@@ -86,6 +132,69 @@ async def _serve(args: list[str], io: CliIo) -> int:
         await relay.stop()
     io.stdout("squawk relay stopped\n")
     return 0
+
+
+def _access_policy(
+    given: str | None,
+    host: str,
+    trust_forwarded_for: bool,
+    *,
+    allowed_keys: str | None,
+    allowed_users: str | None = None,
+    github_client_id: str | None = None,
+    max_keys_per_user: str | None = None,
+) -> AccessPolicy:
+    """The access policy `--access` asks for. Without `--access`, only a
+    relay that nothing but this machine can reach defaults to open; any
+    other relay must be told who may use it. Raises `AllowedKeysError` or
+    `AllowedUsersError` if the allowed keys or allowed users file cannot be
+    used."""
+    mode: AccessMode | None
+    if given is None:
+        mode = default_access_mode(host, trust_forwarded_for)
+        if mode is None:
+            reason = (
+                "it is behind a proxy (--trust-forwarded-for)"
+                if trust_forwarded_for
+                else f"it listens on {host}, which other machines can reach"
+            )
+            raise ParseArgsError(
+                f"choose who may use this relay with --access open|keys|github: {reason}"
+            )
+    elif given in ACCESS_MODES:
+        mode = given
+    else:
+        raise ParseArgsError(f'"{given}" is not an access mode (open, keys or github)')
+    if allowed_keys is not None and mode != "keys":
+        raise ParseArgsError("--allowed-keys is used only with --access keys")
+    if mode != "github":
+        for option, value in (
+            ("--allowed-users", allowed_users),
+            ("--github-client-id", github_client_id),
+            ("--max-keys-per-user", max_keys_per_user),
+        ):
+            if value is not None:
+                raise ParseArgsError(f"{option} is used only with --access github")
+    if mode == "keys":
+        if allowed_keys is None:
+            raise ParseArgsError("--access keys needs --allowed-keys FILE")
+        return KeysAccess(allowed_keys)
+    if mode == "github":
+        if github_client_id is None or not github_client_id.strip():
+            raise ParseArgsError("--access github needs --github-client-id ID")
+        if allowed_users is None:
+            raise ParseArgsError("--access github needs --allowed-users FILE")
+        max_keys = DEFAULT_MAX_KEYS_PER_USER
+        if max_keys_per_user is not None:
+            if not (max_keys_per_user.isascii() and max_keys_per_user.isdigit()) or (
+                int(max_keys_per_user) < 1
+            ):
+                raise ParseArgsError(f'"{max_keys_per_user}" is not a number of keys (1 or more)')
+            max_keys = int(max_keys_per_user)
+        return GitHubAccess(
+            allowed_users, UrllibGitHub(github_client_id.strip()), max_keys_per_user=max_keys
+        )
+    return OpenAccess()
 
 
 async def save_relay(home: str, url: str | None, *, allow_plain: bool = False) -> bool:
@@ -130,6 +239,7 @@ async def wait_for_relay(home: str, timeout_s: float = CONNECT_WAIT_S) -> RelayS
             if (
                 relay is None
                 or relay["connected"]
+                or relay.get("access_problem") is not None
                 or relay["last_error"] is not None
                 or relay.get("in_use") is False
             ):
@@ -162,6 +272,13 @@ def describe_new_relay(url: str, running: bool, relay: RelayStatus | None) -> st
         )
     elif relay is not None and relay["connected"]:
         lines.append(f"Connected. Relay key: {relay['relay_key']}")
+    elif relay is not None and relay.get("access_problem") == "needs-sign-in":
+        lines.append("This relay needs you to sign in: run `squawk relay login`.")
+    elif relay is not None and relay.get("access_problem") == "not-permitted":
+        lines.append(
+            "This relay does not permit this computer's key; ask the person who runs it. "
+            "The service tries again every 6 hours."
+        )
     elif relay is not None and relay["last_error"] is not None:
         lines.append(
             f"Not connected yet: {relay['last_error']}. The service keeps trying; "
@@ -215,12 +332,16 @@ def format_relay_status(
             connected = "no (the squawk service is not running)"
         else:
             connected = "no"
+        problem = relay.get("access_problem") if running else None
+        note = {"not-permitted": NOT_PERMITTED_TEXT, "needs-sign-in": NEEDS_SIGN_IN_TEXT}.get(
+            problem or ""
+        )
         lines = [
-            f"Relay:           {relay['url']}",
+            f"Relay:           {relay['url']}" + ("" if note is None else f" ({note})"),
             f"Connected:       {connected}",
             f"Relay key:       {relay['relay_key'] or 'unknown (not connected yet)'}",
         ]
-        if not relay["connected"] and running and relay["last_error"] is not None:
+        if not relay["connected"] and running and note is None and relay["last_error"] is not None:
             lines.append(f"Last error:      {relay['last_error']}")
     lines.append(f"Queued outbound: {queued}")
     lines.append(f"Held at relay:   {relayed} (waiting for the recipient's receipt)")
@@ -278,7 +399,9 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
         _status,
     ),
     "serve": Command(
-        "run the relay server (--host, --port, --data, --trust-forwarded-for)", _serve
+        "run the relay server (--host, --port, --data, --trust-forwarded-for, --access,"
+        " --allowed-keys, --allowed-users, --github-client-id, --max-keys-per-user)",
+        _serve,
     ),
 }
 

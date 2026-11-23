@@ -16,9 +16,9 @@ import pytest
 from squawk.cli import run
 from squawk.cli_io import CliIo
 from squawk.cli_messages import format_service_status
-from squawk.cli_relay import relay_data_dir
+from squawk.cli_relay import describe_new_relay, format_relay_status, relay_data_dir
 from squawk.config import db_path
-from squawk.daemon import Daemon, StatusResult
+from squawk.daemon import Daemon, RelayStatus, StatusResult
 from squawk.daemon_control import connect_to_daemon
 from squawk.identity import init_identity
 from squawk.network import NetworkTransport
@@ -64,6 +64,150 @@ async def test_relay_serve_runs_until_stopped(tmp_path: Any) -> None:
     assert "squawk relay stopped\n" in "".join(out)
     assert os.path.exists(os.path.join(data, DB_FILE))
     assert err == []
+
+
+async def test_relay_serve_on_loopback_defaults_to_open_and_says_so(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    data = os.path.join(str(tmp_path), "data")
+    task = asyncio.create_task(run(["relay", "serve", "--port", "0", "--data", data], io))
+    await wait_for_text(out, r"Access: open\. Anyone who can reach this relay can open a mailbox")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+async def test_relay_serve_with_access_open_on_every_address_starts(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--host", "0.0.0.0", "--port", "0", "--data", data]
+    task = asyncio.create_task(run([*args, "--access", "open"], io))
+    await wait_for_text(out, r"Access: open\.")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        (["--host", "0.0.0.0"], "it listens on 0.0.0.0, which other machines can reach"),
+        (["--host", "192.168.1.10"], "it listens on 192.168.1.10"),
+        (["--trust-forwarded-for"], "it is behind a proxy (--trust-forwarded-for)"),
+        (["--host", "::1", "--trust-forwarded-for"], "it is behind a proxy"),
+    ],
+)
+async def test_relay_serve_refuses_to_start_without_access_unless_only_this_machine_can_reach_it(
+    tmp_path: Any, extra: list[str], reason: str
+) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    data = os.path.join(str(tmp_path), "data")
+    assert await run(["relay", "serve", "--port", "0", "--data", data, *extra], io) == 2
+    assert "choose who may use this relay with --access open|keys|github" in "".join(err)
+    assert reason in "".join(err)
+    assert not os.path.exists(data)
+
+
+async def test_relay_serve_refuses_an_unknown_access_mode(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", "--access", "everyone"], io) == 2
+    assert '"everyone" is not an access mode' in "".join(err)
+
+
+async def test_relay_serve_checks_the_allowed_keys_options(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    missing = os.path.join(str(tmp_path), "nope")
+    assert await run(["relay", "serve", "--access", "keys"], io) == 2
+    assert "--access keys needs --allowed-keys FILE" in "".join(err)
+    assert await run(["relay", "serve", "--allowed-keys", missing], io) == 2
+    assert "--allowed-keys is used only with --access keys" in "".join(err)
+    assert await run(["relay", "serve", "--access", "keys", "--allowed-keys", missing], io) == 1
+    assert f"squawk relay serve: cannot read {missing}" in "".join(err)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            ["--access", "github", "--allowed-users", "f"],
+            "--access github needs --github-client-id",
+        ),
+        (
+            ["--access", "github", "--github-client-id", "x"],
+            "--access github needs --allowed-users",
+        ),
+        (["--allowed-users", "f"], "--allowed-users is used only with --access github"),
+        (["--github-client-id", "x"], "--github-client-id is used only with --access github"),
+        (["--max-keys-per-user", "3"], "--max-keys-per-user is used only with --access github"),
+        (
+            ["--access", "keys", "--allowed-keys", "f", "--allowed-users", "f"],
+            "--allowed-users is used only with --access github",
+        ),
+        (
+            ["--access", "github", "--allowed-keys", "f"],
+            "--allowed-keys is used only with --access keys",
+        ),
+        (
+            [
+                "--access",
+                "github",
+                "--github-client-id",
+                "x",
+                "--allowed-users",
+                "f",
+                "--max-keys-per-user",
+                "0",
+            ],
+            '"0" is not a number of keys (1 or more)',
+        ),
+    ],
+)
+async def test_relay_serve_checks_the_github_options(
+    tmp_path: Any, extra: list[str], message: str
+) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", *extra], io) == 2
+    assert message in "".join(err)
+
+
+async def test_relay_serve_in_github_mode_needs_a_readable_users_file(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    users = os.path.join(str(tmp_path), "users")
+    args = ["relay", "serve", "--access", "github", "--github-client-id", "x"]
+    assert await run([*args, "--allowed-users", users], io) == 1
+    assert f"squawk relay serve: cannot read {users}" in "".join(err)
+    with open(users, "w", encoding="utf-8") as file:
+        file.write("alice\nnot a user\n")
+    assert await run([*args, "--allowed-users", users], io) == 1
+    assert f"squawk relay serve: {users}: line 2:" in "".join(err)
+
+
+async def test_relay_serve_in_github_mode_says_how_many_users_it_admits(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    users = os.path.join(str(tmp_path), "users")
+    with open(users, "w", encoding="utf-8") as file:
+        file.write("# the team\nalice\nbob 202\n")
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--port", "0", "--data", data, "--access", "github"]
+    github = ["--github-client-id", "Iv1.abc", "--allowed-users", users]
+    task = asyncio.create_task(run([*args, *github, "--max-keys-per-user", "3"], io))
+    await wait_for_text(out, re.escape(f"Access:    github (2 users in {users})\n"))
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
 
 
 async def test_relay_without_a_subcommand_prints_usage(tmp_path: Any) -> None:
@@ -351,3 +495,35 @@ def test_status_from_a_service_without_relay_fields_prints_no_relay_lines() -> N
     text = format_service_status(cast(StatusResult, status))
     assert "Relay:           wss://relay.example.com  NOT connected\n" in text
     assert "Held at relay:   1 (" in text
+
+
+def test_relay_status_and_set_explain_a_relay_that_does_not_let_this_service_in() -> None:
+    relay: RelayStatus = {
+        "url": "wss://relay.example.net",
+        "connected": False,
+        "relay_key": "K",
+        "last_error": "not permitted by this relay; ask the person who runs it",
+        "access_problem": "not-permitted",
+    }
+    text = format_relay_status(relay, 0, 0, running=True)
+    assert text.startswith(
+        "Relay:           wss://relay.example.net "
+        "(not permitted by this relay; ask the person who runs it)\n"
+    )
+    assert "Last error" not in text
+    said = describe_new_relay("wss://relay.example.net", True, relay)
+    assert "does not permit this computer's key; ask the person who runs it" in said
+
+    relay["access_problem"] = "needs-sign-in"
+    relay["last_error"] = "needs sign-in: run `squawk relay login`"
+    text = format_relay_status(relay, 0, 0, running=True)
+    assert text.startswith(
+        "Relay:           wss://relay.example.net (needs sign-in: run `squawk relay login`)\n"
+    )
+    said = describe_new_relay("wss://relay.example.net", True, relay)
+    assert "This relay needs you to sign in: run `squawk relay login`." in said
+
+    # When the service is not running, what it last saw is not shown as current.
+    assert format_relay_status(relay, 0, 0, running=False).startswith(
+        "Relay:           wss://relay.example.net\n"
+    )
