@@ -30,6 +30,20 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 path = "src/squawk/version.py"
 
+[tool.semantic_release]
+# The release job in .github/workflows/ci.yml runs this on every push to main.
+version_variables = ["src/squawk/version.py:__version__"]
+commit_parser = "conventional"
+tag_format = "v{version}"
+major_on_zero = false
+allow_zero_version = true
+build_command = ""
+commit_message = "chore(release): {version}"
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/squawk"]
 
