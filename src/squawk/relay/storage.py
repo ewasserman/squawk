@@ -1,5 +1,6 @@
 """The relay's SQLite database: its own key, mailboxes, allow lists, waiting
-messages and open invites.
+messages, open invites and, in GitHub mode, the GitHub accounts that signed
+in and the keys each one owns.
 
 Times are milliseconds since the epoch, passed in by the caller so that
 tests can use a fake clock. The database file and SQLite's companion files
@@ -59,6 +60,24 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX invites_creator ON invites (creator);
     """,
+    # GitHub mode (docs/plan/relay-access.md): the GitHub accounts that have
+    # signed in, and which account owns each key that signed in. No tokens.
+    """
+    CREATE TABLE github_users (
+        id                    INTEGER PRIMARY KEY,
+        login                 TEXT NOT NULL,
+        first_signed_in_at_ms INTEGER NOT NULL,
+        last_signed_in_at_ms  INTEGER NOT NULL
+    );
+    CREATE INDEX github_users_login ON github_users (login COLLATE NOCASE);
+
+    CREATE TABLE key_owners (
+        key_id         TEXT PRIMARY KEY,
+        github_user_id INTEGER NOT NULL REFERENCES github_users (id),
+        added_at_ms    INTEGER NOT NULL
+    );
+    CREATE INDEX key_owners_user ON key_owners (github_user_id);
+    """,
 )
 """Schema migrations, applied in order; `PRAGMA user_version` counts those applied."""
 
@@ -80,6 +99,14 @@ class StoredMessage:
 class MailboxUsage:
     messages: int
     bytes: int
+
+
+@dataclass(frozen=True)
+class KeyOwner:
+    """The GitHub account a key belongs to, as last seen when it signed in."""
+
+    github_id: int
+    login: str
 
 
 class RelayStore:
@@ -318,6 +345,58 @@ class RelayStore:
         """Removes every invite. Used at start: an invite lasts only while its
         creator stays connected, and a restart drops every connection."""
         self.db.execute("DELETE FROM invites")
+
+    # GitHub users and the keys they own.
+
+    def key_owner(self, key_id: str) -> KeyOwner | None:
+        """The GitHub account that signed in with `key_id`, if any."""
+        row = self.db.execute(
+            "SELECT u.id, u.login FROM key_owners k JOIN github_users u"
+            " ON u.id = k.github_user_id WHERE k.key_id = ?",
+            (key_id,),
+        ).fetchone()
+        return None if row is None else KeyOwner(int(row[0]), str(row[1]))
+
+    def github_ids_named(self, login: str) -> list[int]:
+        """The ids of the stored GitHub accounts whose login is `login`,
+        ignoring case (GitHub logins are not case-sensitive)."""
+        rows = self.db.execute(
+            "SELECT id FROM github_users WHERE login = ? COLLATE NOCASE ORDER BY id", (login,)
+        )
+        return [int(r[0]) for r in rows]
+
+    def count_keys_of(self, github_id: int) -> int:
+        """How many keys belong to the GitHub account `github_id`."""
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM key_owners WHERE github_user_id = ?", (github_id,)
+        ).fetchone()
+        return int(row[0])
+
+    def record_sign_in(self, key_id: str, github_id: int, login: str, now: int) -> bool:
+        """Records that `key_id` signed in as the GitHub account `github_id`,
+        whose login is now `login`. Returns True if that account had never
+        signed in before."""
+
+        def record() -> bool:
+            known = self.db.execute(
+                "SELECT 1 FROM github_users WHERE id = ?", (github_id,)
+            ).fetchone()
+            self.db.execute(
+                "INSERT INTO github_users"
+                " (id, login, first_signed_in_at_ms, last_signed_in_at_ms) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT (id) DO UPDATE SET login = excluded.login,"
+                " last_signed_in_at_ms = excluded.last_signed_in_at_ms",
+                (github_id, login, now, now),
+            )
+            self.db.execute(
+                "INSERT INTO key_owners (key_id, github_user_id, added_at_ms) VALUES (?, ?, ?)"
+                " ON CONFLICT (key_id) DO UPDATE SET github_user_id = excluded.github_user_id,"
+                " added_at_ms = excluded.added_at_ms",
+                (key_id, github_id, now),
+            )
+            return known is None
+
+        return self.transaction(record)
 
     # Expiry.
 

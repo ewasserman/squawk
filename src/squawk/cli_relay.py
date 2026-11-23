@@ -21,14 +21,18 @@ from squawk.daemon_control import connect_to_daemon
 from squawk.relay import RelayServer
 from squawk.relay.access import (
     ACCESS_MODES,
+    DEFAULT_MAX_KEYS_PER_USER,
     OPEN_WARNING,
     AccessMode,
     AccessPolicy,
     AllowedKeysError,
+    AllowedUsersError,
+    GitHubAccess,
     KeysAccess,
     OpenAccess,
     default_access_mode,
 )
+from squawk.relay.github import UrllibGitHub
 from squawk.relay_client import NEEDS_SIGN_IN_TEXT, NOT_PERMITTED_TEXT, RELAY_URL_KEY
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
@@ -62,6 +66,9 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "trust-forwarded-for": Opt("boolean"),
             "access": Opt("string"),
             "allowed-keys": Opt("string"),
+            "allowed-users": Opt("string"),
+            "github-client-id": Opt("string"),
+            "max-keys-per-user": Opt("string"),
         },
     )
     port_text = string_value(values, "port")
@@ -78,8 +85,11 @@ async def _serve(args: list[str], io: CliIo) -> int:
             host,
             trust_forwarded_for,
             allowed_keys=string_value(values, "allowed-keys"),
+            allowed_users=string_value(values, "allowed-users"),
+            github_client_id=string_value(values, "github-client-id"),
+            max_keys_per_user=string_value(values, "max-keys-per-user"),
         )
-    except AllowedKeysError as err:
+    except (AllowedKeysError, AllowedUsersError) as err:
         io.stderr(f"squawk relay serve: {err}\n")
         return 1
     data_dir = string_value(values, "data") or relay_data_dir(io.env)
@@ -111,6 +121,8 @@ async def _serve(args: list[str], io: CliIo) -> int:
             io.stdout(f"{OPEN_WARNING}\n")
         elif isinstance(access, KeysAccess):
             io.stdout(f"Access:    keys ({len(access.keys)} allowed in {access.path})\n")
+        elif isinstance(access, GitHubAccess):
+            io.stdout(f"Access:    github ({len(access.users)} users in {access.path})\n")
         else:
             io.stdout(f"Access:    {access.mode}\n")
         await stop.wait()
@@ -123,12 +135,20 @@ async def _serve(args: list[str], io: CliIo) -> int:
 
 
 def _access_policy(
-    given: str | None, host: str, trust_forwarded_for: bool, *, allowed_keys: str | None
+    given: str | None,
+    host: str,
+    trust_forwarded_for: bool,
+    *,
+    allowed_keys: str | None,
+    allowed_users: str | None = None,
+    github_client_id: str | None = None,
+    max_keys_per_user: str | None = None,
 ) -> AccessPolicy:
     """The access policy `--access` asks for. Without `--access`, only a
     relay that nothing but this machine can reach defaults to open; any
-    other relay must be told who may use it. Raises `AllowedKeysError` if
-    the allowed keys file cannot be used."""
+    other relay must be told who may use it. Raises `AllowedKeysError` or
+    `AllowedUsersError` if the allowed keys or allowed users file cannot be
+    used."""
     mode: AccessMode | None
     if given is None:
         mode = default_access_mode(host, trust_forwarded_for)
@@ -147,12 +167,33 @@ def _access_policy(
         raise ParseArgsError(f'"{given}" is not an access mode (open, keys or github)')
     if allowed_keys is not None and mode != "keys":
         raise ParseArgsError("--allowed-keys is used only with --access keys")
+    if mode != "github":
+        for option, value in (
+            ("--allowed-users", allowed_users),
+            ("--github-client-id", github_client_id),
+            ("--max-keys-per-user", max_keys_per_user),
+        ):
+            if value is not None:
+                raise ParseArgsError(f"{option} is used only with --access github")
     if mode == "keys":
         if allowed_keys is None:
             raise ParseArgsError("--access keys needs --allowed-keys FILE")
         return KeysAccess(allowed_keys)
-    if mode != "open":
-        raise ParseArgsError(f"--access {mode} is not available yet")
+    if mode == "github":
+        if github_client_id is None or not github_client_id.strip():
+            raise ParseArgsError("--access github needs --github-client-id ID")
+        if allowed_users is None:
+            raise ParseArgsError("--access github needs --allowed-users FILE")
+        max_keys = DEFAULT_MAX_KEYS_PER_USER
+        if max_keys_per_user is not None:
+            if not (max_keys_per_user.isascii() and max_keys_per_user.isdigit()) or (
+                int(max_keys_per_user) < 1
+            ):
+                raise ParseArgsError(f'"{max_keys_per_user}" is not a number of keys (1 or more)')
+            max_keys = int(max_keys_per_user)
+        return GitHubAccess(
+            allowed_users, UrllibGitHub(github_client_id.strip()), max_keys_per_user=max_keys
+        )
     return OpenAccess()
 
 
@@ -359,7 +400,7 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
     ),
     "serve": Command(
         "run the relay server (--host, --port, --data, --trust-forwarded-for, --access,"
-        " --allowed-keys)",
+        " --allowed-keys, --allowed-users, --github-client-id, --max-keys-per-user)",
         _serve,
     ),
 }
