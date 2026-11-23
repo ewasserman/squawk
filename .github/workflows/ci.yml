@@ -16,3 +16,31 @@ jobs:
       - run: uv run ruff format --check
       - run: uv run mypy
       - run: uv run pytest
+
+  # After the checks pass on main, read the conventional-commit subjects since
+  # the last tag and bump the version: fix -> patch, feat -> minor, and a
+  # breaking change (`feat!:` or a `BREAKING CHANGE:` footer) -> minor while the
+  # version is 0.x. It commits the new version and CHANGELOG.md, tags vX.Y.Z and
+  # makes a GitHub release. Commits pushed with GITHUB_TOKEN do not start
+  # another workflow run, so the release commit does not trigger itself.
+  release:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      # Release from the commit that passed the checks, on a local branch named main.
+      - run: git checkout -B main ${{ github.sha }}
+      - uses: python-semantic-release/python-semantic-release@v10.7.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git_committer_name: github-actions
+          git_committer_email: 41898282+github-actions[bot]@users.noreply.github.com
