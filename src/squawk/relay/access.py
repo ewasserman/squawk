@@ -282,11 +282,13 @@ class GitHubAccess:
         return Decision.REFUSED
 
     def _permits(self, login: str, github_id: int) -> bool:
-        """Whether the file lists `login` and, if it pins an id, that id."""
-        if login.lower() not in self.users:
-            return False
-        pinned = self.users[login.lower()]
-        return pinned is None or pinned == github_id
+        """Whether the file admits the GitHub account `github_id`, last seen
+        with the name `login`: a line pins that id (under whatever name, so
+        that renaming the account and its line keeps it admitted), or a line
+        lists `login` without an id."""
+        if github_id in self.users.values():
+            return True
+        return login.lower() in self.users and self.users[login.lower()] is None
 
     async def request_device_code(self) -> DeviceCode:
         """Asks GitHub for a code for the person to enter (raises `GitHubError`)."""
@@ -302,13 +304,18 @@ class GitHubAccess:
         milliseconds since the epoch). Logs why when it may not."""
         store = self.store
         refused = f"refused a sign-in by GitHub user {user.login} (id {user.id})"
+        owner = store.key_owner(key)
+        if owner is not None and owner.github_id != user.id:
+            # Two sign-ins with the same key at once, as different accounts.
+            _log(f"{refused}: key {key} already belongs to GitHub id {owner.github_id}")
+            return False
         if not self._permits(user.login, user.id):
             if user.login.lower() in self.users:
                 _log(f"{refused}: {self.path} gives another id for that name")
             else:
                 _log(f"{refused}: not listed in {self.path}")
             return False
-        if self.users[user.login.lower()] is None:
+        if user.id not in self.users.values():
             others = [i for i in store.github_ids_named(user.login) if i != user.id]
             if others:
                 _log(
@@ -316,16 +323,18 @@ class GitHubAccess:
                     f" to admit this account instead, write its id after the name in {self.path}"
                 )
                 return False
-        if store.count_keys_of(user.id) >= self.max_keys_per_user:
+        if owner is None and store.count_keys_of(user.id) >= self.max_keys_per_user:
             _log(f"{refused}: that user already has {self.max_keys_per_user} keys")
             return False
         first = store.record_sign_in(key, user.id, user.login, now)
-        if first:
+        if first and user.id not in self.users.values():
             _log(
                 f"GitHub user {user.login} signed in for the first time; their GitHub id is"
                 f" {user.id}. To pin it, write {user.login} {user.id} on their line in"
                 f" {self.path}"
             )
+        elif first:
+            _log(f"GitHub user {user.login} (id {user.id}) signed in for the first time")
         else:
             _log(f"GitHub user {user.login} (id {user.id}) signed in with a new key {key}")
         return True

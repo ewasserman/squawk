@@ -416,6 +416,10 @@ class RelayServer:
             user = await self._sign_in(ws, self.access, key, ip)
             if user is None:
                 return
+            if self.access.decide(key) is not Decision.ADMITTED:
+                # The allowed users file changed while the sign-in finished.
+                await ws.close(NOT_PERMITTED_CODE, "not permitted")
+                return
         elif decision is not Decision.ADMITTED:
             await ws.close(NOT_PERMITTED_CODE, "not permitted")
             return
@@ -580,7 +584,9 @@ class RelayServer:
         )
         match await access.wait_for_approval(code):
             case SignedIn(user=user):
-                if self._store is None or not access.admit_signed_in(key, user, self._now()):
+                if self._store is None:
+                    return LOGIN_ERROR, None  # the relay is stopping
+                if not access.admit_signed_in(key, user, self._now()):
                     return LOGIN_NOT_PERMITTED, None
                 return None, user.login
             case SignInDenied():

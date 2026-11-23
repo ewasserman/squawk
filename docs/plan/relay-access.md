@@ -178,7 +178,12 @@ bob              12345678
   changes (checked at least once a minute) and on `SIGHUP`. Keys belonging to
   a user who is no longer listed are refused from then on, and their open
   connections are closed with `4003`. Their mailboxes are deleted along with
-  any messages waiting in them.
+  any messages waiting in them, and the relay forgets which user owned those
+  keys, so they no longer count toward that user's keys; connecting with one
+  again asks for a sign-in, which is refused unless the user is listed again.
+- **Renaming.** A line that pins an id admits that GitHub account under
+  whatever name the line uses, so after someone renames their account the
+  operator changes the name on their line and keeps the id.
 - **A new computer.** The person signs in again from the new computer; that
   key is added to their account, up to `--max-keys-per-user`. The operator
   can remove old keys (see "Administration").

@@ -205,9 +205,12 @@ class RelayStore:
 
     def delete_mailbox(self, key_id: str) -> None:
         """Deletes `key_id`'s mailbox with its allow list, the messages waiting
-        in it and its open invite. Used when a key may no longer use the relay."""
+        in it and its open invite, and forgets which GitHub user owned it (so
+        it no longer counts toward their keys, and its owner can sign in again
+        if they are admitted later). Used when a key may no longer use the relay."""
 
         def delete() -> None:
+            self.db.execute("DELETE FROM key_owners WHERE key_id = ?", (key_id,))
             self.db.execute("DELETE FROM allowed WHERE owner = ?", (key_id,))
             self.db.execute("DELETE FROM messages WHERE recipient = ?", (key_id,))
             self.db.execute("DELETE FROM invites WHERE creator = ?", (key_id,))

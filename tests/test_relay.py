@@ -1764,10 +1764,27 @@ async def test_a_user_taken_out_of_the_file_is_disconnected_and_their_mailboxes_
     assert not relay.store.has_mailbox(alice.id)
     assert relay.store.usage(alice.id, 0).messages == 0
     assert (await b.deposit(alice))["reason"] == "not-allowed"
-    # The key stays refused; it is not asked to sign in again.
+    # The key is forgotten: it counts toward nobody's keys, and its owner is
+    # asked to sign in again (and refused then if still not listed).
+    assert relay.store.key_owner(alice.id) is None
     again = await login(relay, alice, expect_ok=False)
-    assert await close_code(again.ws) == (4003, "not permitted")
+    assert await again.recv() == {"t": "login-required", "provider": "github"}
+    await again.close()
     await b.close()
+
+
+async def test_a_renamed_account_stays_admitted_when_its_id_is_pinned_under_the_new_name(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub
+) -> None:
+    relay = await start_relay(access=github_access(users_file, github))
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    owner = relay.store.key_owner(alice.id)
+    assert owner is not None
+    write_keys(users_file, f"alice-renamed {owner.github_id}", "bob 202")
+    relay.reload_access()
+    await a.allow(bob)  # still connected
+    await a.close()
 
 
 async def test_pinning_another_id_in_the_file_disconnects_the_account_that_signed_in(
