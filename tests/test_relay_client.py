@@ -318,7 +318,7 @@ class CountingKeysAccess(KeysAccess):
 async def test_a_relay_that_refuses_the_key_is_tried_again_only_later(tmp_path: object) -> None:
     keys_file = os.path.join(str(tmp_path), "allowed-keys")
     with open(keys_file, "w", encoding="utf-8") as file:
-        file.write("# nobody yet\n")
+        file.write(f"{make_key_id()} someone else\n")
     access = CountingKeysAccess(keys_file)
     relay = RelayServer(os.path.join(str(tmp_path), "relay"), port=0, access=access)
     await relay.start()

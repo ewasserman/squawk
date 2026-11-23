@@ -190,11 +190,15 @@ own reference; text after `#` is ignored. Reread on change and on `SIGHUP`,
 as above. A key no longer listed is refused, its connection closed, and its
 mailbox deleted.
 
-If the file cannot be read, or has a line that does not start with a key id,
-the relay refuses to start; once running, it keeps the keys it read before
-and logs why. A half-saved or mistyped file then changes nothing, instead of
-locking people out and deleting their mailboxes. Starting in `keys` mode
-deletes the mailboxes of keys that are not listed.
+If the file cannot be read, has a line that does not start with a key id,
+or lists no keys, the relay refuses to start. Once running, it rereads the
+file every 20 seconds. Keys added are admitted at once. Keys taken out are
+refused only when two readings in a row agree (or at once on `SIGHUP`),
+because an editor may leave the file empty or cut short for a moment while
+saving it, and a removal deletes mailboxes. A file that cannot be read or has
+a bad line leaves the keys read before in place, and the relay logs why.
+Mailboxes are deleted only when a key is taken out while the relay runs;
+starting the relay never deletes any.
 
 ## What the relay stores (additions)
 

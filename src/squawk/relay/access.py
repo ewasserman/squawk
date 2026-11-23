@@ -9,9 +9,7 @@ key. The operator chooses the policy with `squawk relay serve --access`:
 """
 
 import ipaddress
-import os
 import sys
-from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Protocol, get_args
 
@@ -45,10 +43,12 @@ class AccessPolicy(Protocol):
         """Whether `key` may use the relay."""
         ...
 
-    def reload(self) -> bool:
-        """Rereads whatever the policy is based on, if it changed. Returns
-        True if the policy's answers may have changed; the relay then closes
-        the connections and deletes the mailboxes of keys now refused."""
+    def reload(self, force: bool = False) -> bool:
+        """Rereads whatever the policy is based on. Returns True if the
+        policy's answers may have changed; the relay then closes the
+        connections and deletes the mailboxes of keys now refused. A policy
+        may wait for a second reading before refusing keys it admitted
+        before; `force` (the operator sent SIGHUP) applies the change at once."""
         ...
 
 
@@ -62,26 +62,12 @@ class OpenAccess:
     def decide(self, key: str) -> Decision:
         return Decision.ADMITTED
 
-    def reload(self) -> bool:
+    def reload(self, force: bool = False) -> bool:
         return False
 
 
 class AllowedKeysError(Exception):
     """The allowed keys file cannot be read or has lines that are not keys."""
-
-
-@dataclass(frozen=True)
-class _FileVersion:
-    """Enough about a file to notice that it changed."""
-
-    inode: int
-    size: int
-    mtime_ns: int
-
-
-def _file_version(path: str) -> _FileVersion:
-    st = os.stat(path)
-    return _FileVersion(st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def parse_allowed_keys(text: str) -> dict[str, str]:
@@ -121,15 +107,22 @@ def read_allowed_keys(path: str) -> dict[str, str]:
 class KeysAccess:
     """Admits the keys listed in a file and refuses every other key.
 
-    `reload` rereads the file when it has changed. If the new version cannot
-    be read or has a line that is not a key, the relay keeps using the keys
-    it last read and logs why: a half-saved or mistyped file then changes
-    nothing, instead of locking people out and deleting their mailboxes."""
+    `reload` rereads the file and compares what it lists with the keys in
+    use. Keys added to the file are admitted at once. Taking keys out is
+    applied only when two checks in a row read the same list (or when the
+    operator asks with SIGHUP), because an editor saving the file may leave
+    it empty or cut short for a moment, and a removal closes connections and
+    deletes mailboxes. If the file cannot be read or has a line that is not
+    a key, the relay keeps the keys it read before and logs why."""
 
     def __init__(self, path: str) -> None:
         self.path = path
-        self._version = _file_version_or_none(path)
         self.keys = read_allowed_keys(path)
+        if not self.keys:
+            raise AllowedKeysError(f"{path} lists no keys, so the relay would refuse everyone")
+        self._pending: dict[str, str] | None = None
+        """A list that takes keys out, read at the last check and not yet applied."""
+        self._last_problem: str | None = None
 
     @property
     def mode(self) -> AccessMode:
@@ -138,31 +131,28 @@ class KeysAccess:
     def decide(self, key: str) -> Decision:
         return Decision.ADMITTED if key in self.keys else Decision.REFUSED
 
-    def reload(self) -> bool:
-        version = _file_version_or_none(self.path)
-        if version == self._version:
-            return False
+    def reload(self, force: bool = False) -> bool:
         try:
             keys = read_allowed_keys(self.path)
         except AllowedKeysError as err:
-            _log(f"keeping the allowed keys read before: {err}")
-            self._version = version
+            if str(err) != self._last_problem:
+                _log(f"keeping the allowed keys read before: {err}")
+            self._last_problem = str(err)
+            self._pending = None
             return False
-        self._version = version
+        self._last_problem = None
         if keys == self.keys:
+            self._pending = None
             return False
-        added = len(keys.keys() - self.keys.keys())
         removed = len(self.keys.keys() - keys.keys())
+        if removed and not force and keys != self._pending:
+            self._pending = keys
+            return False
+        self._pending = None
+        added = len(keys.keys() - self.keys.keys())
         _log(f"reread {self.path}: {len(keys)} keys ({added} added, {removed} removed)")
         self.keys = keys
         return True
-
-
-def _file_version_or_none(path: str) -> _FileVersion | None:
-    try:
-        return _file_version(path)
-    except OSError:
-        return None
 
 
 def _log(text: str) -> None:

@@ -223,7 +223,6 @@ class RelayServer:
         self.identity = identity_from_secret_key("relay", store.secret_key())
         store.delete_all_invites()
         self.purge()
-        self._enforce_access()
         self._server = await serve(
             self._handle,
             self._host,
@@ -308,16 +307,25 @@ class RelayServer:
         while True:
             await asyncio.sleep(self.limits.access_check_interval_s)
             try:
-                self.reload_access()
+                self.reload_access(force=False)
             except Exception as err:
                 _log(f"checking the access file failed: {type(err).__name__}: {err}")
 
-    def reload_access(self) -> None:
-        """Has the access policy reread its file if it changed (the relay does
-        this every `access_check_interval_s` and on SIGHUP), then closes the
-        connections and deletes the mailboxes of keys it now refuses."""
-        if self.access.reload():
+    def reload_access(self, force: bool = True) -> None:
+        """Has the access policy reread its file, then closes the connections
+        and deletes the mailboxes of keys it now refuses. The relay does this
+        every `access_check_interval_s` with `force` False, so that taking
+        keys out waits for a second reading of the file; SIGHUP and other
+        explicit requests apply the file at once."""
+        if self.access.reload(force):
             self._enforce_access()
+
+    def reload_access_logged(self) -> None:
+        """`reload_access` for a signal handler: logs a failure instead of raising."""
+        try:
+            self.reload_access()
+        except Exception as err:
+            _log(f"rereading the access file failed: {type(err).__name__}: {err}")
 
     def _enforce_access(self) -> None:
         refused = Decision.REFUSED

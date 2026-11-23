@@ -1266,7 +1266,7 @@ async def test_the_relay_notices_a_changed_file_by_itself(
     assert await close_code(a.ws) == (4003, "not permitted")
 
 
-async def test_starting_in_keys_mode_deletes_the_mailboxes_of_keys_not_listed(
+async def test_starting_in_keys_mode_deletes_no_mailboxes(
     start_relay: RelayFactory, keys_file: str, data_dir: str
 ) -> None:
     store = RelayStore.open(data_dir)
@@ -1274,7 +1274,42 @@ async def test_starting_in_keys_mode_deletes_the_mailboxes_of_keys_not_listed(
     store.touch_mailbox(bob.id, START_MS)
     store.close()
     relay = await start_relay(access=KeysAccess(keys_file))
-    assert relay.store.mailbox_keys() == [alice.id]
+    assert sorted(relay.store.mailbox_keys()) == sorted([alice.id, bob.id])
+
+
+def test_a_file_that_lists_no_keys_is_refused_at_start(tmp_path: Any) -> None:
+    path = os.path.join(str(tmp_path), "allowed-keys")
+    write_keys(path, "# nobody", "")
+    with pytest.raises(AllowedKeysError, match="lists no keys"):
+        KeysAccess(path)
+
+
+def test_taking_keys_out_waits_for_two_readings_that_agree(keys_file: str) -> None:
+    access = KeysAccess(keys_file)
+    write_keys(keys_file, "")  # an editor emptied the file while saving it
+    assert access.reload() is False
+    write_keys(keys_file, alice.id, bob.id)  # and then wrote it out
+    assert access.reload() is True  # adding a key is applied at once
+    assert access.decide(bob.id) is Decision.ADMITTED
+    write_keys(keys_file, bob.id)
+    assert access.reload() is False
+    assert access.decide(alice.id) is Decision.ADMITTED
+    assert access.reload() is True  # the second reading agrees
+    assert access.decide(alice.id) is Decision.REFUSED
+
+
+def test_sighup_applies_a_removal_at_once_even_when_size_and_time_are_unchanged(
+    keys_file: str,
+) -> None:
+    write_keys(keys_file, alice.id)
+    access = KeysAccess(keys_file)
+    stat_before = os.stat(keys_file)
+    with open(keys_file, "w", encoding="utf-8") as file:
+        file.write(f"{bob.id}\n")  # a key of the same length
+    os.utime(keys_file, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    assert access.reload(force=True) is True
+    assert access.decide(alice.id) is Decision.REFUSED
+    assert access.decide(bob.id) is Decision.ADMITTED
 
 
 async def test_sighup_rereads_the_allowed_keys_file(tmp_path: Any, keys_file: str) -> None:

@@ -448,9 +448,11 @@ class RelayClient:
 
     async def _wait_before_retry(self, ms: float) -> None:
         """Waits `ms` milliseconds, or until `retry_now` is called."""
-        self._retry_now.clear()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._retry_now.wait(), ms / 1000)
+        # Cleared after the wait, so that a request made during the
+        # connection attempt before it is not lost.
+        self._retry_now.clear()
 
     def _disconnected(self) -> None:
         self._ready = False

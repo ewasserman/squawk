@@ -101,7 +101,7 @@ async def _serve(args: list[str], io: CliIo) -> int:
                 handled.append(sig)
     # SIGHUP rereads the allowed keys or allowed users file.
     with contextlib.suppress(NotImplementedError, RuntimeError, AttributeError):
-        loop.add_signal_handler(signal.SIGHUP, relay.reload_access)
+        loop.add_signal_handler(signal.SIGHUP, relay.reload_access_logged)
         handled.append(signal.SIGHUP)
     try:
         io.stdout(f"squawk relay listening on ws://{host}:{relay.port}\n")
