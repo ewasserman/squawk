@@ -1,22 +1,30 @@
 # squawk
 
-Squawk lets Claude Code sessions on different machines on the same local
-network send messages to each other, so that two people's assistants can
-exchange questions and answers.
+Squawk lets Claude Code sessions on different machines send messages to
+each other, so that two people's assistants can exchange questions and
+answers. The machines can be on the same local network, or on different
+networks connected through a relay server.
 
-Each machine runs a small background service (`squawkd`). Services find each
-other on the local network with mDNS, people pair them once by comparing a
-6-digit code, and after that every message is signed by its sender and
-encrypted for its recipient. Claude sends with the `squawk` command; you see
-each message in a dialog before it goes. Incoming messages are written
+Each machine runs a small background service (`squawkd`). Services reach
+each other in two ways:
+
+- **On the same local network**, they find each other with mDNS and connect
+  directly. Nothing else is needed.
+- **On different networks**, each service keeps a connection open to a relay
+  server that both people use. The relay holds sealed messages until the
+  recipient's service fetches them, and cannot read them.
+
+Either way, people pair their services once by comparing a 6-digit code, and
+after that every message is signed by its sender and encrypted for its
+recipient. Claude sends with the `squawk` command; you see each message in a
+dialog before it goes. Incoming messages are written
 straight into the right Claude Code session through Claude Code's own
 messaging between sessions, so you start Claude as usual, with no extra
 flags.
 
-People on different networks can use a relay server instead: each service
-connects out to the relay, which holds sealed messages until the recipient
-fetches them. The relay cannot read them. When both people are on the same
-network, messages still go directly. See "Contacts on other networks" below.
+A service can use both routes at once. Each message is tried over the local
+network first and goes through the relay only when the recipient cannot be
+reached directly. See "Contacts on other networks" below.
 
 Security design: [docs/plan/security.md](docs/plan/security.md).
 Step-by-step guide for trying it with a colleague:
@@ -25,8 +33,10 @@ Step-by-step guide for trying it with a colleague:
 ## Quickstart
 
 Requires macOS, [uv](https://docs.astral.sh/uv/) and Claude Code 2.1.224 or
-later. Both people do this on their own Mac; the Macs must be on the same
-network.
+later. Both people do this on their own Mac. The steps below are for two Macs
+on the same local network; if you are on different networks, follow step 1,
+then pair as in "Contacts on other networks" instead of step 2, then carry on
+with step 3.
 
 1. Install and set up (once per Mac):
 
@@ -40,7 +50,8 @@ network.
    every session registers itself with squawk, and installs a squawk skill
    that tells Claude how to use it.
 
-2. Pair, once per colleague. One of you waits, the other connects:
+2. Pair, once per colleague, on the same local network. One of you waits,
+   the other connects:
 
    ```bash
    squawk pair --accept         # Bob
@@ -65,11 +76,13 @@ network.
 
 ## Contacts on other networks
 
-When your colleague is not on your local network, both services connect to
-the same relay server and pair with a one-time invite code:
+When your colleague is not on your local network, both of your services use
+the same relay server (see "Running a relay" below for where one comes
+from). Set it once on each Mac, then pair with a one-time invite code:
 
 ```bash
 squawk relay set wss://relay.example.com   # both people, once
+squawk relay status                        # "Connected: yes"
 squawk invite                              # Alice: prints a code
 squawk pair --code <code>                  # Bob, within 10 minutes
 ```
@@ -79,12 +92,23 @@ a 6-digit code to compare, as in the Quickstart, but compare them on a call
 where you can hear or see each other, never in a chat message: the relay
 passed the pairing along and could be interfering.
 
-After pairing, messages, replies and `squawk sessions Bob` work as on the
-local network. Each message is tried over the local network first, then
-through the relay. If Bob's service is not running, the message waits at the
-relay for up to 7 days; `squawk send` says "waiting at the relay", and
-`squawk status` counts it under "Held at relay" until Bob's service fetches
-it and sends back a signed receipt.
+`squawk setup --relay <url>` sets the relay during setup instead. A relay URL
+must start with `wss://` (encrypted with TLS); a plain `ws://` URL is
+accepted only with `--allow-plain`, for testing.
+
+The invite code works once. Pairing through the relay is needed only when
+you cannot pair on the local network; a contact paired on the local network
+is also reached through the relay later, as long as you both use the same
+relay.
+
+After pairing, messages, replies, `squawk sessions Bob` and the session and
+policy settings below work exactly as on the local network. `squawk contacts`
+shows the route to each contact (local network or relay). If Bob's service
+is not running, the message waits at the relay for up to 7 days; `squawk
+send` says "waiting at the relay", and `squawk status` and `squawk relay
+status` count it under "Held at relay" until Bob's service fetches it and
+sends back a signed receipt. `squawk sessions Bob` says Bob is offline when
+their service is neither on your network nor connected to the relay.
 
 The relay stores only sealed messages it cannot open, and accepts messages
 for you only from your paired contacts. It does see who talks to whom and
@@ -92,9 +116,50 @@ when, and your IP address. Details:
 [docs/plan/security.md](docs/plan/security.md) (threats 9 to 17) and the
 protocol in [docs/plan/relay.md](docs/plan/relay.md).
 
-There is no public relay yet. To try one on your own network, see "A relay
-for local testing" below and the relay section of the
-[setup guide](docs/setup-guide.md).
+`squawk relay set --off` stops using the relay.
+
+## Running a relay
+
+There is no public relay yet, so for now someone runs one. The relay is the
+same `squawk` package, run as a server: `squawk relay serve` (options
+`--host`, `--port`, `--data`, `--trust-forwarded-for`), or the Docker image
+built from this repository. It keeps its key, mailboxes and waiting messages
+in SQLite in its data directory. `GET /healthz` on its port answers
+`{"status":"ok","version":"..."}`.
+
+**On one machine, for testing.** From a clone of this repository:
+
+```bash
+docker compose up -d relay     # listens on ws://localhost:8765
+curl localhost:8765/healthz
+squawk relay set ws://localhost:8765 --allow-plain
+```
+
+Without Docker, `uv run squawk relay serve` runs the same server from the
+sources. In Docker the data is kept in the `relay-data` volume, so it
+survives `docker compose restart relay`; `docker compose down -v` deletes it.
+
+**Shared on your network, for a trial with a colleague.** Start it with
+`SQUAWK_RELAY_BIND=0.0.0.0 docker compose up -d relay` so that other machines
+can connect, and have both people run
+`squawk relay set ws://<that machine's address>:8765 --allow-plain`. To make
+sure messages really go through the relay rather than directly, start each
+service with discovery on the local network turned off:
+`squawk daemon stop && SQUAWK_NO_MDNS=1 squawk daemon start`. The
+[setup guide](docs/setup-guide.md) (step 7) walks through this.
+
+**Reachable from the internet.** The relay process speaks plain WebSocket, so
+put it behind a reverse proxy that terminates TLS, and give people the
+`wss://` address. Start the relay with `--trust-forwarded-for` so that its
+per-address rate limits use the client address from the proxy's
+`X-Forwarded-For` header; without a proxy, leave that option off, or a client
+could claim any address. Limits, storage and the protocol are described in
+[docs/plan/relay.md](docs/plan/relay.md). This setup has not been tried yet:
+so far the relay has been tested only on one machine
+([docs/plan/relay-trial.md](docs/plan/relay-trial.md)).
+
+Plain `ws://` is for testing only. Messages are still sealed end to end, but
+anyone on the network path can see who talks to whom and when.
 
 ## Which session gets a message
 
@@ -188,8 +253,9 @@ squawk uninstall         # remove the hooks and skill (--purge also deletes ~/.c
 
 macOS may ask whether your terminal (or Python) may "find and connect to
 devices on your local network". Allow it, or squawk cannot reach other
-machines. To check later: System Settings → Privacy & Security → Local
-Network.
+machines on your network, including a relay running on one of them. To
+check later: System Settings → Privacy & Security → Local Network. A relay
+on the internet does not need this permission.
 
 ## Development
 
@@ -205,34 +271,7 @@ uv run squawk <command>   # the CLI from the sources
 ```
 
 Set `SQUAWK_HOME` to use a different directory than `~/.config/squawk`, for
-example to run two services on one machine.
-
-### A relay for local testing
-
-Services on different networks exchange messages through a relay server
-(see [docs/plan/relay.md](docs/plan/relay.md)). To run one locally in
-Docker:
-
-```bash
-docker compose up relay        # add -d to run it in the background
-curl localhost:8765/healthz    # {"status":"ok","version":"..."}
-```
-
-It listens on `ws://localhost:8765`, on this machine only (start it with
-`SQUAWK_RELAY_BIND=0.0.0.0 docker compose up relay` to let other machines
-on the network use it), and keeps its data (its key, mailboxes
-and waiting messages) in the `relay-data` Docker volume, so it survives
-`docker compose restart relay`. `docker compose down -v` deletes the data.
-
-Without Docker, `uv run squawk relay serve` runs the same server from the
-sources (`--host`, `--port`, `--data`).
-
-The local relay is plain `ws://`, not encrypted with TLS. A service refuses
-a `ws://` relay URL unless you allow it explicitly with `--allow-plain` when
-setting the relay. Messages are still sealed end to end; what plain `ws://`
-exposes is who talks to whom. A deployed relay uses `wss://`.
-
-Point a service at the local relay with
-`uv run squawk relay set ws://localhost:8765 --allow-plain` (or
-`squawk setup --relay ws://localhost:8765 --allow-plain`), then check the
-connection with `uv run squawk relay status`.
+example to run two services on one machine. With `SQUAWK_NO_MDNS=1` set when
+the service starts, it does not use the local network, so two services on
+one machine reach each other only through a relay (see "Running a relay"
+above). The end-to-end relay tests are in `tests/test_e2e_relay.py`.
