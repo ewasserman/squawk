@@ -16,9 +16,9 @@ import pytest
 from squawk.cli import run
 from squawk.cli_io import CliIo
 from squawk.cli_messages import format_service_status
-from squawk.cli_relay import relay_data_dir
+from squawk.cli_relay import describe_new_relay, format_relay_status, relay_data_dir
 from squawk.config import db_path
-from squawk.daemon import Daemon, StatusResult
+from squawk.daemon import Daemon, RelayStatus, StatusResult
 from squawk.daemon_control import connect_to_daemon
 from squawk.identity import init_identity
 from squawk.network import NetworkTransport
@@ -418,3 +418,35 @@ def test_status_from_a_service_without_relay_fields_prints_no_relay_lines() -> N
     text = format_service_status(cast(StatusResult, status))
     assert "Relay:           wss://relay.example.com  NOT connected\n" in text
     assert "Held at relay:   1 (" in text
+
+
+def test_relay_status_and_set_explain_a_relay_that_does_not_let_this_service_in() -> None:
+    relay: RelayStatus = {
+        "url": "wss://relay.example.net",
+        "connected": False,
+        "relay_key": "K",
+        "last_error": "not permitted by this relay; ask the person who runs it",
+        "access_problem": "not-permitted",
+    }
+    text = format_relay_status(relay, 0, 0, running=True)
+    assert text.startswith(
+        "Relay:           wss://relay.example.net "
+        "(not permitted by this relay; ask the person who runs it)\n"
+    )
+    assert "Last error" not in text
+    said = describe_new_relay("wss://relay.example.net", True, relay)
+    assert "does not permit this computer's key; ask the person who runs it" in said
+
+    relay["access_problem"] = "needs-sign-in"
+    relay["last_error"] = "needs sign-in: run `squawk relay login`"
+    text = format_relay_status(relay, 0, 0, running=True)
+    assert text.startswith(
+        "Relay:           wss://relay.example.net (needs sign-in: run `squawk relay login`)\n"
+    )
+    said = describe_new_relay("wss://relay.example.net", True, relay)
+    assert "This relay needs you to sign in: run `squawk relay login`." in said
+
+    # When the service is not running, what it last saw is not shown as current.
+    assert format_relay_status(relay, 0, 0, running=False).startswith(
+        "Relay:           wss://relay.example.net\n"
+    )

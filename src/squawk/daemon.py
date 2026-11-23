@@ -306,6 +306,10 @@ class RelayStatus(TypedDict):
     """The relay's key id, from the last time it connected; None if it never has."""
     last_error: str | None
     """Why the last connection attempt failed or the connection dropped, if it did."""
+    access_problem: NotRequired[str | None]
+    """`not-permitted` while the relay refuses this service's key,
+    `needs-sign-in` while it wants the key's owner to sign in
+    (`squawk relay login`); absent otherwise."""
     in_use: NotRequired[bool]
     """False when the relay is set but the service is not using it (it has no
     network, or the stored URL no longer passes the checks). Absent means True."""
@@ -1077,12 +1081,15 @@ class Daemon:
         when no relay is set."""
         relay = self.transport.relay
         if relay is not None:
-            return {
+            status: RelayStatus = {
                 "url": relay.url,
                 "connected": relay.connected,
                 "relay_key": relay.relay_key,
                 "last_error": relay.last_error,
             }
+            if relay.access_problem is not None:
+                status["access_problem"] = relay.access_problem
+            return status
         from squawk.relay_client import RELAY_URL_KEY
 
         url = self.store.get_setting(RELAY_URL_KEY)

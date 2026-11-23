@@ -2,9 +2,13 @@
 
 The service keeps one WebSocket connection to the relay it is set to use,
 and reconnects with backoff (1 second, doubling to at most 5 minutes, with
-random jitter) when it drops. After proving its key, it sends its allow
-list (its paired, unblocked contacts) and asks for waiting messages; from
-then on the relay pushes each new message as it arrives. The allow list is
+random jitter) when it drops. A relay that does not admit its key (close
+code 4003) or wants its owner to sign in (`login-required`) is tried again
+only every 6 hours, or at once when `retry_now` is called.
+
+After proving its key, it sends its allow list (its paired, unblocked
+contacts) and asks for waiting messages; from then on the relay pushes each
+new message as it arrives. The allow list is
 sent again whenever the contacts change.
 
 For each message the relay delivers, the client:
@@ -46,7 +50,7 @@ import contextlib
 import random
 import sys
 from collections.abc import Callable, Coroutine
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
@@ -68,6 +72,7 @@ from squawk.envelope import (
     seal,
 )
 from squawk.network import LinkError, auth_message
+from squawk.relay.access import NOT_PERMITTED_CODE
 from squawk.relay_url import check_relay_url
 
 if TYPE_CHECKING:
@@ -80,6 +85,17 @@ RELAY_ALLOW_PLAIN_KEY = "relay_allow_plain"
 """Setting key holding "on" when the person allowed a plain ws:// relay URL."""
 
 PROTOCOL_VERSION = 1
+
+AccessProblem = Literal["not-permitted", "needs-sign-in"]
+"""Why a relay that is reachable does not let this service in
+(docs/plan/relay-access.md, "The client")."""
+
+NOT_PERMITTED_TEXT = "not permitted by this relay; ask the person who runs it"
+NEEDS_SIGN_IN_TEXT = "needs sign-in: run `squawk relay login`"
+
+REFUSED_RETRY_MS = 6 * 60 * 60_000
+"""How long the client waits before trying a relay that refused its key
+again, in case the operator admitted it in the meantime."""
 _MAX_FRAME = 1 << 20
 
 PERMANENT_REFUSALS = frozenset({"malformed", "sender-mismatch", "too-large"})
@@ -91,6 +107,14 @@ relay yet, or has not added us to its allow list yet."""
 
 def _log(text: str) -> None:
     print(f"squawkd: relay: {text}", file=sys.stderr, flush=True)
+
+
+class _AccessRefused(LinkError):
+    """The relay will not let this service's key in until something changes."""
+
+    def __init__(self, problem: AccessProblem) -> None:
+        super().__init__(NOT_PERMITTED_TEXT if problem == "not-permitted" else NEEDS_SIGN_IN_TEXT)
+        self.problem: AccessProblem = problem
 
 
 class RelayRefused(LinkError):
@@ -213,12 +237,19 @@ class RelayClient:
         backoff_min_ms: int = 1_000,
         backoff_max_ms: int = 5 * 60_000,
         allow_check_interval_ms: int = 1_000,
+        refused_retry_ms: int = REFUSED_RETRY_MS,
     ) -> None:
         self.url = check_relay_url(url, allow_plain=allow_plain)
         self._request_timeout_ms = request_timeout_ms
         self._backoff_min_ms = backoff_min_ms
         self._backoff_max_ms = backoff_max_ms
         self._allow_check_interval_ms = allow_check_interval_ms
+        self._refused_retry_ms = refused_retry_ms
+        self._retry_now = asyncio.Event()
+        self.access_problem: AccessProblem | None = None
+        """Set while the relay refuses this service's key or wants its owner
+        to sign in; the client then tries again only every
+        `refused_retry_ms` or when `retry_now` is called."""
         self._daemon: Daemon | None = None
         self._guard: ReplayGuard | None = None
         self._ws: ClientConnection | None = None
@@ -262,6 +293,10 @@ class RelayClient:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._ws.close(1001, "shutting down"), 2)
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def retry_now(self) -> None:
+        """Ends the wait before the next connection attempt."""
+        self._retry_now.set()
 
     @property
     def connected(self) -> bool:
@@ -368,6 +403,8 @@ class RelayClient:
         delay = self._backoff_min_ms
         while not self._stopped:
             was_ready = False
+            problem: AccessProblem | None = None
+            ws: ClientConnection | None = None
             try:
                 async with connect(
                     self.url,
@@ -384,17 +421,36 @@ class RelayClient:
                 self.last_error = "the relay closed the connection"
             except asyncio.CancelledError:
                 raise
+            except _AccessRefused as err:
+                problem = err.problem
             except Exception as err:
                 self.last_error = str(err) or type(err).__name__
             finally:
                 self._disconnected()
+            if ws is not None and ws.close_code == NOT_PERMITTED_CODE:
+                problem = "not-permitted"
             if self._stopped:
                 return
+            self.access_problem = problem
+            if problem is not None:
+                self.last_error = str(_AccessRefused(problem))
+                _log(
+                    f"{self.last_error}; trying again in {self._refused_retry_ms // 60_000} minutes"
+                )
+                await self._wait_before_retry(self._refused_retry_ms)
+                delay = self._backoff_min_ms
+                continue
             if was_ready:
                 delay = self._backoff_min_ms
             _log(f"disconnected ({self.last_error}); trying again")
-            await asyncio.sleep(delay * random.uniform(0.8, 1.2) / 1000)
+            await self._wait_before_retry(delay * random.uniform(0.8, 1.2))
             delay = min(delay * 2, self._backoff_max_ms)
+
+    async def _wait_before_retry(self, ms: float) -> None:
+        """Waits `ms` milliseconds, or until `retry_now` is called."""
+        self._retry_now.clear()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._retry_now.wait(), ms / 1000)
 
     def _disconnected(self) -> None:
         self._ready = False
@@ -432,11 +488,19 @@ class RelayClient:
                 {"t": "auth", "v": PROTOCOL_VERSION, "key": identity.id, "sig": to_base64url(sig)}
             )
         )
-        ok = _parse(await asyncio.wait_for(ws.recv(), timeout))
+        try:
+            ok = _parse(await asyncio.wait_for(ws.recv(), timeout))
+        except ConnectionClosed as err:
+            if err.rcvd is not None and err.rcvd.code == NOT_PERMITTED_CODE:
+                raise _AccessRefused("not-permitted") from err
+            raise
+        if ok.get("t") == "login-required":
+            raise _AccessRefused("needs-sign-in")
         if ok.get("t") != "ok":
             raise LinkError("the relay did not accept our key")
         self.relay_key = key
         self.last_error = None
+        self.access_problem = None
 
     async def _session(self, ws: ClientConnection) -> None:
         reader = asyncio.ensure_future(self._read(ws))

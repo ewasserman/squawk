@@ -29,7 +29,7 @@ from squawk.relay.access import (
     OpenAccess,
     default_access_mode,
 )
-from squawk.relay_client import RELAY_URL_KEY
+from squawk.relay_client import NEEDS_SIGN_IN_TEXT, NOT_PERMITTED_TEXT, RELAY_URL_KEY
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
 from squawk.store import Store
@@ -198,6 +198,7 @@ async def wait_for_relay(home: str, timeout_s: float = CONNECT_WAIT_S) -> RelayS
             if (
                 relay is None
                 or relay["connected"]
+                or relay.get("access_problem") is not None
                 or relay["last_error"] is not None
                 or relay.get("in_use") is False
             ):
@@ -230,6 +231,13 @@ def describe_new_relay(url: str, running: bool, relay: RelayStatus | None) -> st
         )
     elif relay is not None and relay["connected"]:
         lines.append(f"Connected. Relay key: {relay['relay_key']}")
+    elif relay is not None and relay.get("access_problem") == "needs-sign-in":
+        lines.append("This relay needs you to sign in: run `squawk relay login`.")
+    elif relay is not None and relay.get("access_problem") == "not-permitted":
+        lines.append(
+            "This relay does not permit this computer's key; ask the person who runs it. "
+            "The service tries again every 6 hours."
+        )
     elif relay is not None and relay["last_error"] is not None:
         lines.append(
             f"Not connected yet: {relay['last_error']}. The service keeps trying; "
@@ -283,12 +291,16 @@ def format_relay_status(
             connected = "no (the squawk service is not running)"
         else:
             connected = "no"
+        problem = relay.get("access_problem") if running else None
+        note = {"not-permitted": NOT_PERMITTED_TEXT, "needs-sign-in": NEEDS_SIGN_IN_TEXT}.get(
+            problem or ""
+        )
         lines = [
-            f"Relay:           {relay['url']}",
+            f"Relay:           {relay['url']}" + ("" if note is None else f" ({note})"),
             f"Connected:       {connected}",
             f"Relay key:       {relay['relay_key'] or 'unknown (not connected yet)'}",
         ]
-        if not relay["connected"] and running and relay["last_error"] is not None:
+        if not relay["connected"] and running and note is None and relay["last_error"] is not None:
             lines.append(f"Last error:      {relay['last_error']}")
     lines.append(f"Queued outbound: {queued}")
     lines.append(f"Held at relay:   {relayed} (waiting for the recipient's receipt)")
