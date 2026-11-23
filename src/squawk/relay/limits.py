@@ -74,6 +74,15 @@ class RelayLimits:
     access_check_interval_s: float = 30.0
     """How often the relay checks whether its allowed keys or allowed users
     file changed (docs/plan/relay-access.md asks for at least once a minute)."""
+    # Signing in with GitHub (the limits in docs/plan/relay-access.md).
+    login_start_timeout_s: float = 30.0
+    """How long a client has to send `login-start` after `login-required`."""
+    sign_in_rate_per_ip: Rate = field(default_factory=lambda: Rate(10, HOUR_MS))
+    """Sign-ins started from one IP address."""
+    max_sign_ins_per_ip: int = 2
+    """Sign-ins in progress at once from one IP address."""
+    max_sign_ins: int = 20
+    """Sign-ins in progress at once on the whole relay."""
 
 
 class RateLimiter:

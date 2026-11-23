@@ -133,6 +133,83 @@ async def test_relay_serve_checks_the_allowed_keys_options(tmp_path: Any) -> Non
     assert f"squawk relay serve: cannot read {missing}" in "".join(err)
 
 
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            ["--access", "github", "--allowed-users", "f"],
+            "--access github needs --github-client-id",
+        ),
+        (
+            ["--access", "github", "--github-client-id", "x"],
+            "--access github needs --allowed-users",
+        ),
+        (["--allowed-users", "f"], "--allowed-users is used only with --access github"),
+        (["--github-client-id", "x"], "--github-client-id is used only with --access github"),
+        (["--max-keys-per-user", "3"], "--max-keys-per-user is used only with --access github"),
+        (
+            ["--access", "keys", "--allowed-keys", "f", "--allowed-users", "f"],
+            "--allowed-users is used only with --access github",
+        ),
+        (
+            ["--access", "github", "--allowed-keys", "f"],
+            "--allowed-keys is used only with --access keys",
+        ),
+        (
+            [
+                "--access",
+                "github",
+                "--github-client-id",
+                "x",
+                "--allowed-users",
+                "f",
+                "--max-keys-per-user",
+                "0",
+            ],
+            '"0" is not a number of keys (1 or more)',
+        ),
+    ],
+)
+async def test_relay_serve_checks_the_github_options(
+    tmp_path: Any, extra: list[str], message: str
+) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", *extra], io) == 2
+    assert message in "".join(err)
+
+
+async def test_relay_serve_in_github_mode_needs_a_readable_users_file(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    users = os.path.join(str(tmp_path), "users")
+    args = ["relay", "serve", "--access", "github", "--github-client-id", "x"]
+    assert await run([*args, "--allowed-users", users], io) == 1
+    assert f"squawk relay serve: cannot read {users}" in "".join(err)
+    with open(users, "w", encoding="utf-8") as file:
+        file.write("alice\nnot a user\n")
+    assert await run([*args, "--allowed-users", users], io) == 1
+    assert f"squawk relay serve: {users}: line 2:" in "".join(err)
+
+
+async def test_relay_serve_in_github_mode_says_how_many_users_it_admits(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    users = os.path.join(str(tmp_path), "users")
+    with open(users, "w", encoding="utf-8") as file:
+        file.write("# the team\nalice\nbob 202\n")
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--port", "0", "--data", data, "--access", "github"]
+    github = ["--github-client-id", "Iv1.abc", "--allowed-users", users]
+    task = asyncio.create_task(run([*args, *github, "--max-keys-per-user", "3"], io))
+    await wait_for_text(out, re.escape(f"Access:    github (2 users in {users})\n"))
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
 async def test_relay_without_a_subcommand_prints_usage(tmp_path: Any) -> None:
     err: list[str] = []
     io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})

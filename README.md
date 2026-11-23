@@ -123,7 +123,8 @@ protocol in [docs/plan/relay.md](docs/plan/relay.md).
 There is no public relay yet, so for now someone runs one. The relay is the
 same `squawk` package, run as a server: `squawk relay serve` (options
 `--host`, `--port`, `--data`, `--trust-forwarded-for`, `--access`,
-`--allowed-keys`), or the Docker image built from this repository. The relay
+`--allowed-keys`, `--allowed-users`, `--github-client-id`,
+`--max-keys-per-user`), or the Docker image built from this repository. The relay
 keeps its key, mailboxes and waiting messages in SQLite in its data
 directory. `GET /healthz` on its port answers
 `{"status":"ok","version":"..."}`.
@@ -135,7 +136,12 @@ will not start until `--access` is given. The Docker image passes
 `--access open`. With `--access keys --allowed-keys FILE`, only the keys
 listed in the file (one key id per line, optionally followed by a name) may
 use the relay. The relay rereads the file when it changes and on `SIGHUP`,
-and deletes the mailbox of a key taken out of it.
+and deletes the mailbox of a key taken out of it. With `--access github
+--github-client-id ID --allowed-users FILE`, a new key is admitted once its
+owner signs in with GitHub as a user listed in the file (one GitHub user name
+per line, optionally followed by their numeric GitHub id), up to
+`--max-keys-per-user` keys each (5 by default); the file is reread in the
+same way.
 
 **On one machine, for testing.** From a clone of this repository:
 
