@@ -122,8 +122,12 @@ protocol in [docs/plan/relay.md](docs/plan/relay.md).
 
 There is no public relay yet, so for now someone runs one. The relay is the
 same `squawk` package, run as a server: `squawk relay serve` (options
-`--host`, `--port`, `--data`, `--trust-forwarded-for`), or the Docker image
-built from this repository. It keeps its key, mailboxes and waiting messages
+`--host`, `--port`, `--data`, `--trust-forwarded-for`, `--access`), or the
+Docker image built from this repository. `--access open` lets anyone who can
+reach the relay use it; it is the default only for a relay that listens on
+this machine alone (`127.0.0.1`, without `--trust-forwarded-for`), and any
+other relay will not start until `--access` is given. The Docker image
+passes `--access open`. It keeps its key, mailboxes and waiting messages
 in SQLite in its data directory. `GET /healthz` on its port answers
 `{"status":"ok","version":"..."}`.
 

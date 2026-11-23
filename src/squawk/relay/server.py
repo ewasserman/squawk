@@ -5,8 +5,9 @@ them. The protocol is described in docs/plan/relay.md.
 Each connection starts with the relay's `hello` (its key and a random
 challenge); the client answers `auth` with its key and a signature over
 `auth_message(challenge, client key, relay key)` from `squawk.network`, and
-the relay answers `ok`. After that every frame is handled by one of the
-`_on_*` methods below.
+the relay asks its access policy (`squawk.relay.access`) whether the key
+may use it, and answers `ok` or closes the connection. After that every
+frame is handled by one of the `_on_*` methods below.
 
 All state that must survive a restart (the relay's key, mailboxes, allow
 lists, waiting messages, open invites) is in SQLite (`RelayStore`). What
@@ -32,6 +33,7 @@ from squawk.encoding import from_base64url, is_key_id, key_from_id, to_base64url
 from squawk.envelope import EnvelopeValidationError, Sealed, parse_sealed
 from squawk.identity import Identity, identity_from_secret_key
 from squawk.network import REFUSED_CODE, auth_message
+from squawk.relay.access import NOT_PERMITTED_CODE, AccessPolicy, Decision, OpenAccess
 from squawk.relay.invite_code import code_hash, new_code, normalize_code
 from squawk.relay.limits import Rate, RateLimiter, RelayLimits
 from squawk.relay.storage import RelayStore
@@ -195,8 +197,10 @@ class RelayServer:
         limits: RelayLimits | None = None,
         now: Callable[[], int] | None = None,
         trust_forwarded_for: bool = False,
+        access: AccessPolicy | None = None,
     ) -> None:
         self._data_dir = data_dir
+        self.access: AccessPolicy = OpenAccess() if access is None else access
         self._trust_forwarded_for = trust_forwarded_for
         self._host = host
         self._port = port
@@ -337,6 +341,11 @@ class RelayServer:
         key = await self._authenticate(ws)
         if key is None:
             return
+        if self.access.decide(key) is not Decision.ADMITTED:
+            # Signing in for unknown keys comes with the github mode; until
+            # then an unknown key is refused like any other.
+            await ws.close(NOT_PERMITTED_CODE, "not permitted")
+            return
         client = _Client(
             ws, key, _remote_ip(ws, self._trust_forwarded_for), self.limits.max_queued_bytes
         )
@@ -365,6 +374,7 @@ class RelayServer:
                         "v": PROTOCOL_VERSION,
                         "key": self.key_id,
                         "challenge": challenge,
+                        "access": self.access.mode,
                     }
                 )
             )

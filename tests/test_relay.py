@@ -18,9 +18,16 @@ from squawk.encoding import to_base64url
 from squawk.identity import Identity, identity_from_secret_key
 from squawk.network import auth_message
 from squawk.relay import Rate, RelayLimits, RelayServer
+from squawk.relay.access import (
+    AccessMode,
+    Decision,
+    OpenAccess,
+    default_access_mode,
+    is_loopback_host,
+)
 from squawk.relay.invite_code import ALPHABET, code_hash, new_code, normalize_code
 from squawk.relay.limits import DAY_MS, MINUTE_MS, RateLimiter
-from squawk.relay.storage import DB_FILE
+from squawk.relay.storage import DB_FILE, RelayStore
 from squawk.version import VERSION
 
 Frame = dict[str, Any]
@@ -160,8 +167,12 @@ async def start_relay(data_dir: str, clock: Clock) -> AsyncIterator[RelayFactory
     """Starts relays on free ports with the fake clock; stops them afterwards."""
     running: list[RelayServer] = []
 
-    async def start(limits: RelayLimits | None = None, directory: str | None = None) -> RelayServer:
-        relay = RelayServer(directory or data_dir, port=0, limits=limits, now=clock)
+    async def start(
+        limits: RelayLimits | None = None,
+        directory: str | None = None,
+        access: Any = None,
+    ) -> RelayServer:
+        relay = RelayServer(directory or data_dir, port=0, limits=limits, now=clock, access=access)
         await relay.start()
         running.append(relay)
         return relay
@@ -191,7 +202,99 @@ async def test_hello_carries_the_relay_key_and_a_challenge(relay: RelayServer) -
     assert hello["v"] == 1
     assert hello["key"] == relay.key_id
     assert len(hello["challenge"]) >= 43
+    assert hello["access"] == "open"
     await ws.close()
+
+
+class FixedAccess:
+    """An access policy with a fixed answer for each key (ADMITTED otherwise)."""
+
+    def __init__(self, mode: AccessMode, answers: dict[str, Decision]) -> None:
+        self._mode: AccessMode = mode
+        self.answers = answers
+
+    @property
+    def mode(self) -> AccessMode:
+        return self._mode
+
+    def decide(self, key: str) -> Decision:
+        return self.answers.get(key, Decision.ADMITTED)
+
+
+async def test_hello_names_the_access_mode(start_relay: RelayFactory) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {}))
+    ws, hello = await open_ws(relay)
+    assert hello["access"] == "keys"
+    await ws.close()
+
+
+@pytest.mark.parametrize("decision", [Decision.REFUSED, Decision.UNKNOWN])
+async def test_a_key_the_access_mode_does_not_admit_is_closed_with_4003_and_gets_no_mailbox(
+    start_relay: RelayFactory, decision: Decision
+) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {alice.id: decision}))
+    client = await login(relay, alice, expect_ok=False)
+    assert await close_code(client.ws) == (4003, "not permitted")
+    assert not relay.store.has_mailbox(alice.id)
+    admitted = await login(relay, bob)
+    assert admitted.ok["t"] == "ok"
+    assert relay.store.has_mailbox(bob.id)
+    await admitted.close()
+
+
+async def test_the_access_check_comes_after_the_signature_check(start_relay: RelayFactory) -> None:
+    relay = await start_relay(access=FixedAccess("keys", {alice.id: Decision.REFUSED}))
+    client = await login(relay, alice, signer=bob, expect_ok=False)
+    assert await close_code(client.ws) == (4001, "bad signature")
+
+
+def test_open_access_admits_every_key() -> None:
+    assert OpenAccess().mode == "open"
+    assert OpenAccess().decide(alice.id) is Decision.ADMITTED
+
+
+@pytest.mark.parametrize(
+    ("host", "trust_forwarded_for", "expected"),
+    [
+        ("127.0.0.1", False, "open"),
+        ("127.0.0.2", False, "open"),
+        ("::1", False, "open"),
+        ("localhost", False, "open"),
+        ("127.0.0.1", True, None),
+        ("0.0.0.0", False, None),
+        ("::", False, None),
+        ("192.168.1.10", False, None),
+        ("relay.example.net", False, None),
+    ],
+)
+def test_open_is_the_default_only_for_a_relay_only_this_machine_can_reach(
+    host: str, trust_forwarded_for: bool, expected: str | None
+) -> None:
+    assert default_access_mode(host, trust_forwarded_for) == expected
+    assert is_loopback_host(host) == (expected is not None or trust_forwarded_for)
+
+
+def test_deleting_a_mailbox_removes_its_allow_list_waiting_messages_and_invite() -> None:
+    store = RelayStore.open_memory()
+    for key in (alice.id, bob.id):
+        store.touch_mailbox(key, START_MS)
+    store.set_allowed(alice.id, [bob.id])
+    store.set_allowed(bob.id, [alice.id])
+    store.add_message(bob.id, alice.id, "m1", "{}", START_MS)
+    store.add_message(alice.id, bob.id, "m2", "{}", START_MS)
+    store.add_invite("hash", alice.id, START_MS + 1000)
+
+    store.delete_mailbox(alice.id)
+
+    assert not store.has_mailbox(alice.id)
+    assert not store.is_allowed(alice.id, bob.id)
+    assert store.usage(alice.id, 0).messages == 0
+    assert store.invite_creator("hash") is None
+    # Bob's mailbox, his allow list and the message waiting for him are his.
+    assert store.has_mailbox(bob.id)
+    assert store.is_allowed(bob.id, alice.id)
+    assert store.usage(bob.id, 0).messages == 1
+    store.close()
 
 
 async def test_auth_answers_ok_with_the_number_waiting(relay: RelayServer) -> None:

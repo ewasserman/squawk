@@ -19,6 +19,14 @@ from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
 from squawk.relay import RelayServer
+from squawk.relay.access import (
+    ACCESS_MODES,
+    OPEN_WARNING,
+    AccessMode,
+    AccessPolicy,
+    OpenAccess,
+    default_access_mode,
+)
 from squawk.relay_client import RELAY_URL_KEY
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
@@ -50,6 +58,7 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "port": Opt("string", "p"),
             "data": Opt("string"),
             "trust-forwarded-for": Opt("boolean"),
+            "access": Opt("string"),
         },
     )
     port_text = string_value(values, "port")
@@ -59,12 +68,15 @@ async def _serve(args: list[str], io: CliIo) -> int:
             raise ParseArgsError(f'"{port_text}" is not a port number (0-65535)')
         port = int(port_text)
     host = string_value(values, "host") or DEFAULT_HOST
+    trust_forwarded_for = values.get("trust-forwarded-for") is True
+    access = _access_policy(string_value(values, "access"), host, trust_forwarded_for)
     data_dir = string_value(values, "data") or relay_data_dir(io.env)
     relay = RelayServer(
         data_dir,
         host=host,
         port=port,
-        trust_forwarded_for=values.get("trust-forwarded-for") is True,
+        trust_forwarded_for=trust_forwarded_for,
+        access=access,
     )
     await relay.start()
     stop = io.stop if io.stop is not None else asyncio.Event()
@@ -79,6 +91,10 @@ async def _serve(args: list[str], io: CliIo) -> int:
         io.stdout(f"squawk relay listening on ws://{host}:{relay.port}\n")
         io.stdout(f"Relay key: {relay.key_id}\n")
         io.stdout(f"Data:      {data_dir}\n")
+        if access.mode == "open":
+            io.stdout(f"{OPEN_WARNING}\n")
+        else:
+            io.stdout(f"Access:    {access.mode}\n")
         await stop.wait()
     finally:
         for sig in handled:
@@ -86,6 +102,31 @@ async def _serve(args: list[str], io: CliIo) -> int:
         await relay.stop()
     io.stdout("squawk relay stopped\n")
     return 0
+
+
+def _access_policy(given: str | None, host: str, trust_forwarded_for: bool) -> AccessPolicy:
+    """The access policy `--access` asks for. Without `--access`, only a
+    relay that nothing but this machine can reach defaults to open; any
+    other relay must be told who may use it."""
+    mode: AccessMode | None
+    if given is None:
+        mode = default_access_mode(host, trust_forwarded_for)
+        if mode is None:
+            reason = (
+                "it is behind a proxy (--trust-forwarded-for)"
+                if trust_forwarded_for
+                else f"it listens on {host}, which other machines can reach"
+            )
+            raise ParseArgsError(
+                f"choose who may use this relay with --access open|keys|github: {reason}"
+            )
+    elif given in ACCESS_MODES:
+        mode = given
+    else:
+        raise ParseArgsError(f'"{given}" is not an access mode (open, keys or github)')
+    if mode != "open":
+        raise ParseArgsError(f"--access {mode} is not available yet")
+    return OpenAccess()
 
 
 async def save_relay(home: str, url: str | None, *, allow_plain: bool = False) -> bool:
@@ -278,7 +319,7 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
         _status,
     ),
     "serve": Command(
-        "run the relay server (--host, --port, --data, --trust-forwarded-for)", _serve
+        "run the relay server (--host, --port, --data, --trust-forwarded-for, --access)", _serve
     ),
 }
 

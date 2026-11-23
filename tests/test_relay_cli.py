@@ -66,6 +66,61 @@ async def test_relay_serve_runs_until_stopped(tmp_path: Any) -> None:
     assert err == []
 
 
+async def test_relay_serve_on_loopback_defaults_to_open_and_says_so(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    data = os.path.join(str(tmp_path), "data")
+    task = asyncio.create_task(run(["relay", "serve", "--port", "0", "--data", data], io))
+    await wait_for_text(out, r"Access: open\. Anyone who can reach this relay can open a mailbox")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+async def test_relay_serve_with_access_open_on_every_address_starts(tmp_path: Any) -> None:
+    out: list[str] = []
+    stop = asyncio.Event()
+    io = CliIo(
+        stdout=out.append, stderr=lambda _: None, env={"SQUAWK_HOME": str(tmp_path)}, stop=stop
+    )
+    data = os.path.join(str(tmp_path), "data")
+    args = ["relay", "serve", "--host", "0.0.0.0", "--port", "0", "--data", data]
+    task = asyncio.create_task(run([*args, "--access", "open"], io))
+    await wait_for_text(out, r"Access: open\.")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == 0
+
+
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        (["--host", "0.0.0.0"], "it listens on 0.0.0.0, which other machines can reach"),
+        (["--host", "192.168.1.10"], "it listens on 192.168.1.10"),
+        (["--trust-forwarded-for"], "it is behind a proxy (--trust-forwarded-for)"),
+        (["--host", "::1", "--trust-forwarded-for"], "it is behind a proxy"),
+    ],
+)
+async def test_relay_serve_refuses_to_start_without_access_unless_only_this_machine_can_reach_it(
+    tmp_path: Any, extra: list[str], reason: str
+) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    data = os.path.join(str(tmp_path), "data")
+    assert await run(["relay", "serve", "--port", "0", "--data", data, *extra], io) == 2
+    assert "choose who may use this relay with --access open|keys|github" in "".join(err)
+    assert reason in "".join(err)
+    assert not os.path.exists(data)
+
+
+async def test_relay_serve_refuses_an_unknown_access_mode(tmp_path: Any) -> None:
+    err: list[str] = []
+    io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", "--access", "everyone"], io) == 2
+    assert '"everyone" is not an access mode' in "".join(err)
+
+
 async def test_relay_without_a_subcommand_prints_usage(tmp_path: Any) -> None:
     err: list[str] = []
     io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})

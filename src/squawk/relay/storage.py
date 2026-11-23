@@ -176,6 +176,22 @@ class RelayStore:
             (key_id, now, now),
         )
 
+    def delete_mailbox(self, key_id: str) -> None:
+        """Deletes `key_id`'s mailbox with its allow list, the messages waiting
+        in it and its open invite. Used when a key may no longer use the relay."""
+
+        def delete() -> None:
+            self.db.execute("DELETE FROM allowed WHERE owner = ?", (key_id,))
+            self.db.execute("DELETE FROM messages WHERE recipient = ?", (key_id,))
+            self.db.execute("DELETE FROM invites WHERE creator = ?", (key_id,))
+            self.db.execute("DELETE FROM mailboxes WHERE key_id = ?", (key_id,))
+
+        self.transaction(delete)
+
+    def has_mailbox(self, key_id: str) -> bool:
+        row = self.db.execute("SELECT 1 FROM mailboxes WHERE key_id = ?", (key_id,)).fetchone()
+        return row is not None
+
     def set_allowed(self, owner: str, senders: list[str]) -> None:
         """Replaces the allow list of `owner`'s mailbox."""
 
