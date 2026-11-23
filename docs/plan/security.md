@@ -308,11 +308,14 @@ relay cannot change, so a late message is shown with its real age.
 or holds it back.
 
 **Mitigations.** We cannot stop this; we make it visible. A message the
-relay has accepted stays in the sender's outbox as *relayed* until the
-recipient's signed `ack` receipt arrives, and `squawk status` shows it as
-waiting. With no receipt after 7 days it is marked failed. When both people
-are on the same local network, the direct route is tried first and the
-relay is not involved. *Tasks 2, 6, 9.*
+relay has accepted is not counted as delivered until the recipient's signed
+`ack` receipt arrives: `squawk send` says it is "waiting at the relay", and
+`squawk status` and `squawk relay status` count it under "Held at relay".
+With no receipt after 7 days it is marked failed. When the sender switches
+relays, or the recipient appears on the local network, held messages are
+sent again; the recipient's replay check drops any second copy. When both
+people are on the same local network, the direct route is tried first and
+the relay is not involved. *Tasks 2, 6, 9.*
 
 ### 13. The relay in the middle of pairing
 
@@ -341,8 +344,9 @@ its own, then read and forge everything they send each other.
 the codes over a channel the relay does not control.
 
 The relay URL each side learns during pairing is not covered by the codes,
-so the relay could change it. The worst result is that messages are sent to
-a relay that cannot deliver them, which threat 12 already covers.
+so the relay could change it. The URL is only shown in `squawk contacts`:
+a service always deposits messages at its own relay, so a changed URL does
+not send messages anywhere else.
 
 ### 14. Strangers using the relay to reach you
 
@@ -358,7 +362,8 @@ are refused.
   relay's key. *Tasks 3, 5.*
 - Even if the relay ignored the allow list, the recipient's service refuses
   messages from keys that are not paired contacts (threat 10).
-- `squawk block` removes the contact from the allow list at once. *Task 5.*
+- `squawk block` removes the contact from the allow list within about a
+  second (the service checks its contacts every second). *Task 5.*
 
 ### 15. What the relay and the network path learn
 
@@ -414,7 +419,7 @@ service. *Task 3.*
 | 9 | Relay reads messages | Sealed end to end; the relay holds no key that opens them | 1, 3 |
 | 10 | Relay forges messages or receipts | Signed by sender or recipient; recipient checks the signed sender is a contact | 2, 5 |
 | 11 | Relay replays messages | Ids remembered 7 days and 15 minutes; relayed messages older than 7 days refused | 2 |
-| 12 | Relay drops or delays messages | Not preventable; signed receipts, *relayed* state, failure after 7 days, LAN first | 2, 6, 9 |
+| 12 | Relay drops or delays messages | Not preventable; signed receipts, "Held at relay" until the receipt, failure after 7 days, LAN first | 2, 6, 9 |
 | 13 | Relay in the middle of pairing | 6-digit code compared over a call; one-time 10-minute invite codes | 3, 8, 11 |
 | 14 | Strangers reaching you through the relay | Allow list of paired contacts; recipient refuses unknown keys | 3, 5 |
 | 15 | Metadata seen by the relay | Accepted; plain `ws://` only by opt-in | 1, 4, 9 |

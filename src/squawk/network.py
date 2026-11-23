@@ -511,6 +511,10 @@ async def _discard(link: PeerLink) -> None:
         link.terminate()
 
 
+NOT_ON_NETWORK = "recipient is not on the network"
+"""The error when no address for a contact answers on the local network."""
+
+
 def _error_text(err: BaseException) -> str:
     return str(err) or type(err).__name__
 
@@ -1056,7 +1060,7 @@ class NetworkTransport(Transport):
             await try_each(self.candidates(recipient))
         if link is None or address is None:
             if last_error is None:
-                raise LinkError("recipient is not on the network")
+                raise LinkError(NOT_ON_NETWORK)
             raise last_error
         if link.authorization != "paired":
             link.close()
@@ -1193,9 +1197,16 @@ class NetworkTransport(Transport):
                 await relay.forward(seal(request, daemon.identity))
             except RelayRefused as err:
                 if err.reason == "offline":
+                    # "Not found" on the local network only repeats "not on this
+                    # network"; any other local-network error is worth showing.
+                    detail = (
+                        ""
+                        if direct_error == NOT_ON_NETWORK
+                        else f" (local network: {direct_error})"
+                    )
                     raise LinkError(
                         f"{contact.name} is offline: their squawk service is not on this "
-                        f"network and not connected to the relay ({direct_error})"
+                        f"network and not connected to the relay{detail}"
                     ) from None
                 if err.reason == "not-allowed":
                     raise LinkError(
