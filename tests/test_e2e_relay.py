@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import pytest
 
@@ -22,19 +22,22 @@ from squawk.identity import init_identity
 from squawk.network import NetworkTransport
 from squawk.pairing import Pairing
 from squawk.relay import RelayServer
+from squawk.relay.access import AccessPolicy, GitHubAccess
+from squawk.relay.github import DeviceCode, GitHubUser, PollAnswer, Token
 from squawk.relay_client import RelayClient
 from test_e2e import Person, World, always_send, body_of, msg_id_of, wait_for
 
 
 class RelayWorld(World):
-    def __init__(self, relay_dir: str) -> None:
+    def __init__(self, relay_dir: str, access: AccessPolicy | None = None) -> None:
         super().__init__()
         self.relay_dir = relay_dir
+        self.access = access
         self.relay: RelayServer | None = None
         self.relay_port = 0
 
     async def start_relay(self) -> None:
-        self.relay = RelayServer(self.relay_dir, port=self.relay_port)
+        self.relay = RelayServer(self.relay_dir, port=self.relay_port, access=self.access)
         await self.relay.start()
         self.relay_port = self.relay.port
 
@@ -47,13 +50,13 @@ class RelayWorld(World):
     def url(self) -> str:
         return f"ws://127.0.0.1:{self.relay_port}"
 
-    async def person(self, name: str) -> Person:
+    async def person(self, name: str, *, connect: bool = True) -> Person:
         home = tempfile.mkdtemp(prefix="sq-", dir="/tmp")
         self.homes.append(home)
         init_identity(home, name)
-        return await self.start_service(name, home)
+        return await self.start_service(name, home, connect=connect)
 
-    async def start_service(self, name: str, home: str) -> Person:
+    async def start_service(self, name: str, home: str, *, connect: bool = True) -> Person:
         notes: list[tuple[str, str]] = []
         relay = RelayClient(
             self.url,
@@ -81,7 +84,8 @@ class RelayWorld(World):
         # No direct address: the other service can reach this one only through the relay.
         person = Person(name, home, daemon, pairing, "", notes)
         self.people.append(person)
-        await wait_for(lambda: relay.connected)
+        if connect:
+            await wait_for(lambda: relay.connected)
         return person
 
     async def stop_service(self, person: Person) -> None:
@@ -100,9 +104,7 @@ def relay_of(person: Person) -> RelayClient:
     return transport.relay
 
 
-@pytest.fixture
-async def world(tmp_path: object) -> AsyncIterator[RelayWorld]:
-    w = RelayWorld(os.path.join(str(tmp_path), "relay"))
+async def _run_world(w: RelayWorld) -> AsyncIterator[RelayWorld]:
     await w.start_relay()
     try:
         yield w
@@ -115,6 +117,53 @@ async def world(tmp_path: object) -> AsyncIterator[RelayWorld]:
             await w.relay.stop()
         for home in w.homes:
             shutil.rmtree(home, ignore_errors=True)
+
+
+@pytest.fixture
+async def world(tmp_path: object) -> AsyncIterator[RelayWorld]:
+    async for w in _run_world(RelayWorld(os.path.join(str(tmp_path), "relay"))):
+        yield w
+
+
+class FakeGitHub:
+    """Stands in for GitHub: the person approves at once, as `user`."""
+
+    def __init__(self) -> None:
+        self.user = GitHubUser("alice", 101)
+
+    async def request_device_code(self) -> DeviceCode:
+        return DeviceCode(
+            device_code="device-secret",
+            user_code="ABCD-1234",
+            verification_uri="https://github.com/login/device",
+            expires_in=900,
+            interval=5,
+        )
+
+    async def poll_token(self, device_code: str) -> PollAnswer:
+        return Token("gho_token")
+
+    async def read_user(self, token: str) -> GitHubUser:
+        return self.user
+
+
+async def _no_wait(_seconds: float) -> None:
+    await asyncio.sleep(0)
+
+
+@pytest.fixture
+def github() -> FakeGitHub:
+    return FakeGitHub()
+
+
+@pytest.fixture
+async def github_world(tmp_path: object, github: FakeGitHub) -> AsyncIterator[RelayWorld]:
+    users = os.path.join(str(tmp_path), "allowed-users")
+    with open(users, "w", encoding="utf-8") as file:
+        file.write("alice\nbob\n")
+    access = GitHubAccess(users, github, sleep=_no_wait)
+    async for w in _run_world(RelayWorld(os.path.join(str(tmp_path), "relay"), access)):
+        yield w
 
 
 async def test_two_people_on_different_networks_talk_through_the_relay(
@@ -204,3 +253,96 @@ async def test_two_people_on_different_networks_talk_through_the_relay(
 
 async def _yes() -> str:
     return "y"
+
+
+def _needs_sign_in(person: Person) -> Callable[[], bool]:
+    return lambda: relay_of(person).access_problem == "needs-sign-in"
+
+
+def _connected(person: Person) -> Callable[[], bool]:
+    return lambda: relay_of(person).connected
+
+
+async def _pair_by_invite(world: RelayWorld, alice: Person, bob: Person) -> None:
+    out: list[str] = []
+    io = CliIo(
+        stdout=out.append,
+        stderr=out.append,
+        env={"SQUAWK_HOME": alice.home},
+        ask=lambda _prompt: _yes(),
+        confirm=always_send,
+    )
+    inviting = asyncio.ensure_future(run(["invite"], io))
+    found = await wait_for(lambda: re.search(r"Invite code: (\S+)", "".join(out)))
+    joined = await world.cli(bob, "pair", "--code", found.group(1))
+    assert joined.code == 0, joined.err
+    assert await inviting == 0, "".join(out)
+
+
+async def test_people_sign_in_with_github_then_pair_and_talk_through_the_relay(
+    github_world: RelayWorld, github: FakeGitHub
+) -> None:
+    world = github_world
+    alice = await world.person("alice", connect=False)
+    bob = await world.person("bob", connect=False)
+    for person in (alice, bob):
+        await wait_for(_needs_sign_in(person))
+    status = await world.cli(alice, "relay", "status")
+    assert f"Relay:           {world.url} (needs sign-in: run `squawk relay login`)" in status.out
+
+    for person, user in ((alice, GitHubUser("alice", 101)), (bob, GitHubUser("Bob", 202))):
+        github.user = user
+        signed = await world.cli(person, "relay", "login")
+        assert signed.code == 0, signed.err
+        assert signed.out == (
+            "Open https://github.com/login/device and enter ABCD-1234 (valid for 15 minutes).\n"
+            "GitHub should ask only to read your public profile. If it asks for\n"
+            "anything more, deny it: the relay should never need more.\n"
+            f"Signed in to the relay as {user.login}\n"
+        )
+        await wait_for(_connected(person))
+    assert relay_of(alice).access_problem is None
+
+    again = await world.cli(alice, "relay", "login")
+    assert again.code == 0, again.err
+    assert "no sign-in is needed" in again.out
+
+    await _pair_by_invite(world, alice, bob)
+    there = await world.cli(alice, "send", "bob", "signed in and paired")
+    assert there.code == 0, there.err
+    assert "delivered to their squawk service" in there.out
+    back = await world.cli(bob, "send", "alice", "and back")
+    assert back.code == 0, back.err
+    assert "delivered to their squawk service" in back.out
+
+    # A restarted service is let in without signing in again.
+    bob = await world.restart_service(bob)
+    assert relay_of(bob).connected
+
+
+async def test_a_github_user_not_listed_is_refused(
+    github_world: RelayWorld, github: FakeGitHub
+) -> None:
+    carol = await github_world.person("carol", connect=False)
+    github.user = GitHubUser("carol", 303)
+    refused = await github_world.cli(carol, "relay", "login")
+    assert refused.code == 1
+    assert "Open https://github.com/login/device and enter ABCD-1234" in refused.out
+    assert refused.err == (
+        "squawk relay login: the relay does not permit this GitHub account; "
+        "ask the person who runs it\n"
+    )
+    await wait_for(lambda: relay_of(carol).access_problem == "not-permitted")
+    status = await github_world.cli(carol, "relay", "status")
+    assert "(not permitted by this relay; ask the person who runs it)" in status.out
+
+
+async def test_relay_login_without_a_relay_or_service(world: RelayWorld) -> None:
+    alice = await world.person("alice")
+    already = await world.cli(alice, "relay", "login")
+    assert already.code == 0, already.err
+    assert "no sign-in is needed" in already.out
+    await world.cli(alice, "relay", "set", "--off")
+    none = await world.cli(alice, "relay", "login")
+    assert none.code == 1
+    assert "no relay is set" in none.err

@@ -342,6 +342,11 @@ Long text can be given on standard input instead:
   queues, and whether it is connected to its relay.
 - `squawk relay status`: the relay this machine uses, whether it is
   connected, and how many messages wait for it.
+- `squawk relay login`: signs this machine in to a relay that admits people
+  by their GitHub account, when `squawk relay status` says it needs a
+  sign-in. It prints a GitHub address and a code, then waits until your user
+  has entered the code and approved on GitHub; suggest that your user run it
+  (`! squawk relay login`), since only they can approve.
 
 ## Pairing with someone on a different network
 

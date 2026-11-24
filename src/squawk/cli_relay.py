@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from typing import cast
 
 from squawk.cli_args import Opt, ParseArgsError, parse_args, string_value
-from squawk.cli_io import CliIo, Command
+from squawk.cli_io import NOT_RUNNING_MESSAGE, CliIo, Command
 from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
@@ -37,6 +37,7 @@ from squawk.relay_client import NEEDS_SIGN_IN_TEXT, NOT_PERMITTED_TEXT, RELAY_UR
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
 from squawk.store import Store
+from squawk.timefmt import now_ms, parse_iso_ms
 
 CONNECT_WAIT_S = 5.0
 """How long `squawk relay set` and `squawk setup --relay` wait to see
@@ -387,6 +388,48 @@ async def _status(args: list[str], io: CliIo) -> int:
     return 0
 
 
+LOGIN_WARNING = (
+    "GitHub should ask only to read your public profile. If it asks for\n"
+    "anything more, deny it: the relay should never need more.\n"
+)
+
+
+async def _login(args: list[str], io: CliIo) -> int:
+    parse_args(args)
+    client = await connect_to_daemon(squawk_home(io.env))
+    if client is None:
+        io.stderr(NOT_RUNNING_MESSAGE + "\n")
+        return 1
+    try:
+        started = await client.call("relay_login_start")
+        if not started.get("needed"):
+            io.stdout("This service is already let in by the relay; no sign-in is needed.\n")
+            return 0
+        minutes = _minutes_until(str(started.get("expires_at")))
+        valid = "" if minutes is None else f" (valid for {minutes} minutes)"
+        io.stdout(
+            f"Open {started['verification_uri']} and enter {started['user_code']}{valid}.\n"
+            + LOGIN_WARNING
+        )
+        result = await client.call("relay_login_wait")
+    except RpcError as err:
+        io.stderr(f"squawk relay login: {err}\n")
+        return 1
+    finally:
+        await client.close()
+    user = result.get("user")
+    io.stdout(f"Signed in to the relay as {user}\n" if user else "Signed in to the relay\n")
+    return 0
+
+
+def _minutes_until(iso: str) -> int | None:
+    """Whole minutes from now until `iso` (rounded to the nearest), or None."""
+    at = parse_iso_ms(iso)
+    if at is None:
+        return None
+    return max(0, round((at - now_ms()) / 60_000))
+
+
 RELAY_SUBCOMMANDS: dict[str, Command] = {
     "set": Command(
         "use a relay to reach contacts on other networks: set <url> (wss://; --allow-plain "
@@ -398,6 +441,7 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
         "waiting for it",
         _status,
     ),
+    "login": Command("sign in to a relay that admits people by their GitHub account", _login),
     "serve": Command(
         "run the relay server (--host, --port, --data, --trust-forwarded-for, --access,"
         " --allowed-keys, --allowed-users, --github-client-id, --max-keys-per-user)",
@@ -421,7 +465,7 @@ async def _relay(args: list[str], io: CliIo) -> int:
 RELAY_COMMANDS: dict[str, Command] = {
     "relay": Command(
         "choose and check the relay for contacts on other networks, or run one "
-        "(set | status | serve)",
+        "(set | status | login | serve)",
         _relay,
     ),
 }
