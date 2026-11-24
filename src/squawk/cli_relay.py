@@ -129,7 +129,9 @@ async def _serve(args: list[str], io: CliIo) -> int:
         elif isinstance(access, KeysAccess):
             io.stdout(f"Access:    keys ({len(access.keys)} allowed in {access.path})\n")
         elif isinstance(access, GitHubAccess):
-            io.stdout(f"Access:    github ({len(access.users)} users in {access.path})\n")
+            count = len(access.users)
+            noun = "user" if count == 1 else "users"
+            io.stdout(f"Access:    github ({count} {noun} in {access.path})\n")
         else:
             io.stdout(f"Access:    {access.mode}\n")
         await stop.wait()
