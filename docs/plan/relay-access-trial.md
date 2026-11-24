@@ -75,7 +75,7 @@ hotspot will do).
 
 | Step | Worked? | Notes |
 | --- | --- | --- |
-| 1 | Partly | 443 reached from a phone on cellular; certificate issued over TLS-ALPN (after correction 5). Ports 22, 80, 8765 from outside not yet checked. |
+| 1 | Yes | From a phone's hotspot: `/healthz` answered with a valid certificate (issued over TLS-ALPN, after correction 5); 22 and 8765 timed out, 80 gave "host is down". From the home network the results mean nothing: the public address is the router itself there (its SSH answered on 22), and the relay is unreachable (correction 6). |
 | 2 | Yes | Tested from inside the VM: github.com, Let's Encrypt and DuckDNS reachable; the Mac, other LAN hosts and the router's admin ports not, over IPv4 and, after correction 2, IPv6. |
 | 3 | Yes | After updating A's client from 0.3.1 to 0.5.0 (correction 7). The relay logged the first sign-in with the pinned id. |
 | 4 | | |
