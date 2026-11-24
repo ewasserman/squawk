@@ -85,7 +85,7 @@ hotspot will do).
 | 8 | | |
 | 9 | Yes | Lists A with one key, first and last sign-in times. |
 | 10 | | |
-| 11 | | No backup set up yet. |
+| 11 | Yes | Nightly backup out of the VM through `tart exec` (no network path needed), using SQLite's `VACUUM INTO` for a consistent copy; restored into a scratch directory, `admin users` matched the live relay exactly. |
 
 Corrections to the guide:
 
@@ -145,5 +145,11 @@ Corrections to the guide:
    The guide's systemd unit could also add standard sandboxing
    (`ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`,
    `CapabilityBoundingSet=` and similar); the relay ran fine under it.
+9. **"Back it up" needs a method.** The data directory is a live SQLite
+   database in WAL mode, so copying the files while the relay runs can
+   give an inconsistent copy. The guide should give a command, such as
+   `VACUUM INTO` (or `sqlite3 relay.db ".backup ..."`) run as the relay's
+   user, and say that the backup holds the relay's private key, so it
+   must be kept as private as the data directory.
 
 Problems filed:
