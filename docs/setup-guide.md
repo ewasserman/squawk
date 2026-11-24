@@ -150,8 +150,9 @@ sealed messages it cannot read until the recipient's service fetches them.
 When you and your colleague are on the same network, messages still go
 directly and the relay is not used.
 
-There is no public relay yet. For now, one of you runs a relay in Docker
-(below) and you both use it.
+There is no public relay yet. For now, one of you runs a relay, either in
+Docker for a trial (below) or properly, reachable from the internet, as
+described in [Running a relay](running-a-relay.md), and you both use it.
 
 **Set the relay**, both of you:
 
@@ -159,6 +160,12 @@ There is no public relay yet. For now, one of you runs a relay in Docker
 squawk relay set wss://relay.example.com
 squawk relay status        # "Connected: yes"
 ```
+
+If `squawk relay status` says the relay **needs sign-in**, the relay admits
+people by their GitHub account: run `squawk relay login`, open the address
+it prints, enter the code and approve. GitHub's page should ask only to read
+your public profile; if it asks for anything more, deny it. If it says **not
+permitted by this relay**, ask the person who runs the relay to add you.
 
 `squawk setup --relay <url>` does the same during setup. A relay URL must
 start with `wss://` (encrypted). Plain `ws://` is accepted only with
@@ -202,7 +209,9 @@ ipconfig getifaddr en0                   # this Mac's address, e.g. 192.168.1.20
 ```
 
 `SQUAWK_RELAY_BIND=0.0.0.0` lets other machines on the network connect;
-without it the relay is reachable only from the Mac it runs on. If macOS
+without it the relay is reachable only from the Mac it runs on. The Docker
+relay runs with `--access open`, so anyone who can reach it on your network
+can use it; that is fine for a trial, not for a relay on the internet. If macOS
 asks whether Docker may accept incoming connections, allow it.
 
 Then on both Macs, with the relay Mac's address:

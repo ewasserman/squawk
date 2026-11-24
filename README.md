@@ -176,14 +176,15 @@ service with discovery on the local network turned off:
 `squawk daemon stop && SQUAWK_NO_MDNS=1 squawk daemon start`. The
 [setup guide](docs/setup-guide.md) (step 7) walks through this.
 
-**Reachable from the internet.** The relay process speaks plain WebSocket, so
-put it behind a reverse proxy that terminates TLS, and give people the
-`wss://` address. Start the relay with `--trust-forwarded-for` so that its
-per-address rate limits use the client address from the proxy's
-`X-Forwarded-For` header; without a proxy, leave that option off, or a client
-could claim any address. Limits, storage and the protocol are described in
-[docs/plan/relay.md](docs/plan/relay.md). This setup has not been tried yet:
-so far the relay has been tested only on one machine
+**Reachable from the internet.** [docs/running-a-relay.md](docs/running-a-relay.md)
+covers what that needs: a proxy in front that handles TLS, so people use a
+`wss://` address; the relay on `127.0.0.1` with `--trust-forwarded-for`, so
+its limits per IP address see each person's address from the proxy's
+`X-Forwarded-For` header; and `--access github` or `--access keys`. It has
+worked examples for a relay at home (a virtual machine, DuckDNS, Caddy) and
+a private one over Tailscale. Limits, storage and the protocol are described
+in [docs/plan/relay.md](docs/plan/relay.md). This setup has not been tried
+over the internet yet: so far the relay has been tested on one machine
 ([docs/plan/relay-trial.md](docs/plan/relay-trial.md)).
 
 Plain `ws://` is for testing only. Messages are still sealed end to end, but
