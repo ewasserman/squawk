@@ -9,6 +9,9 @@
 
 dist/
 
+# Local notes from the relay trial; they hold one site's network details.
+docs/plan/relay-trial-notes.md
+
 # Python
 .venv/
 __pycache__/
