@@ -63,7 +63,37 @@ def relay_data_dir(env: Mapping[str, str]) -> str:
     return os.path.join(squawk_home(env), "relay")
 
 
+SERVE_USAGE = f"""Usage: squawk relay serve [options]
+
+Runs a relay. The guide to running one is docs/running-a-relay.md.
+
+Options:
+  --host HOST               address to listen on (default {DEFAULT_HOST})
+  --port, -p PORT           port to listen on (default {DEFAULT_PORT}; 0 picks a free one)
+  --data DIR                where the relay keeps its database (default
+                            $SQUAWK_RELAY_DATA, or relay/ in squawk's home
+                            directory, ~/.config/squawk unless $SQUAWK_HOME)
+  --trust-forwarded-for     take each client's address from the X-Forwarded-For
+                            header; use only behind a proxy that sets it
+  --access MODE             who may use the relay: open, keys or github. Required
+                            unless the relay listens only on this machine
+                            without --trust-forwarded-for
+  --allowed-keys FILE       with --access keys: the file of allowed keys
+  --allowed-users FILE      with --access github: the file of allowed GitHub users
+  --github-client-id ID     with --access github: the GitHub OAuth App's client id
+  --max-keys-per-user N     with --access github: computers each user may sign
+                            in from (default {DEFAULT_MAX_KEYS_PER_USER})
+  --help, -h                show this text
+
+SIGHUP rereads the allowed keys or users file at once; otherwise it is
+reread every 20 seconds.
+"""
+
+
 async def _serve(args: list[str], io: CliIo) -> int:
+    if "--help" in args or "-h" in args:
+        io.stdout(SERVE_USAGE)
+        return 0
     values, _ = parse_args(
         args,
         {
