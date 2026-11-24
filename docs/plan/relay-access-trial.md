@@ -7,7 +7,9 @@ Problems found become tasks in the epic.
 
 ## The deployment
 
-Follow the guide's example of a relay at home: a Tart Linux virtual
+Install squawk v0.5.0 (the first release with access control) as the
+guide's "Installing squawk" says, and follow its example of a relay at
+home: a Tart Linux virtual
 machine on the Mac Studio, bridged networking, no shared folders, only TCP
 443 forwarded from the router, Caddy, a DuckDNS name, and the relay as a
 systemd service with `--access github`. The allowed users file lists the
@@ -53,14 +55,15 @@ hotspot will do).
    - Expected: B is connected again at once, and A can message B (after
      pairing again if needed).
 9. **The admin command.** On the virtual machine:
-   `squawk relay admin users --data /var/lib/squawk-relay`.
+   `sudo -u squawk-relay /home/squawk-relay/.local/bin/squawk relay admin
+   users --data /var/lib/squawk-relay`.
    - Expected: lists A and B with their keys and last sign-in times.
 10. **A restart keeps everyone.** `systemctl restart squawk-relay`, then
     A messages B.
     - Expected: both reconnect by themselves within a minute and the
       message arrives.
 11. **The backup restores.** Copy the newest nightly backup somewhere
-    else and run `squawk relay admin users --data <that copy>`.
+    else and run `squawk relay admin users --data <that copy>` there.
     - Expected: the same list as step 9.
 
 ## Results

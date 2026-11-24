@@ -152,11 +152,14 @@ gets `SIGHUP` (`systemctl reload squawk-relay` with the unit below).
 - A file that lists nobody stops the relay from starting.
 
 `squawk relay admin` works on the relay's data directory, on the relay's
-machine, while the relay runs:
+machine, while the relay runs. Only the relay's user can read that
+directory, so run it as that user (with the service below, `squawk-relay`):
 
 ```bash
-squawk relay admin users --data /var/lib/squawk-relay        # GitHub users and their keys
-squawk relay admin remove-key KEY --data /var/lib/squawk-relay
+sudo -u squawk-relay /home/squawk-relay/.local/bin/squawk relay admin users \
+  --data /var/lib/squawk-relay                      # GitHub users and their keys
+sudo -u squawk-relay /home/squawk-relay/.local/bin/squawk relay admin remove-key KEY \
+  --data /var/lib/squawk-relay
 ```
 
 `remove-key` forgets one key and deletes its mailbox, for example a
@@ -178,11 +181,40 @@ it is lost, the relay makes a new key and starts empty: messages waiting in
 it are lost (their senders see them fail after 7 days), and in `github`
 mode everyone signs in again.
 
+### Installing squawk
+
+squawk needs Python 3.12 or later, which [uv](https://docs.astral.sh/uv/)
+downloads by itself if the system's Python is older. On Linux, give the
+relay a user of its own that cannot log in, and install uv and squawk for
+that user:
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin squawk-relay
+sudo -u squawk-relay -H sh -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+sudo -u squawk-relay -H /home/squawk-relay/.local/bin/uv tool install \
+  git+https://github.com/ewasserman/squawk@v0.5.0
+sudo -u squawk-relay /home/squawk-relay/.local/bin/squawk --version
+```
+
+The `@v0.5.0` picks a release ([the list of releases](https://github.com/ewasserman/squawk/releases));
+`@main` installs the latest code instead. The program is then at
+`/home/squawk-relay/.local/bin/squawk`. The relay needs no other packages;
+Caddy, if you use it, is installed from your distribution or
+[caddyserver.com](https://caddyserver.com/docs/install).
+
+The allowed users or keys file is read by the relay's user, so make it
+readable by that user and writable only by you:
+
+```bash
+sudo mkdir -p /etc/squawk-relay
+sudoedit /etc/squawk-relay/allowed-users
+sudo chown root:squawk-relay /etc/squawk-relay/allowed-users
+sudo chmod 640 /etc/squawk-relay/allowed-users
+```
+
 ### Running it as a service
 
-On Linux with systemd, run the relay as its own user. Install squawk for
-that user (`uv tool install git+https://github.com/ewasserman/squawk`), then
-create `/etc/systemd/system/squawk-relay.service`:
+On Linux with systemd, create `/etc/systemd/system/squawk-relay.service`:
 
 ```ini
 [Unit]
@@ -311,7 +343,15 @@ address apply to everyone together.
 
 ## Upgrading
 
-Stop the relay, upgrade squawk (`uv tool upgrade squawk`), and start it
-again. Services reconnect by themselves within a few seconds to a few
-minutes. The database is upgraded in place when the new version starts;
-back it up first.
+Back up the data directory, install the new release over the old one,
+and restart the relay:
+
+```bash
+sudo -u squawk-relay -H /home/squawk-relay/.local/bin/uv tool install --force \
+  git+https://github.com/ewasserman/squawk@vX.Y.Z
+sudo systemctl restart squawk-relay
+```
+
+ Services reconnect by themselves within a few seconds to a few
+minutes. The database is upgraded in place when the new version starts,
+which is why the backup comes first.
