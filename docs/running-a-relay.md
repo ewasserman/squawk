@@ -193,13 +193,18 @@ files then can give a broken copy. Make a consistent copy with SQLite
 instead, as the relay's user, and copy that:
 
 ```bash
+sudo -u squawk-relay rm -f /var/lib/squawk-relay/backup.db
 sudo -u squawk-relay sqlite3 /var/lib/squawk-relay/relay.db \
   "VACUUM INTO '/var/lib/squawk-relay/backup.db'"
 ```
 
-A backup holds the relay's private key and who talks to whom, so keep it as
-private as the data directory. To check one, run `squawk relay admin users
---data <a directory holding the copy as relay.db>`.
+(`VACUUM INTO` refuses to overwrite a file, hence the `rm` first.) A backup
+holds the relay's private key and who talks to whom, so keep it as private
+as the data directory. To check one, copy it into an empty directory as
+`relay.db` and run `squawk relay admin users --data <that directory>`.
+Check a copy, never the backup itself: `squawk relay admin` upgrades the
+database it opens to its own version, and a backup kept from before an
+upgrade is only useful while it is still the old version.
 
 ### Installing squawk
 
@@ -382,9 +387,14 @@ asks Let's Encrypt for a certificate.
       *established* and *related* states). Without this, the virtual
       machine's replies to devices at home are dropped, and the relay
       cannot be reached by its public name from home.
-   2. Drop everything to private addresses (`10.0.0.0/8`, `172.16.0.0/12`,
-      `192.168.0.0/16`, and `fc00::/7` for IPv6) and to the router itself,
-      except DHCP. Give the relay's network a public DNS server, since the
+   2. Drop everything to your other networks and to the router itself,
+      except DHCP. For IPv4 that is the private addresses (`10.0.0.0/8`,
+      `172.16.0.0/12`, `192.168.0.0/16`). For IPv6 it is `fc00::/7` and
+      also **your home network's IPv6 prefix** from your internet provider
+      (such as `2001:db8:1234::/56`): home devices usually have global
+      IPv6 addresses as well, and the router passes traffic to those like
+      any other. If your router lets you, the simplest rule drops
+      everything from the relay's network to every other internal network. Give the relay's network a public DNS server, since the
       router's is now out of reach.
    3. For IPv6, also drop traffic to the router's link-local addresses
       (`fe80::/10`). Even with IPv6 turned off for that network, the router
@@ -402,6 +412,7 @@ asks Let's Encrypt for a certificate.
    nc -vz -w 5 <the router's home address> 443         # should time out
    ip -6 route | grep default                          # "via fe80::... dev <if>"
    nc -6 -vz -w 5 fe80::...%<if> 22                    # should time out
+   nc -6 -vz -w 5 <the Mac's global IPv6 address> 22   # should time out
    curl -sI https://github.com | head -1               # should work
    ```
 
@@ -441,12 +452,20 @@ asks Let's Encrypt for a certificate.
    Mac, `tart exec` reaches the virtual machine without the network:
 
    ```bash
-   tart exec squawk-relay sudo -u squawk-relay sqlite3 /var/lib/squawk-relay/relay.db \
-     "VACUUM INTO '/var/lib/squawk-relay/backup.db'"
-   tart exec squawk-relay sudo sh -c \
-     'cat /var/lib/squawk-relay/backup.db && rm /var/lib/squawk-relay/backup.db' \
-     > relay-$(date +%F).db
+   #!/bin/sh
+   set -e
+   out=relay-$(date +%F).db
+   tart exec squawk-relay sudo -u squawk-relay sh -c '
+     rm -f /var/lib/squawk-relay/backup.db
+     sqlite3 /var/lib/squawk-relay/relay.db \
+       "VACUUM INTO '"'"'/var/lib/squawk-relay/backup.db'"'"'"'
+   tart exec squawk-relay sudo cat /var/lib/squawk-relay/backup.db > "$out.part"
+   tart exec squawk-relay sudo rm /var/lib/squawk-relay/backup.db
+   mv "$out.part" "$out"
    ```
+
+   The file gets its final name only when every step worked, so a failed
+   night leaves a `.part` file rather than a backup that looks good.
 
    (`sqlite3` is in the `sqlite3` package.) Then copy the file off the Mac,
    kept as private as the data directory itself.

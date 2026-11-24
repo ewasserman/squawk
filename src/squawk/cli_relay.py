@@ -23,7 +23,7 @@ from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
 from squawk.encoding import is_key_id
-from squawk.relay import RelayServer
+from squawk.relay import RelayLimits, RelayServer
 from squawk.relay.access import (
     ACCESS_MODES,
     DEFAULT_MAX_KEYS_PER_USER,
@@ -63,6 +63,8 @@ def relay_data_dir(env: Mapping[str, str]) -> str:
     return os.path.join(squawk_home(env), "relay")
 
 
+_CHECK_S = round(RelayLimits().access_check_interval_s)
+
 SERVE_USAGE = f"""Usage: squawk relay serve [options]
 
 Runs a relay. The guide to running one is docs/running-a-relay.md.
@@ -85,18 +87,18 @@ Options:
                             in from (default {DEFAULT_MAX_KEYS_PER_USER})
   --help, -h                show this text
 
-SIGHUP rereads the allowed keys or users file at once; otherwise it is
-reread every 20 seconds.
+The relay checks the allowed keys or users file every {_CHECK_S} seconds.
+People added can connect after the next check; people removed are cut off
+once two checks in a row agree (within about {2 * _CHECK_S} seconds). SIGHUP
+rereads the file and applies both at once.
 """
 
 
 async def _serve(args: list[str], io: CliIo) -> int:
-    if "--help" in args or "-h" in args:
-        io.stdout(SERVE_USAGE)
-        return 0
     values, _ = parse_args(
         args,
         {
+            "help": Opt("boolean", "h"),
             "host": Opt("string"),
             "port": Opt("string", "p"),
             "data": Opt("string"),
@@ -108,6 +110,9 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "max-keys-per-user": Opt("string"),
         },
     )
+    if values.get("help") is True:
+        io.stdout(SERVE_USAGE)
+        return 0
     port_text = string_value(values, "port")
     port = DEFAULT_PORT
     if port_text is not None:
