@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
@@ -25,6 +26,7 @@ from squawk.relay_client import (
     RELAY_ALLOW_PLAIN_KEY,
     RELAY_URL_KEY,
     RelayClient,
+    RelayLoginFailed,
     relay_client_from_settings,
 )
 from squawk.store import OutboundItem, StoredMessage
@@ -407,3 +409,73 @@ async def test_a_relay_that_wants_a_sign_in_is_reported_and_not_retried_at_once(
 
 def make_key_id() -> str:
     return identity_from_secret_key("x", ed25519_random_secret_key()).id
+
+
+async def _fake_relay_sending(login_frame: dict[str, Any]) -> Any:
+    """A relay that asks for a sign-in and answers `login-start` with `login_frame`."""
+
+    async def handler(ws: ServerConnection) -> None:
+        await ws.send(
+            jsontext.stringify({"t": "hello", "v": 1, "key": make_key_id(), "challenge": "c" * 43})
+        )
+        await ws.recv()
+        await ws.send(jsontext.stringify({"t": "login-required", "provider": "github"}))
+        await ws.recv()
+        await ws.send(jsontext.stringify(login_frame))
+        with contextlib.suppress(ConnectionClosed):
+            await ws.recv()
+
+    return serve(handler, "127.0.0.1", 0)
+
+
+async def _client_for(port: int) -> tuple[Daemon, RelayClient, str]:
+    home = tempfile.mkdtemp(prefix="sq-", dir="/tmp")
+    init_identity(home, "alice")
+    client = RelayClient(f"ws://127.0.0.1:{port}", allow_plain=True, backoff_min_ms=50)
+    daemon = Daemon(
+        home, transport=NetworkTransport(host="127.0.0.1", discovery=False, relay=client)
+    )
+    await daemon.start()
+    return daemon, client, home
+
+
+async def test_a_sign_in_address_not_on_github_is_refused() -> None:
+    frame = {
+        "t": "login",
+        "verification_uri": "https://github-login.example/device",
+        "user_code": "ABCD-1234",
+        "expires_at": "2030-01-01T00:00:00Z",
+    }
+    async with await _fake_relay_sending(frame) as server:
+        daemon, client, home = await _client_for(server.sockets[0].getsockname()[1])
+        try:
+            await wait_for(lambda: client.access_problem == "needs-sign-in")
+            with pytest.raises(RelayLoginFailed, match="not on GitHub"):
+                await client.start_login()
+        finally:
+            await daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+
+async def test_control_characters_from_the_relay_are_not_shown_and_stopping_ends_the_wait() -> None:
+    frame = {
+        "t": "login",
+        "verification_uri": "https://github.com/login/device\x1b]0;x\x07",
+        "user_code": "AB\x1b[2JCD-1234",
+        "expires_at": "2030-01-01T00:00:00Z",
+    }
+    async with await _fake_relay_sending(frame) as server:
+        daemon, client, home = await _client_for(server.sockets[0].getsockname()[1])
+        try:
+            await wait_for(lambda: client.access_problem == "needs-sign-in")
+            prompt = await client.start_login()
+            assert prompt is not None
+            assert prompt.verification_uri == "https://github.com/login/device]0;x"
+            assert prompt.user_code == "AB[2JCD-1234"
+            waiting = asyncio.ensure_future(client.wait_login())
+            await client.stop()
+            with pytest.raises(RelayLoginFailed, match="stopped using this relay"):
+                await asyncio.wait_for(waiting, 3)
+        finally:
+            await daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)

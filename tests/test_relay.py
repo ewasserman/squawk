@@ -1864,3 +1864,209 @@ def test_a_users_file_that_lists_no_users_is_refused_at_start(
     write_keys(path, "# nobody", "")
     with pytest.raises(AllowedUsersError, match="lists no users"):
         github_access(path, github)
+
+
+# `squawk relay admin`.
+
+
+async def admin(*args: str) -> tuple[int, str, str]:
+    """Runs `squawk relay admin ...`; returns its exit code, output and errors."""
+    out: list[str] = []
+    err: list[str] = []
+    io = CliIo(stdout=out.append, stderr=err.append, env={"SQUAWK_HOME": "/nonexistent"})
+    code = await run(["relay", "admin", *args], io)
+    return code, "".join(out), "".join(err)
+
+
+def fill_users(data_dir: str) -> None:
+    """Two keys for alice (one of them without a mailbox), one for Bob, and a
+    user whose only key was removed."""
+    store = RelayStore.open(data_dir)
+    try:
+        store.record_sign_in(alice.id, 101, "alice", START_MS)
+        store.touch_mailbox(alice.id, START_MS + DAY_MS)
+        store.record_sign_in(carol.id, 101, "alice", START_MS + HOUR_MS)
+        store.record_sign_in(bob.id, 202, "Bob", START_MS + DAY_MS)
+        store.touch_mailbox(bob.id, START_MS + DAY_MS)
+        gone = make_identity("gone")
+        store.record_sign_in(gone.id, 303, "dave", START_MS)
+        store.delete_mailbox(gone.id)
+    finally:
+        store.close()
+
+
+async def test_admin_users_lists_each_user_with_their_keys(data_dir: str) -> None:
+    fill_users(data_dir)
+    code, out, err = await admin("users", "--data", data_dir)
+    assert (code, err) == (0, "")
+    assert out == (
+        "alice (GitHub id 101)\n"
+        "  first signed in 2027-01-15 08:00 UTC, last signed in 2027-01-15 09:00 UTC\n"
+        "  keys (2):\n"
+        f"    {alice.id}  added 2027-01-15 08:00 UTC, last connected 2027-01-16 08:00 UTC\n"
+        f"    {carol.id}  added 2027-01-15 09:00 UTC, no mailbox\n"
+        "\n"
+        "Bob (GitHub id 202)\n"
+        "  first signed in 2027-01-16 08:00 UTC, last signed in 2027-01-16 08:00 UTC\n"
+        "  keys (1):\n"
+        f"    {bob.id}  added 2027-01-16 08:00 UTC, last connected 2027-01-16 08:00 UTC\n"
+        "\n"
+        "dave (GitHub id 303)\n"
+        "  first signed in 2027-01-15 08:00 UTC, last signed in 2027-01-15 08:00 UTC\n"
+        "  no keys\n"
+    )
+
+
+async def test_admin_users_as_json(data_dir: str) -> None:
+    fill_users(data_dir)
+    code, out, _ = await admin("users", "--data", data_dir, "--json")
+    assert code == 0
+    users = jsontext.parse(out)
+    assert isinstance(users, dict)
+    assert [u["login"] for u in users["users"]] == ["alice", "Bob", "dave"]
+    assert users["users"][0] == {
+        "login": "alice",
+        "github_id": 101,
+        "first_signed_in_at": iso_from_ms(START_MS),
+        "last_signed_in_at": iso_from_ms(START_MS + HOUR_MS),
+        "keys": [
+            {
+                "key": alice.id,
+                "added_at": iso_from_ms(START_MS),
+                "last_connected_at": iso_from_ms(START_MS + DAY_MS),
+            },
+            {
+                "key": carol.id,
+                "added_at": iso_from_ms(START_MS + HOUR_MS),
+                "last_connected_at": None,
+            },
+        ],
+    }
+    assert users["users"][2]["keys"] == []
+
+
+async def test_admin_users_says_when_no_user_has_signed_in(data_dir: str) -> None:
+    store = RelayStore.open(data_dir)
+    store.touch_mailbox(alice.id, START_MS)  # a key admitted without GitHub
+    store.close()
+    code, out, _ = await admin("users", "--data", data_dir)
+    assert code == 0
+    assert out.startswith("No GitHub user has signed in to this relay.\n")
+    assert "allowed keys file" in out
+    code, out, _ = await admin("users", "--data", data_dir, "--json")
+    assert (code, jsontext.parse(out)) == (0, {"users": []})
+
+
+async def test_admin_uses_the_default_data_directory(tmp_path: Any) -> None:
+    data = os.path.join(str(tmp_path), "relay")
+    RelayStore.open(data).close()
+    io = CliIo(stdout=lambda _: None, stderr=lambda _: None, env={"SQUAWK_RELAY_DATA": data})
+    assert await run(["relay", "admin", "users"], io) == 0
+
+
+@pytest.mark.parametrize("command", [["users"], ["remove-key", alice.id]])
+async def test_admin_does_not_create_a_missing_data_directory(
+    data_dir: str, command: list[str]
+) -> None:
+    code, out, err = await admin(*command, "--data", data_dir)
+    assert (code, out) == (1, "")
+    assert f"there is no relay data in {data_dir}" in err
+    assert not os.path.exists(data_dir)
+
+
+async def test_admin_without_a_subcommand_prints_usage() -> None:
+    code, _, err = await admin()
+    assert code == 2
+    assert "Usage: squawk relay admin <subcommand>" in err
+    assert "remove-key" in err
+
+
+async def test_admin_remove_key_deletes_the_mailbox_and_forgets_the_owner(data_dir: str) -> None:
+    store = RelayStore.open(data_dir)
+    store.record_sign_in(alice.id, 101, "alice", START_MS)
+    store.touch_mailbox(alice.id, START_MS)
+    store.touch_mailbox(bob.id, START_MS)
+    store.set_allowed(alice.id, [bob.id])
+    store.add_message(bob.id, alice.id, "m1", "{}", START_MS)
+    store.add_invite("hash", alice.id, START_MS + HOUR_MS)
+    store.close()
+
+    code, out, err = await admin("remove-key", alice.id, "--data", data_dir)
+    assert (code, err) == (0, "")
+    assert out.startswith(
+        f"Removed the key {alice.id} (GitHub user alice, id 101): deleted its mailbox, "
+        "its allow list, 1 waiting message and any open invite.\n"
+    )
+    store = RelayStore.open(data_dir)
+    try:
+        assert not store.has_mailbox(alice.id)
+        assert store.key_owner(alice.id) is None
+        assert store.count_keys_of(101) == 0
+        assert not store.is_allowed(alice.id, bob.id)
+        assert store.usage(alice.id, 0).messages == 0
+        assert store.invite_creator("hash") is None
+        assert store.has_mailbox(bob.id)
+    finally:
+        store.close()
+
+    # Bob's key has a mailbox but no GitHub owner (keys or open mode).
+    code, out, _ = await admin("remove-key", bob.id, "--data", data_dir)
+    assert code == 0
+    assert out.startswith(f"Removed the key {bob.id}: deleted its mailbox")
+
+
+async def test_admin_remove_key_refuses_an_unknown_or_malformed_key(data_dir: str) -> None:
+    RelayStore.open(data_dir).close()
+    code, out, err = await admin("remove-key", alice.id, "--data", data_dir)
+    assert (code, out) == (1, "")
+    assert f"this relay does not know the key {alice.id}" in err
+    code, _, err = await admin("remove-key", "not-a-key", "--data", data_dir)
+    assert code == 2
+    assert '"not-a-key" is not a key id' in err
+    code, _, err = await admin("remove-key", "--data", data_dir)
+    assert code == 2
+    assert "Usage: squawk relay admin remove-key <key>" in err
+
+
+async def test_a_running_relay_closes_the_connection_of_a_key_removed_by_admin(
+    start_relay: RelayFactory, users_file: str, github: FakeGitHub, data_dir: str
+) -> None:
+    relay = await start_relay(
+        RelayLimits(access_check_interval_s=0.05), access=github_access(users_file, github)
+    )
+    a = await start_sign_in(relay, alice)
+    assert (await a.recv())["t"] == "ok"
+    github.user = GitHubUser("bob", 202)
+    b = await start_sign_in(relay, bob)
+    assert (await b.recv())["t"] == "ok"
+
+    code, _, err = await admin("remove-key", alice.id, "--data", data_dir)
+    assert (code, err) == (0, "")
+
+    assert await close_code(a.ws) == (4004, "removed by the operator")
+    await b.allow(carol)  # other connections carry on
+    # The key was forgotten, so its next connection is asked to sign in again.
+    again = await login(relay, alice, expect_ok=False)
+    assert await again.recv() == {"t": "login-required", "provider": "github"}
+    await again.close()
+    await b.close()
+
+
+async def test_the_removed_key_check_leaves_connected_keys_with_mailboxes_alone(
+    start_relay: RelayFactory,
+) -> None:
+    relay = await start_relay()
+    a = await login(relay, alice)
+    relay.close_removed_keys()
+    await a.allow(bob)
+    await a.close()
+
+
+async def test_a_removed_key_is_closed_at_its_next_frame(
+    start_relay: RelayFactory, data_dir: str
+) -> None:
+    relay = await start_relay(RelayLimits(access_check_interval_s=3600))
+    a = await login(relay, alice)
+    relay.store.delete_mailbox(alice.id)  # as `squawk relay admin remove-key` does
+    await a.send({"t": "allow", "req": "r", "senders": []})
+    assert await close_code(a.ws) == (4004, "removed by the operator")

@@ -1247,6 +1247,40 @@ class Daemon:
                 raise RpcError(RpcErrorCode.APPLICATION_ERROR, str(err)) from err
             return {"relay": self.relay_status()}
 
+        def current_relay() -> "RelayClient":
+            relay = self.transport.relay
+            if relay is None:
+                raise RpcError(
+                    RpcErrorCode.APPLICATION_ERROR,
+                    "no relay is set; `squawk relay set <url>` sets one",
+                )
+            return relay
+
+        async def relay_login_start(_params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            from squawk.relay_client import RelayLoginFailed
+
+            try:
+                prompt = await current_relay().start_login()
+            except RelayLoginFailed as err:
+                raise RpcError(RpcErrorCode.APPLICATION_ERROR, str(err)) from err
+            if prompt is None:
+                return {"needed": False}
+            return {
+                "needed": True,
+                "verification_uri": prompt.verification_uri,
+                "user_code": prompt.user_code,
+                "expires_at": prompt.expires_at,
+            }
+
+        async def relay_login_wait(_params: Any, _connection: RpcConnection) -> dict[str, Any]:
+            from squawk.relay_client import RelayLoginFailed
+
+            try:
+                user = await current_relay().wait_login()
+            except RelayLoginFailed as err:
+                raise RpcError(RpcErrorCode.APPLICATION_ERROR, str(err)) from err
+            return {"user": user}
+
         async def send(params: Any, _connection: RpcConnection) -> SendResult:
             return await self.send(parse_send_params(params))
 
@@ -1356,6 +1390,8 @@ class Daemon:
         server.handle("subscribe", subscribe)
         server.handle("status", status)
         server.handle("set_relay", set_relay)
+        server.handle("relay_login_start", relay_login_start)
+        server.handle("relay_login_wait", relay_login_wait)
         server.handle("stop", stop)
 
     def _spawn_stop(self) -> None:

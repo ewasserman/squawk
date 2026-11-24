@@ -50,6 +50,7 @@ import contextlib
 import random
 import sys
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -112,9 +113,66 @@ def _log(text: str) -> None:
 class _AccessRefused(LinkError):
     """The relay will not let this service's key in until something changes."""
 
-    def __init__(self, problem: AccessProblem) -> None:
+    def __init__(self, problem: AccessProblem, reason: str = "") -> None:
         super().__init__(NOT_PERMITTED_TEXT if problem == "not-permitted" else NEEDS_SIGN_IN_TEXT)
         self.problem: AccessProblem = problem
+        self.reason = reason
+        """The `login-failed` reason, when a sign-in was tried."""
+
+    def __str__(self) -> str:
+        return LOGIN_FAILURES.get(self.reason, super().__str__())
+
+
+LOGIN_FAILURES: dict[str, str] = {
+    "not-permitted": "the relay does not permit this GitHub account; ask the person who runs it",
+    "denied": "the sign-in was declined on GitHub",
+    "expired": "the code expired before it was approved; run `squawk relay login` again",
+    "busy": "the relay has too many sign-ins in progress; try again in a few minutes",
+    "error": "the relay could not reach GitHub; try again later",
+}
+"""What each `login-failed` reason means, for the person signing in."""
+
+
+class RelayLoginFailed(LinkError):
+    """Signing in to the relay did not work; `reason` is the relay's reason
+    code (`LOGIN_FAILURES`), or empty when the connection failed instead."""
+
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class LoginPrompt:
+    """What the person must do to sign in: open `verification_uri` and enter
+    `user_code` before `expires_at` (ISO time)."""
+
+    verification_uri: str
+    user_code: str
+    expires_at: str
+
+
+class _Login:
+    """A sign-in asked for with `RelayClient.start_login`. `prompt` completes
+    with the code to show (or None when the relay let the key in without
+    one); `result` with the GitHub login the person signed in as."""
+
+    def __init__(self) -> None:
+        loop = asyncio.get_running_loop()
+        self.prompt: asyncio.Future[LoginPrompt | None] = loop.create_future()
+        self.result: asyncio.Future[str | None] = loop.create_future()
+        for future in (self.prompt, self.result):
+            # Mark failures as seen, so that one nobody waits for is not logged.
+            future.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+    def fail(self, err: BaseException) -> None:
+        for future in (self.prompt, self.result):
+            if not future.done():
+                future.set_exception(err)
+
+    @property
+    def done(self) -> bool:
+        return self.result.done()
 
 
 class RelayRefused(LinkError):
@@ -273,6 +331,7 @@ class RelayClient:
         list and `fetch` have been sent)."""
         self._rooms: dict[str, RoomLink] = {}
         self._invite_waiters: dict[str, asyncio.Future[RoomLink]] = {}
+        self._login: _Login | None = None
         self.on_live: Callable[[Envelope], None] | None = None
         """Called with each live request or answer (`forward`ed to us) from a
         paired contact, already opened and checked."""
@@ -286,6 +345,8 @@ class RelayClient:
 
     async def stop(self) -> None:
         self._stopped = True
+        if self._login is not None:
+            self._login.fail(RelayLoginFailed("the service stopped using this relay"))
         tasks = [t for t in (self._runner, *self._tasks) if t is not None]
         for task in tasks:
             task.cancel()
@@ -293,6 +354,38 @@ class RelayClient:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._ws.close(1001, "shutting down"), 2)
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def start_login(self, timeout_s: float = 30.0) -> LoginPrompt | None:
+        """Connects to the relay to sign in with GitHub (docs/plan/relay-access.md,
+        "The client"). Returns what the person must do, or None when the relay
+        let this service in without a sign-in (it is connected, or the relay
+        is not in github mode). Raises `RelayLoginFailed` if the relay refuses
+        or cannot be reached. Then call `wait_login`."""
+        if self._ready or self._setting_up:
+            return None
+        if self._stopped:
+            raise RelayLoginFailed("the service stopped using this relay")
+        login = self._login
+        if login is None or login.done:
+            login = self._login = _Login()
+            self.retry_now()
+        try:
+            return await asyncio.wait_for(asyncio.shield(login.prompt), timeout_s)
+        except TimeoutError:
+            raise RelayLoginFailed(
+                f"the relay did not answer ({self.last_error or 'still connecting'})"
+            ) from None
+
+    async def wait_login(self) -> str | None:
+        """Waits for the sign-in started by `start_login` to end. Returns the
+        GitHub login the person signed in as (None if no sign-in was needed);
+        raises `RelayLoginFailed` if it did not work."""
+        login = self._login
+        if login is None:
+            if self._ready:
+                return None
+            raise RelayLoginFailed("no sign-in has been started; run `squawk relay login`")
+        return await asyncio.shield(login.result)
 
     def retry_now(self) -> None:
         """Ends the wait before the next connection attempt."""
@@ -423,8 +516,12 @@ class RelayClient:
                 raise
             except _AccessRefused as err:
                 problem = err.problem
+                if self._login is not None:
+                    self._login.fail(RelayLoginFailed(str(err), err.reason))
             except Exception as err:
                 self.last_error = str(err) or type(err).__name__
+                if self._login is not None:
+                    self._login.fail(RelayLoginFailed(f"cannot reach the relay: {self.last_error}"))
             finally:
                 self._disconnected()
             if ws is not None and ws.close_code == NOT_PERMITTED_CODE:
@@ -497,12 +594,70 @@ class RelayClient:
                 raise _AccessRefused("not-permitted") from err
             raise
         if ok.get("t") == "login-required":
-            raise _AccessRefused("needs-sign-in")
+            login = self._login
+            if login is None or login.done:
+                raise _AccessRefused("needs-sign-in")
+            ok = await self._sign_in(ws, login)
         if ok.get("t") != "ok":
             raise LinkError("the relay did not accept our key")
         self.relay_key = key
         self.last_error = None
         self.access_problem = None
+        if self._login is not None and not self._login.done:
+            # Let in without a sign-in (or after one: `_sign_in` set the result).
+            user = ok.get("user")
+            if not self._login.prompt.done():
+                self._login.prompt.set_result(None)
+            self._login.result.set_result(user if isinstance(user, str) else None)
+
+    async def _sign_in(self, ws: ClientConnection, login: _Login) -> dict[str, Any]:
+        """Runs a sign-in after `login-required`: sends `login-start`, hands the
+        relay's code to `login.prompt`, and returns the relay's `ok` once the
+        person has approved on GitHub. Raises `_AccessRefused` with the
+        reason if the relay sends `login-failed` or closes the connection."""
+        timeout = self._request_timeout_ms / 1000
+        await ws.send(jsontext.stringify({"t": "login-start"}))
+        try:
+            frame = _parse(await asyncio.wait_for(ws.recv(), timeout))
+            if frame.get("t") == "login":
+                uri, code, expires_at = (
+                    frame.get("verification_uri"),
+                    frame.get("user_code"),
+                    frame.get("expires_at"),
+                )
+                if not (isinstance(uri, str) and isinstance(code, str)):
+                    raise LinkError("the relay sent a sign-in without a code")
+                # The relay chooses what is shown; a dishonest one could point
+                # the person at another site or send terminal control codes.
+                uri, code = _printable(uri), _printable(code)
+                if not uri.startswith(GITHUB_PREFIX):
+                    raise LinkError(f"the relay sent a sign-in address not on GitHub: {uri}")
+                if not login.prompt.done():
+                    login.prompt.set_result(LoginPrompt(uri, code, _printable(str(expires_at))))
+                # No time limit here: the relay ends the sign-in when GitHub's
+                # code expires, and pings keep the connection alive meanwhile.
+                frame = _parse(await ws.recv())
+        except ConnectionClosed as err:
+            if err.rcvd is not None and err.rcvd.code == NOT_PERMITTED_CODE:
+                raise _AccessRefused("not-permitted", "not-permitted") from err
+            raise LinkError("the relay closed the connection during the sign-in") from err
+        if frame.get("t") == "login-failed":
+            reason = frame.get("reason")
+            reason = reason if isinstance(reason, str) and reason in LOGIN_FAILURES else "error"
+            problem: AccessProblem = (
+                "not-permitted" if reason == "not-permitted" else "needs-sign-in"
+            )
+            raise _AccessRefused(problem, reason)
+        if frame.get("t") != "ok":
+            what = _printable(str(frame.get("t")))
+            reason = frame.get("reason")
+            if isinstance(reason, str):
+                what += f" ({_printable(reason)})"
+            raise LinkError(f"the relay answered the sign-in with {what}")
+        user = frame.get("user")
+        if isinstance(user, str):
+            frame["user"] = _printable(user)
+        return frame
 
     async def _session(self, ws: ClientConnection) -> None:
         reader = asyncio.ensure_future(self._read(ws))
@@ -730,6 +885,15 @@ class RelayClient:
         if self._guard is None:
             raise RuntimeError("relay client is not started")
         return self._guard
+
+
+GITHUB_PREFIX = "https://github.com/"
+
+
+def _printable(text: str, limit: int = 200) -> str:
+    """`text` without control characters (which could change what a terminal
+    shows), cut to `limit` characters."""
+    return "".join(c for c in text if c.isprintable())[:limit]
 
 
 def _parse(data: str | bytes) -> dict[str, Any]:

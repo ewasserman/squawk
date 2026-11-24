@@ -83,6 +83,7 @@ from). Set it once on each Mac, then pair with a one-time invite code:
 ```bash
 squawk relay set wss://relay.example.com   # both people, once
 squawk relay status                        # "Connected: yes"
+squawk relay login                         # only if status says it needs a sign-in
 squawk invite                              # Alice: prints a code
 squawk pair --code <code>                  # Bob, within 10 minutes
 ```
@@ -141,7 +142,18 @@ and deletes the mailbox of a key taken out of it. With `--access github
 owner signs in with GitHub as a user listed in the file (one GitHub user name
 per line, optionally followed by their numeric GitHub id), up to
 `--max-keys-per-user` keys each (5 by default); the file is reread in the
-same way.
+same way. Each person then runs `squawk relay login` once per computer: it
+prints a GitHub address and a code to enter there, and waits until they have
+approved.
+
+On the machine where the relay runs, `squawk relay admin users` lists the
+GitHub users that have signed in, with their keys and when each last
+connected (`--json` for a program to read), and `squawk relay admin
+remove-key KEY` forgets a key and deletes its mailbox. Both take `--data DIR`
+like `serve` and work while the relay is running; the running relay closes
+the removed key's connection within a minute. In GitHub mode the key must
+sign in again to come back; in keys mode, also take it out of the allowed
+keys file.
 
 **On one machine, for testing.** From a clone of this repository:
 
@@ -259,6 +271,7 @@ squawk status            # service status, sessions, queues and relay connection
 squawk relay set <url>   # reach contacts on other networks through a relay (wss://)
 squawk relay set --off   # stop using a relay
 squawk relay status      # the relay, whether it is connected, messages waiting for it
+squawk relay login       # sign in with GitHub, for a relay that asks for it
 squawk invite            # a one-time code for pairing through the relay
 squawk pair --code <c>   # join someone's invite through the relay
 squawk daemon start|stop|status
