@@ -11,7 +11,8 @@ main reason this document exists.
 Task numbers in threats 1–8 refer to the sub-issues of GitHub issue #1 (task
 3 is #4, and so on: task *n* is issue #*n+1*). Threats 9–17 cover the relay;
 their task numbers refer to the sub-issues of GitHub issue #28 (task *n* is
-issue #*n+28*).
+issue #*n+28*). Threats 18–23 cover who may use the relay; they name
+the sub-issues of GitHub issue #50 directly.
 
 ## Who we defend against
 
@@ -350,7 +351,8 @@ not send messages anywhere else.
 
 ### 14. Strangers using the relay to reach you
 
-**Threat.** Anyone can connect to a public relay. A stranger deposits
+**Threat.** Anyone can connect to a relay in `open` mode (see threat 18 for
+the other modes). A stranger deposits
 messages into your mailbox, or fills it up so that your contacts' messages
 are refused.
 
@@ -404,6 +406,93 @@ in [relay.md](relay.md). Messages expire after 7 days. Keeping a public
 relay up under a determined flood is out of scope, as for the local
 service. *Task 3.*
 
+## Who may use the relay
+
+These come from letting the relay operator choose who may use the relay
+([relay-access.md](relay-access.md)). The access check protects the relay and
+its operator; it changes nothing about how messages are protected (threats
+9 to 17). The issues named are the sub-issues of GitHub issue #50.
+
+### 18. Strangers using a relay meant for a group
+
+**Threat.** Someone outside the group opens mailboxes on the relay, stores
+data in them or creates invites.
+
+**Mitigations.** In `keys` and `github` modes the relay checks every key
+right after it proves itself, and a key it does not admit is disconnected
+(close code `4003`) before it can do anything: no mailbox, no invites, no
+deposits. A relay that listens beyond this machine, or behind a proxy
+(`--trust-forwarded-for`), will not start until the operator chooses
+`--access`; `open` is chosen only on purpose, and the relay says at startup
+that anyone who can reach it can use it. An allowed keys or users file that
+cannot be read or has a bad line leaves the previous list in place, and a
+file that lists nobody stops the relay from starting. *#52, #53, #56.*
+
+### 19. A GitHub username changing hands
+
+**Threat.** A listed person renames their GitHub account, and someone else
+takes the old name and signs in with it.
+
+**Mitigations.** The relay remembers the numeric GitHub id of the first
+account that signs in with each name and refuses another account with that
+name. The operator can pin the id in the allowed users file (the relay
+prints it after the first sign-in); a pinned id admits that account under
+whatever name its line uses, so a rename only needs the name on the line
+changed. *What remains:* a name in the file that nobody has signed in with
+yet admits whoever owns that name at the time of their first sign-in.
+*#56.*
+
+### 20. A dishonest relay misusing the sign-in
+
+**Threat.** The code the person enters on GitHub comes from the relay. A
+dishonest relay could show a code that belongs to another OAuth app, one
+that asks for access to the person's repositories, or point the person at a
+look-alike site.
+
+**Mitigations.** The client accepts only a sign-in address that starts with
+`https://github.com/`, and removes control characters from everything the
+relay sends before printing it. GitHub's approval page names the app and
+says what it asks for, and `squawk relay login` tells the person that the
+page should ask only to read their public profile and to deny anything
+more. *What remains:* this depends on the person reading GitHub's page.
+*#57.*
+
+### 21. GitHub tokens at the relay
+
+**Threat.** Someone who controls the relay's machine during a sign-in
+obtains the person's GitHub token.
+
+**Mitigations.** The relay asks for no scopes, so the token can only read
+public profile information. It keeps the token in memory only until it has
+read who the person is, never writes or logs it, and ignores the refresh
+token GitHub may send. The deployment guide recommends turning on "Expire
+user access tokens" for the OAuth app, so a token is valid for 8 hours, and
+not generating a client secret, without which a refresh token cannot be
+used. *What remains:* the relay cannot revoke a token. Without expiry, it
+stays valid at GitHub until the person revokes it in their GitHub settings
+or it goes unused for a year. *#55, #59.*
+
+### 22. The relay knows who owns each key
+
+**Threat.** In `github` mode the relay links each key, and so each mailbox
+and its traffic, to a GitHub account. This adds to the metadata in
+threat 15.
+
+**Accepted.** The operator is the person who chose to admit those users.
+`keys` mode links nothing to an outside account. *#56.*
+
+### 23. Flooding the sign-in
+
+**Threat.** Someone starts many sign-ins, so that the relay keeps asking
+GitHub for codes and polling for tokens, possibly reaching GitHub's rate
+limits and blocking real sign-ins.
+
+**Mitigations.** At most 10 sign-ins started per hour and 2 in progress at
+once from one address, and 20 in progress on the whole relay; a client has
+30 seconds to start a sign-in after the relay asks for one. As with
+threat 17, keeping a public relay up under a determined flood is out of
+scope. *#56.*
+
 ## Summary
 
 | # | Threat | Main mitigation | Task |
@@ -425,3 +514,9 @@ service. *Task 3.*
 | 15 | Metadata seen by the relay | Accepted; plain `ws://` only by opt-in | 1, 4, 9 |
 | 16 | Fake relay | No worse than a dishonest relay; signature bound to the relay's key | 3 |
 | 17 | Flooding the relay | Size, rate and mailbox limits; 7-day expiry | 3 |
+| 18 | Strangers using a relay meant for a group | `keys` or `github` access mode; refused right after proving a key; no start beyond loopback without `--access` | #52, #53, #56 |
+| 19 | A GitHub username changing hands | Numeric GitHub id remembered at first sign-in, or pinned in the file | #56 |
+| 20 | Dishonest relay misusing the sign-in | Only `https://github.com/` addresses shown; warning to deny anything beyond the public profile | #57 |
+| 21 | GitHub tokens at the relay | No scopes; token in memory only until the user is read; expiring tokens recommended | #55, #59 |
+| 22 | Relay knows who owns each key | Accepted; `keys` mode links no outside account | #56 |
+| 23 | Flooding the sign-in | Sign-in limits per address and for the whole relay | #56 |

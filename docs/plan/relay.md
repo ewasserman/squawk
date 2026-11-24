@@ -336,7 +336,9 @@ marked failed as undelivered.
 
 ## Limits
 
-All limits are enforced by the relay; the client keeps within them.
+All limits are enforced by the relay; the client keeps within them. The
+limits on signing in with GitHub are in [relay-access.md](relay-access.md),
+"Limits".
 
 | What | Limit |
 | --- | --- |
@@ -379,9 +381,12 @@ In SQLite, in its data directory (a Docker volume for the local relay):
 - each allow list: owner key id and the allowed key ids;
 - each waiting message: relay id, sender key id, recipient key id, message
   id, arrival time, the sealed message;
-- each open invite: hash of the code, the creating key id, expiry time.
+- each open invite: hash of the code, the creating key id, expiry time;
+- in `github` access mode, each GitHub user that signed in (numeric id,
+  login, first and last sign-in) and which user owns each key. No GitHub
+  tokens are stored ([relay-access.md](relay-access.md)).
 
-Rate limit counters live in memory only.
+Rate limit counters and sign-ins in progress live in memory only.
 
 ## Out of scope for this epic
 

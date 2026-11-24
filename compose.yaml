@@ -2,7 +2,9 @@
 # at ws://localhost:8765 (plain ws:// must be allowed explicitly; see README).
 # It listens only on this machine. To let another machine on the network use
 # it (the two-person trial in docs/setup-guide.md), start it with
-# SQUAWK_RELAY_BIND=0.0.0.0.
+# SQUAWK_RELAY_BIND=0.0.0.0. The image runs it with --access open: anyone
+# who can reach the port can use it. For a relay on the internet, see
+# docs/running-a-relay.md.
 services:
   relay:
     build: .
