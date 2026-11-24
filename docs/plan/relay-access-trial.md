@@ -175,3 +175,9 @@ Corrections to the guide:
     104-byte limit of macOS. A short directory worked. Filed as #65.
 
 Problems filed:
+
+- Corrections 1-9: applied to the guide and the setup guide (#66).
+- `squawk relay serve --help` (correction 8): added (#67).
+- Correction 12: #65.
+- Corrections 10 and 11 are about the client, not relay access, and are
+  proposed separately.
