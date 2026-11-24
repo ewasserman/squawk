@@ -10,13 +10,18 @@ Problems found become tasks in the epic.
 Install squawk v0.5.0 (the first release with access control) as the
 guide's "Installing squawk" says, and follow its example of a relay at
 home: a Tart Linux virtual
-machine on the Mac Studio, bridged networking, no shared folders, only TCP
+machine on a Mac, bridged networking, no shared folders, only TCP
 443 forwarded from the router, Caddy, a DuckDNS name, and the relay as a
 systemd service with `--access github`. The allowed users file lists the
 two people who take part, **A** and **B**. **C** is a third GitHub account
 that is not in the file (a second account of either person will do).
 
 Note anything in the guide that was wrong, missing or unclear.
+
+**As run:** the virtual machine was *not* bridged onto the home network, as
+the guide says, but onto a VLAN of its own (a DMZ) behind the home router,
+with the Mac holding no address on that VLAN. See correction 1 below for
+why.
 
 ## Steps
 
@@ -28,7 +33,7 @@ hotspot will do).
    - Expected: `/healthz` answers `{"status":"ok",...}` with a valid
      certificate; the other three ports do not connect.
 2. **The virtual machine cannot reach the home network.** Inside the
-   virtual machine, `nc -vz -w 5 <Mac Studio's LAN address> 22` and the
+   virtual machine, `nc -vz -w 5 <the Mac's LAN address> 22` and the
    same for the router's admin page (443 or 80).
    - Expected: neither connects. `curl https://github.com` works.
 3. **A signs in.** On A's Mac: `squawk relay set wss://<name>`, then
@@ -70,18 +75,75 @@ hotspot will do).
 
 | Step | Worked? | Notes |
 | --- | --- | --- |
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Partly | 443 reached from a phone on cellular; certificate issued over TLS-ALPN (after correction 5). Ports 22, 80, 8765 from outside not yet checked. |
+| 2 | Yes | Tested from inside the VM: github.com, Let's Encrypt and DuckDNS reachable; the Mac, other LAN hosts and the router's admin ports not, over IPv4 and, after correction 2, IPv6. |
+| 3 | Yes | After updating A's client from 0.3.1 to 0.5.0 (correction 7). The relay logged the first sign-in with the pinned id. |
 | 4 | | |
 | 5 | | |
 | 6 | | |
 | 7 | | |
 | 8 | | |
-| 9 | | |
+| 9 | Yes | Lists A with one key, first and last sign-in times. |
 | 10 | | |
-| 11 | | |
+| 11 | | No backup set up yet. |
 
 Corrections to the guide:
+
+1. **Bridging onto the home network does not isolate the VM.** The guide
+   bridges the VM onto the home LAN and suggests router rules so it "cannot
+   start connections to anything else on your home network". Hosts on one
+   subnet talk through the switch, never the router, so no router rule can
+   do that: the VM could reach the Mac it runs on and every other home
+   device. The guide should put the VM on its own segment (a VLAN, or a
+   separate Ethernet port) and firewall that segment at the router: drop
+   from it to all private ranges and to the router itself, except DHCP.
+   With macOS, `networksetup -createVLAN <name> en0 <id>` makes `vlan0`;
+   turning IPv4 and IPv6 off on its service (named "<name> Configuration")
+   leaves the Mac with no address on it, and `tart run --net-bridged=vlan0`
+   works. Tagged frames passed through unmanaged switches without trouble.
+2. **IPv6 link-local gets past IPv4-only rules.** With IPv6 set to none on
+   the DMZ network, the router still had a link-local (fe80::) address on
+   it, and from the VM its SSH, web admin and DNS answered over IPv6. The
+   IPv4 rules do not apply. A rule dropping TCP/UDP from `fe80::/10` to the
+   router (a local-input IPv6 rule) closed it. The guide should tell
+   operators to test from inside the VM, over both IPv4 and IPv6.
+3. **The cirruslabs Ubuntu image has default logins.** User `admin` with
+   password `admin`, a second user `ubuntu`, passwordless sudo, and SSH
+   with password login listening on all addresses. The guide should say to
+   lock the passwords and turn SSH off (`systemctl mask ssh.socket
+   ssh.service`) before the VM is reachable; `tart exec` manages the VM
+   through the guest agent without the network.
+4. **"Automatic security updates" do not cover Caddy, squawk or uv.**
+   Ubuntu's unattended-upgrades takes only Ubuntu's archive. Caddy from its
+   own repository (Ubuntu 24.04's packaged Caddy is an old 2.6) needs its
+   origin added (`origin=cloudsmith/caddy/stable,codename=any-version`), or
+   the one internet-facing program never updates. Kernel updates also need
+   `Unattended-Upgrade::Automatic-Reboot`. Nothing updates squawk's Python
+   dependencies between releases.
+5. **Starting Caddy before the port forward is live fails, and the failures
+   count.** Caddy asked for a certificate seconds after the forward was
+   saved, before the router had applied it; TLS-ALPN timed out and the
+   HTTP-01 fallback failed on the unforwarded port 80. Let's Encrypt allows
+   5 failed validations per hostname per hour. The guide should say to
+   check the forward from outside first (or with Caddy stopped and a packet
+   capture in the VM), then start Caddy with the real name.
+6. **The relay is not reachable from its own home network.** From the home
+   LAN, the public name times out: the router does not hairpin the forward,
+   and the DMZ rules drop the VM's replies to private addresses. The guide's
+   "check from another network" is necessary, not just advice, and people
+   at the relay's home need split DNS plus a rule letting the DMZ reply to
+   the LAN.
+7. **Old clients fail confusingly.** A 0.3.1 client against a `github`
+   relay reports only "the relay did not accept our key", and `squawk relay
+   login` prints usage. The guide (and the setup guide's step 7) should say
+   that clients need 0.5.0 or later first.
+8. **Smaller gaps.** The guide does not mention UPnP (if the router allows
+   it, the VM could open ports itself; blocking the DMZ from the router
+   covers it); gives no example launchd job for starting the VM (and a
+   LaunchAgent starts only at login, not boot); and `squawk relay serve
+   --help` is not supported, so its options had to be read from the source.
+   The guide's systemd unit could also add standard sandboxing
+   (`ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`,
+   `CapabilityBoundingSet=` and similar); the relay ran fine under it.
 
 Problems filed:
