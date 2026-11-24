@@ -78,13 +78,13 @@ hotspot will do).
 | 1 | Yes | From a phone's hotspot: `/healthz` answered with a valid certificate (issued over TLS-ALPN, after correction 5); 22 and 8765 timed out, 80 gave "host is down". From the home network the results mean nothing: the public address is the router itself there (its SSH answered on 22), and the relay is unreachable (correction 6). |
 | 2 | Yes | Tested from inside the VM: github.com, Let's Encrypt and DuckDNS reachable; the Mac, other LAN hosts and the router's admin ports not, over IPv4 and, after correction 2, IPv6. |
 | 3 | Yes | After updating A's client from 0.3.1 to 0.5.0 (correction 7). The relay logged the first sign-in with the pinned id. |
-| 4 | | |
-| 5 | | |
-| 6 | | |
-| 7 | | |
-| 8 | | |
+| 4 | Yes | B (on 0.5.0, on another network) signed in; the relay logged the first sign-in with B's pinned id, and `admin users` lists B with one key. |
+| 5 | Yes | A and B were already paired from before, so no new invite was needed: the clients send their contact lists when they connect, and the relay let the two exchange messages. Messages flowed both ways, including Claude sessions on each side talking to each other; the relay's message counter rose with each one and nothing was left waiting. Pairing by invite through the relay was not tested here. See corrections 10 and 11. |
+| 6 | Not run | No third GitHub account was at hand. |
+| 7 | Yes | With no reload, the relay reread the file 36 seconds after it was saved, logged "1 removed" and deleted B's mailbox; B's `squawk relay status` then said not connected and not permitted. |
+| 8 | Yes | B's line put back (pinned id checked against GitHub) and the relay reloaded; B ran `squawk relay login`, was connected at once, and messages worked both ways without pairing again. |
 | 9 | Yes | Lists A with one key, first and last sign-in times. |
-| 10 | | |
+| 10 | Yes | After `systemctl restart squawk-relay`, both A's and B's services reconnected by themselves within about a second (the relay recorded both connections 1 second after the restart), and A's next message to B arrived. |
 | 11 | Yes | Nightly backup out of the VM through `tart exec` (no network path needed), using SQLite's `VACUUM INTO` for a consistent copy; restored into a scratch directory, `admin users` matched the live relay exactly. |
 
 Corrections to the guide:
@@ -151,5 +151,18 @@ Corrections to the guide:
    `VACUUM INTO` (or `sqlite3 relay.db ".backup ..."`) run as the relay's
    user, and say that the backup holds the relay's private key, so it
    must be kept as private as the data directory.
+10. **A client that moves networks can wait up to 5 minutes to reconnect.**
+    After failed attempts (here, on the relay's home network), the client
+    backs off to a 5-minute retry and does not notice a network change, so
+    `squawk relay status` said not connected after the move to a working
+    network. `squawk daemon stop && squawk daemon start` fixed it. Either
+    the client should retry when the network changes, or `relay status`
+    should say when it will try next and the guide should mention the
+    restart.
+11. **`squawk contacts` shows a stale route.** A contact paired before
+    either side used a relay shows `route=local network` even when all
+    traffic goes through the relay. The field is the relay the contact
+    reported at pairing time and is never updated; sending ignores it.
+    It should be updated (or dropped), or say what it means.
 
 Problems filed:
