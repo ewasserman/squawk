@@ -143,6 +143,15 @@ per line, optionally followed by their numeric GitHub id), up to
 `--max-keys-per-user` keys each (5 by default); the file is reread in the
 same way.
 
+On the machine where the relay runs, `squawk relay admin users` lists the
+GitHub users that have signed in, with their keys and when each last
+connected (`--json` for a program to read), and `squawk relay admin
+remove-key KEY` forgets a key and deletes its mailbox. Both take `--data DIR`
+like `serve` and work while the relay is running; the running relay closes
+the removed key's connection within a minute. In GitHub mode the key must
+sign in again to come back; in keys mode, also take it out of the allowed
+keys file.
+
 **On one machine, for testing.** From a clone of this repository:
 
 ```bash

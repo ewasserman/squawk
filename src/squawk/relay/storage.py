@@ -109,6 +109,28 @@ class KeyOwner:
     login: str
 
 
+@dataclass(frozen=True)
+class OwnedKey:
+    """A key that a GitHub user signed in with."""
+
+    key_id: str
+    added_at_ms: int
+    """When the key signed in (most recently, if it signed in more than once)."""
+    last_connected_at_ms: int | None
+    """When the key's mailbox last connected; None if it has no mailbox."""
+
+
+@dataclass(frozen=True)
+class SignedInUser:
+    """A GitHub user that has signed in to the relay, with the keys they own."""
+
+    github_id: int
+    login: str
+    first_signed_in_at_ms: int
+    last_signed_in_at_ms: int
+    keys: tuple[OwnedKey, ...]
+
+
 class RelayStore:
     """The relay's database. Open it with `RelayStore.open`. Not thread-safe:
     use it only from the thread that opened it."""
@@ -374,6 +396,27 @@ class RelayStore:
             "SELECT COUNT(*) FROM key_owners WHERE github_user_id = ?", (github_id,)
         ).fetchone()
         return int(row[0])
+
+    def signed_in_users(self) -> list[SignedInUser]:
+        """Every GitHub user that has signed in, sorted by login ignoring case,
+        each with the keys they own, oldest key first. A user whose keys were
+        all removed is still listed, with no keys."""
+        users = self.db.execute(
+            "SELECT id, login, first_signed_in_at_ms, last_signed_in_at_ms FROM github_users"
+            " ORDER BY login COLLATE NOCASE, id"
+        ).fetchall()
+        keys: dict[int, list[OwnedKey]] = {}
+        for row in self.db.execute(
+            "SELECT k.github_user_id, k.key_id, k.added_at_ms, m.last_connected_at_ms"
+            " FROM key_owners k LEFT JOIN mailboxes m ON m.key_id = k.key_id"
+            " ORDER BY k.added_at_ms, k.key_id"
+        ):
+            last = None if row[3] is None else int(row[3])
+            keys.setdefault(int(row[0]), []).append(OwnedKey(str(row[1]), int(row[2]), last))
+        return [
+            SignedInUser(int(r[0]), str(r[1]), int(r[2]), int(r[3]), tuple(keys.get(int(r[0]), [])))
+            for r in users
+        ]
 
     def record_sign_in(self, key_id: str, github_id: int, login: str, now: int) -> bool:
         """Records that `key_id` signed in as the GitHub account `github_id`,

@@ -336,6 +336,10 @@ class RelayServer:
                 self.reload_access(force=False)
             except Exception as err:
                 _log(f"checking the access file failed: {type(err).__name__}: {err}")
+            try:
+                self.close_removed_keys()
+            except Exception as err:
+                _log(f"checking for removed keys failed: {type(err).__name__}: {err}")
 
     def reload_access(self, force: bool = True) -> None:
         """Has the access policy reread its file, then closes the connections
@@ -364,6 +368,21 @@ class RelayServer:
             if self.access.decide(key) is refused:
                 self.store.delete_mailbox(key)
                 _log(f"deleted the mailbox of {key}, which may no longer use the relay")
+
+    def close_removed_keys(self) -> None:
+        """Closes the connection of every connected key whose mailbox is no
+        longer in the database, because `squawk relay admin remove-key`
+        removed it from another process. The relay does this every
+        `access_check_interval_s`.
+
+        A key that has just connected is never closed by mistake: `_admit`
+        creates its mailbox in the same step that adds it to `_clients`, with
+        nothing in between that lets this check run."""
+        for client in list(self._clients.values()):
+            if not self.store.has_mailbox(client.key):
+                self._drop(client)
+                client.close(NOT_PERMITTED_CODE, "not permitted")
+                _log(f"closed the connection of {client.key}, whose key was removed")
 
     def _rate_table(self) -> dict[str, Rate]:
         """Each rate limit counter's name and its limit."""

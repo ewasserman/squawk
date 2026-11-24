@@ -4,6 +4,8 @@
 `squawk relay set <url>` chooses the relay this machine's service uses to
 reach contacts on other networks (`--off` removes it), and
 `squawk relay status` shows whether the service is connected to it.
+`squawk relay admin` lists the GitHub users that signed in to a relay run on
+this machine and removes keys from it.
 """
 
 import asyncio
@@ -11,13 +13,16 @@ import contextlib
 import os
 import signal
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import cast
 
+from squawk import jsontext
 from squawk.cli_args import Opt, ParseArgsError, parse_args, string_value
 from squawk.cli_io import CliIo, Command
 from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
+from squawk.encoding import is_key_id
 from squawk.relay import RelayServer
 from squawk.relay.access import (
     ACCESS_MODES,
@@ -33,10 +38,12 @@ from squawk.relay.access import (
     default_access_mode,
 )
 from squawk.relay.github import UrllibGitHub
+from squawk.relay.storage import DB_FILE, RelayStore, SignedInUser
 from squawk.relay_client import NEEDS_SIGN_IN_TEXT, NOT_PERMITTED_TEXT, RELAY_URL_KEY
 from squawk.relay_url import RelayUrlError, check_relay_url
 from squawk.rpc import RpcError
 from squawk.store import Store
+from squawk.timefmt import iso_from_ms
 
 CONNECT_WAIT_S = 5.0
 """How long `squawk relay set` and `squawk setup --relay` wait to see
@@ -387,6 +394,182 @@ async def _status(args: list[str], io: CliIo) -> int:
     return 0
 
 
+# `squawk relay admin`: works directly on the database of a relay run on this
+# machine, which may be running in another process at the same time (SQLite
+# lets both use the database; each waits briefly for the other's writes).
+
+
+def _open_relay_data(command: str, data_option: str | None, io: CliIo) -> RelayStore | None:
+    """Opens the relay database in `--data DIR` (default: where `squawk
+    relay serve` keeps it). Reports an error and returns None if there is no
+    relay data there; it never creates a data directory."""
+    data_dir = data_option or relay_data_dir(io.env)
+    if not os.path.isfile(os.path.join(data_dir, DB_FILE)):
+        io.stderr(
+            f"squawk relay admin {command}: there is no relay data in {data_dir}"
+            " (give the relay's data directory with --data DIR)\n"
+        )
+        return None
+    return RelayStore.open(data_dir)
+
+
+def _readable_time(ms: int) -> str:
+    """`ms` as a date and time in UTC to the minute, e.g. "2026-11-21 12:00 UTC"."""
+    return datetime.fromtimestamp(ms / 1000, UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+NO_USERS_TEXT = (
+    "No GitHub user has signed in to this relay.\n"
+    "(A relay run with --access keys has no users: the keys that may use it are the ones "
+    "in its allowed keys file.)\n"
+)
+
+
+def format_relay_users(users: list[SignedInUser]) -> str:
+    """The report `squawk relay admin users` prints."""
+    if not users:
+        return NO_USERS_TEXT
+    blocks = []
+    for user in users:
+        lines = [
+            f"{user.login} (GitHub id {user.github_id})",
+            f"  first signed in {_readable_time(user.first_signed_in_at_ms)},"
+            f" last signed in {_readable_time(user.last_signed_in_at_ms)}",
+        ]
+        if not user.keys:
+            lines.append("  no keys")
+        else:
+            lines.append(f"  keys ({len(user.keys)}):")
+            for key in user.keys:
+                connected = (
+                    "no mailbox"
+                    if key.last_connected_at_ms is None
+                    else f"last connected {_readable_time(key.last_connected_at_ms)}"
+                )
+                lines.append(
+                    f"    {key.key_id}  added {_readable_time(key.added_at_ms)}, {connected}"
+                )
+        blocks.append("\n".join(lines) + "\n")
+    return "\n".join(blocks)
+
+
+def relay_users_json(users: list[SignedInUser]) -> dict[str, object]:
+    """What `squawk relay admin users --json` prints, before it is turned into text."""
+    return {
+        "users": [
+            {
+                "login": user.login,
+                "github_id": user.github_id,
+                "first_signed_in_at": iso_from_ms(user.first_signed_in_at_ms),
+                "last_signed_in_at": iso_from_ms(user.last_signed_in_at_ms),
+                "keys": [
+                    {
+                        "key": key.key_id,
+                        "added_at": iso_from_ms(key.added_at_ms),
+                        "last_connected_at": None
+                        if key.last_connected_at_ms is None
+                        else iso_from_ms(key.last_connected_at_ms),
+                    }
+                    for key in user.keys
+                ],
+            }
+            for user in users
+        ]
+    }
+
+
+async def _admin_users(args: list[str], io: CliIo) -> int:
+    values, _ = parse_args(args, {"data": Opt("string"), "json": Opt("boolean")})
+    store = _open_relay_data("users", string_value(values, "data"), io)
+    if store is None:
+        return 1
+    try:
+        users = store.signed_in_users()
+    finally:
+        store.close()
+    if values.get("json") is True:
+        io.stdout(jsontext.stringify(relay_users_json(users), "  ") + "\n")
+    else:
+        io.stdout(format_relay_users(users))
+    return 0
+
+
+REMOVE_KEY_USAGE = "Usage: squawk relay admin remove-key <key> [--data DIR]\n"
+
+
+async def _admin_remove_key(args: list[str], io: CliIo) -> int:
+    values, positionals = parse_args(args, {"data": Opt("string")}, allow_positionals=True)
+    if len(positionals) != 1:
+        io.stderr(REMOVE_KEY_USAGE)
+        return 2
+    key = positionals[0]
+    if not is_key_id(key):
+        io.stderr(f'squawk relay admin remove-key: "{key}" is not a key id\n')
+        return 2
+    store = _open_relay_data("remove-key", string_value(values, "data"), io)
+    if store is None:
+        return 1
+    try:
+        owner = store.key_owner(key)
+        if owner is None and not store.has_mailbox(key):
+            io.stderr(f"squawk relay admin remove-key: this relay does not know the key {key}\n")
+            return 1
+        waiting = store.usage(key, 0).messages
+        store.delete_mailbox(key)
+    finally:
+        store.close()
+    owned = "" if owner is None else f" (GitHub user {owner.login}, id {owner.github_id})"
+    plural = "" if waiting == 1 else "s"
+    io.stdout(
+        f"Removed the key {key}{owned}: deleted its mailbox, its allow list, "
+        f"{waiting} waiting message{plural} and any open invite.\n"
+        "If the relay is running, it closes the key's connection within a minute.\n"
+        "In GitHub mode the key must sign in again to use the relay; in keys mode, take it "
+        "out of the allowed keys file too, or it can connect again.\n"
+    )
+    return 0
+
+
+ADMIN_SUBCOMMANDS: dict[str, Command] = {
+    "users": Command(
+        "list the GitHub users that signed in, with their keys (--data DIR, --json)",
+        _admin_users,
+    ),
+    "remove-key": Command(
+        "forget a key and delete its mailbox, allow list, waiting messages and invite: "
+        "remove-key <key> (--data DIR)",
+        _admin_remove_key,
+    ),
+}
+
+
+async def _dispatch(
+    usage: str, subcommands: Mapping[str, Command], args: list[str], io: CliIo
+) -> int:
+    """Runs the subcommand named by `args[0]`, or prints `usage` and the
+    list of subcommands."""
+    sub = subcommands.get(args[0]) if args else None
+    if sub is None:
+        width = max(len(name) for name in subcommands)
+        lines = "".join(
+            f"  {name.ljust(width)}  {cmd.summary}\n" for name, cmd in subcommands.items()
+        )
+        io.stderr(f"{usage}\n\nSubcommands:\n{lines}")
+        return 2
+    return await sub.run(args[1:], io)
+
+
+async def _admin(args: list[str], io: CliIo) -> int:
+    return await _dispatch(
+        "Usage: squawk relay admin <subcommand> [--data DIR]\n\n"
+        "Works on the database of a relay run on this machine (by default where "
+        "`squawk relay serve` keeps it), also while the relay is running.",
+        ADMIN_SUBCOMMANDS,
+        args,
+        io,
+    )
+
+
 RELAY_SUBCOMMANDS: dict[str, Command] = {
     "set": Command(
         "use a relay to reach contacts on other networks: set <url> (wss://; --allow-plain "
@@ -403,25 +586,22 @@ RELAY_SUBCOMMANDS: dict[str, Command] = {
         " --allowed-keys, --allowed-users, --github-client-id, --max-keys-per-user)",
         _serve,
     ),
+    "admin": Command(
+        "look after a relay run on this machine: admin users lists the GitHub users that "
+        "signed in and their keys; admin remove-key <key> removes a key (--data DIR)",
+        _admin,
+    ),
 }
 
 
 async def _relay(args: list[str], io: CliIo) -> int:
-    sub = RELAY_SUBCOMMANDS.get(args[0]) if args else None
-    if sub is None:
-        width = max(len(name) for name in RELAY_SUBCOMMANDS)
-        lines = "".join(
-            f"  {name.ljust(width)}  {cmd.summary}\n" for name, cmd in RELAY_SUBCOMMANDS.items()
-        )
-        io.stderr(f"Usage: squawk relay <subcommand>\n\nSubcommands:\n{lines}")
-        return 2
-    return await sub.run(args[1:], io)
+    return await _dispatch("Usage: squawk relay <subcommand>", RELAY_SUBCOMMANDS, args, io)
 
 
 RELAY_COMMANDS: dict[str, Command] = {
     "relay": Command(
         "choose and check the relay for contacts on other networks, or run one "
-        "(set | status | serve)",
+        "(set | status | serve | admin)",
         _relay,
     ),
 }
