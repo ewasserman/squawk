@@ -75,12 +75,12 @@ hotspot will do).
 
 | Step | Worked? | Notes |
 | --- | --- | --- |
-| 1 | Yes | From a phone's hotspot: `/healthz` answered with a valid certificate (issued over TLS-ALPN, after correction 5); 22 and 8765 timed out, 80 gave "host is down". From the home network the results mean nothing: the public address is the router itself there (its SSH answered on 22), and the relay is unreachable (correction 6). |
+| 1 | Yes | From a phone's hotspot: `/healthz` answered with a valid certificate (issued over TLS-ALPN, after correction 5); 22 and 8765 timed out, 80 gave "host is down". From the home network the results mean nothing: the public address is the router itself there (its SSH answered on 22), and at first the relay was unreachable (correction 6). |
 | 2 | Yes | Tested from inside the VM: github.com, Let's Encrypt and DuckDNS reachable; the Mac, other LAN hosts and the router's admin ports not, over IPv4 and, after correction 2, IPv6. |
 | 3 | Yes | After updating A's client from 0.3.1 to 0.5.0 (correction 7). The relay logged the first sign-in with the pinned id. |
 | 4 | Yes | B (on 0.5.0, on another network) signed in; the relay logged the first sign-in with B's pinned id, and `admin users` lists B with one key. |
 | 5 | Yes | A and B were already paired from before, so no new invite was needed: the clients send their contact lists when they connect, and the relay let the two exchange messages. Messages flowed both ways, including Claude sessions on each side talking to each other; the relay's message counter rose with each one and nothing was left waiting. Pairing by invite through the relay was not tested here. See corrections 10 and 11. |
-| 6 | Not run | No third GitHub account was at hand. |
+| 6 | Yes | C was a second service on the relay host's Mac (its own `SQUAWK_HOME`, `SQUAWK_NO_MDNS=1`), signed in to GitHub as an account not in the file. `squawk relay login` said "the relay does not permit this GitHub account", `relay status` said not permitted, and the relay logged the refusal with the account's id; no mailbox or user record was created. |
 | 7 | Yes | With no reload, the relay reread the file 36 seconds after it was saved, logged "1 removed" and deleted B's mailbox; B's `squawk relay status` then said not connected and not permitted. |
 | 8 | Yes | B's line put back (pinned id checked against GitHub) and the relay reloaded; B ran `squawk relay login`, was connected at once, and messages worked both ways without pairing again. |
 | 9 | Yes | Lists A with one key, first and last sign-in times. |
@@ -127,12 +127,17 @@ Corrections to the guide:
    5 failed validations per hostname per hour. The guide should say to
    check the forward from outside first (or with Caddy stopped and a packet
    capture in the VM), then start Caddy with the real name.
-6. **The relay is not reachable from its own home network.** From the home
-   LAN, the public name times out: the router does not hairpin the forward,
-   and the DMZ rules drop the VM's replies to private addresses. The guide's
-   "check from another network" is necessary, not just advice, and people
-   at the relay's home need split DNS plus a rule letting the DMZ reply to
-   the LAN.
+6. **The DMZ rules cut off the relay's own home network.** From the home
+   LAN, the public name timed out. The router does loop the forward back
+   (hairpin NAT), but the rule dropping the DMZ's traffic to private
+   addresses also dropped the VM's replies. A rule above it accepting
+   traffic from the DMZ in the *established* and *related* states only
+   fixed it: home devices reach the relay by its public name, so laptops
+   work the same at home and away, and the VM still cannot open a
+   connection to the home network (the isolation check still passed). The
+   guide should include that rule with the others. Its "check from another
+   network" is still needed for the exposure test, since from home the
+   public address is the router itself.
 7. **Old clients fail confusingly.** A 0.3.1 client against a `github`
    relay reports only "the relay did not accept our key", and `squawk relay
    login` prints usage. The guide (and the setup guide's step 7) should say
@@ -164,5 +169,9 @@ Corrections to the guide:
     traffic goes through the relay. The field is the relay the contact
     reported at pairing time and is never updated; sending ignores it.
     It should be updated (or dropped), or say what it means.
+12. **A long `SQUAWK_HOME` stops the service from starting.** Running C as
+    a second service from a long temporary directory failed with only
+    "AF_UNIX path too long" in its log: the control socket path passed the
+    104-byte limit of macOS. A short directory worked. Filed as #65.
 
 Problems filed:
