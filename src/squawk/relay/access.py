@@ -27,6 +27,12 @@ ACCESS_MODES: tuple[AccessMode, ...] = get_args(AccessMode)
 NOT_PERMITTED_CODE = 4003
 """Close code for a key the relay does not admit."""
 
+REMOVED_CODE = 4004
+"""Close code for a key the operator removed with `squawk relay admin
+remove-key`. Unlike 4003 it does not mean the key is refused: the client
+connects again at once and the relay then decides (in github mode it asks
+for a sign-in)."""
+
 OPEN_WARNING = "Access: open. Anyone who can reach this relay can open a mailbox on it."
 
 

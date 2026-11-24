@@ -345,6 +345,8 @@ class RelayClient:
 
     async def stop(self) -> None:
         self._stopped = True
+        if self._login is not None:
+            self._login.fail(RelayLoginFailed("the service stopped using this relay"))
         tasks = [t for t in (self._runner, *self._tasks) if t is not None]
         for task in tasks:
             task.cancel()
@@ -359,8 +361,10 @@ class RelayClient:
         let this service in without a sign-in (it is connected, or the relay
         is not in github mode). Raises `RelayLoginFailed` if the relay refuses
         or cannot be reached. Then call `wait_login`."""
-        if self._ready:
+        if self._ready or self._setting_up:
             return None
+        if self._stopped:
+            raise RelayLoginFailed("the service stopped using this relay")
         login = self._login
         if login is None or login.done:
             login = self._login = _Login()
@@ -623,12 +627,19 @@ class RelayClient:
                 )
                 if not (isinstance(uri, str) and isinstance(code, str)):
                     raise LinkError("the relay sent a sign-in without a code")
+                # The relay chooses what is shown; a dishonest one could point
+                # the person at another site or send terminal control codes.
+                uri, code = _printable(uri), _printable(code)
+                if not uri.startswith(GITHUB_PREFIX):
+                    raise LinkError(f"the relay sent a sign-in address not on GitHub: {uri}")
                 if not login.prompt.done():
-                    login.prompt.set_result(LoginPrompt(uri, code, str(expires_at)))
+                    login.prompt.set_result(LoginPrompt(uri, code, _printable(str(expires_at))))
                 # No time limit here: the relay ends the sign-in when GitHub's
                 # code expires, and pings keep the connection alive meanwhile.
                 frame = _parse(await ws.recv())
         except ConnectionClosed as err:
+            if err.rcvd is not None and err.rcvd.code == NOT_PERMITTED_CODE:
+                raise _AccessRefused("not-permitted", "not-permitted") from err
             raise LinkError("the relay closed the connection during the sign-in") from err
         if frame.get("t") == "login-failed":
             reason = frame.get("reason")
@@ -637,6 +648,15 @@ class RelayClient:
                 "not-permitted" if reason == "not-permitted" else "needs-sign-in"
             )
             raise _AccessRefused(problem, reason)
+        if frame.get("t") != "ok":
+            what = _printable(str(frame.get("t")))
+            reason = frame.get("reason")
+            if isinstance(reason, str):
+                what += f" ({_printable(reason)})"
+            raise LinkError(f"the relay answered the sign-in with {what}")
+        user = frame.get("user")
+        if isinstance(user, str):
+            frame["user"] = _printable(user)
         return frame
 
     async def _session(self, ws: ClientConnection) -> None:
@@ -865,6 +885,15 @@ class RelayClient:
         if self._guard is None:
             raise RuntimeError("relay client is not started")
         return self._guard
+
+
+GITHUB_PREFIX = "https://github.com/"
+
+
+def _printable(text: str, limit: int = 200) -> str:
+    """`text` without control characters (which could change what a terminal
+    shows), cut to `limit` characters."""
+    return "".join(c for c in text if c.isprintable())[:limit]
 
 
 def _parse(data: str | bytes) -> dict[str, Any]:

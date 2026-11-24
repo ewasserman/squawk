@@ -265,8 +265,14 @@ squawk relay admin users [--data DIR]            # GitHub users, their keys, las
 squawk relay admin remove-key KEY [--data DIR]   # forget one key and delete its mailbox
 ```
 
-The running relay notices a removed key within a minute and closes its
-connection. Adding and removing users is done in the allowed users file.
+The running relay notices a removed key at the key's next frame, or within
+20 seconds otherwise, and closes its connection with code `4004`, reason
+`removed by the operator`. Unlike `4003`, this does not tell the client it is
+refused: it connects again at once, and the relay then decides. In `github`
+mode the key was forgotten, so its owner is asked to sign in again; in `keys`
+mode a key still listed in the allowed keys file is admitted again, with a
+new, empty mailbox. Adding and removing users is done in the allowed users
+file.
 
 ## Deployment guide
 

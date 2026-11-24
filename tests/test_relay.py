@@ -2043,7 +2043,7 @@ async def test_a_running_relay_closes_the_connection_of_a_key_removed_by_admin(
     code, _, err = await admin("remove-key", alice.id, "--data", data_dir)
     assert (code, err) == (0, "")
 
-    assert await close_code(a.ws) == (4003, "not permitted")
+    assert await close_code(a.ws) == (4004, "removed by the operator")
     await b.allow(carol)  # other connections carry on
     # The key was forgotten, so its next connection is asked to sign in again.
     again = await login(relay, alice, expect_ok=False)
@@ -2060,3 +2060,13 @@ async def test_the_removed_key_check_leaves_connected_keys_with_mailboxes_alone(
     relay.close_removed_keys()
     await a.allow(bob)
     await a.close()
+
+
+async def test_a_removed_key_is_closed_at_its_next_frame(
+    start_relay: RelayFactory, data_dir: str
+) -> None:
+    relay = await start_relay(RelayLimits(access_check_interval_s=3600))
+    a = await login(relay, alice)
+    relay.store.delete_mailbox(alice.id)  # as `squawk relay admin remove-key` does
+    await a.send({"t": "allow", "req": "r", "senders": []})
+    assert await close_code(a.ws) == (4004, "removed by the operator")

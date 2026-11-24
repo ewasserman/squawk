@@ -109,7 +109,10 @@ not admit is disconnected with code `4003`, reason `not permitted`, and gets
 no mailbox. In `github` mode, a key the relay has not seen before gets
 `{"t":"login-required","provider":"github"}` instead of `ok`, and its owner
 signs in with GitHub before the relay answers `ok` (see "Signing in with
-GitHub" in [relay-access.md](relay-access.md)).
+GitHub" in [relay-access.md](relay-access.md)). A key the operator
+removed while it was connected is closed with code `4004`, reason `removed
+by the operator`; the client then connects again and the access mode
+decides.
 
 There is one connection per key. If a second connection authenticates with
 the same key, the relay closes the older one with code `4002`, reason

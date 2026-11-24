@@ -36,6 +36,7 @@ from squawk.identity import Identity, identity_from_secret_key
 from squawk.network import REFUSED_CODE, auth_message
 from squawk.relay.access import (
     NOT_PERMITTED_CODE,
+    REMOVED_CODE,
     AccessPolicy,
     Decision,
     GitHubAccess,
@@ -380,9 +381,12 @@ class RelayServer:
         nothing in between that lets this check run."""
         for client in list(self._clients.values()):
             if not self.store.has_mailbox(client.key):
-                self._drop(client)
-                client.close(NOT_PERMITTED_CODE, "not permitted")
-                _log(f"closed the connection of {client.key}, whose key was removed")
+                self._close_removed(client)
+
+    def _close_removed(self, client: _Client) -> None:
+        self._drop(client)
+        client.close(REMOVED_CODE, "removed by the operator")
+        _log(f"closed the connection of {client.key}, whose key was removed")
 
     def _rate_table(self) -> dict[str, Rate]:
         """Each rate limit counter's name and its limit."""
@@ -655,6 +659,10 @@ class RelayServer:
 
     def _on_data(self, client: _Client, data: str | bytes) -> None:
         if client.dropped:
+            return
+        if not self.store.has_mailbox(client.key):
+            # Removed by `squawk relay admin remove-key` since the last check.
+            self._close_removed(client)
             return
         frame = _parse_frame(data)
         if frame is None:

@@ -421,6 +421,9 @@ async def _login(args: list[str], io: CliIo) -> int:
     except RpcError as err:
         io.stderr(f"squawk relay login: {err}\n")
         return 1
+    except ConnectionError:
+        io.stderr("squawk relay login: the squawk service stopped during the sign-in\n")
+        return 1
     finally:
         await client.close()
     user = result.get("user")
