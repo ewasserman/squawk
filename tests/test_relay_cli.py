@@ -114,6 +114,32 @@ async def test_relay_serve_refuses_to_start_without_access_unless_only_this_mach
     assert not os.path.exists(data)
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+async def test_relay_serve_help_lists_its_options_and_starts_nothing(
+    tmp_path: Any, flag: str
+) -> None:
+    out: list[str] = []
+    err: list[str] = []
+    io = CliIo(stdout=out.append, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})
+    assert await run(["relay", "serve", "--host", "0.0.0.0", flag], io) == 0
+    text = "".join(out)
+    for option in (
+        "--host",
+        "--port",
+        "--data",
+        "--trust-forwarded-for",
+        "--access",
+        "--allowed-keys",
+        "--allowed-users",
+        "--github-client-id",
+        "--max-keys-per-user",
+    ):
+        assert option in text
+    assert "default 5" in text
+    assert err == []
+    assert not os.path.exists(os.path.join(str(tmp_path), "relay"))
+
+
 async def test_relay_serve_refuses_an_unknown_access_mode(tmp_path: Any) -> None:
     err: list[str] = []
     io = CliIo(stdout=lambda _: None, stderr=err.append, env={"SQUAWK_HOME": str(tmp_path)})

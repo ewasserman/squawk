@@ -23,7 +23,7 @@ from squawk.config import db_path, squawk_home
 from squawk.daemon import RelayStatus, StatusResult, store_relay_settings
 from squawk.daemon_control import connect_to_daemon
 from squawk.encoding import is_key_id
-from squawk.relay import RelayServer
+from squawk.relay import RelayLimits, RelayServer
 from squawk.relay.access import (
     ACCESS_MODES,
     DEFAULT_MAX_KEYS_PER_USER,
@@ -63,10 +63,42 @@ def relay_data_dir(env: Mapping[str, str]) -> str:
     return os.path.join(squawk_home(env), "relay")
 
 
+_CHECK_S = round(RelayLimits().access_check_interval_s)
+
+SERVE_USAGE = f"""Usage: squawk relay serve [options]
+
+Runs a relay. The guide to running one is docs/running-a-relay.md.
+
+Options:
+  --host HOST               address to listen on (default {DEFAULT_HOST})
+  --port, -p PORT           port to listen on (default {DEFAULT_PORT}; 0 picks a free one)
+  --data DIR                where the relay keeps its database (default
+                            $SQUAWK_RELAY_DATA, or relay/ in squawk's home
+                            directory, ~/.config/squawk unless $SQUAWK_HOME)
+  --trust-forwarded-for     take each client's address from the X-Forwarded-For
+                            header; use only behind a proxy that sets it
+  --access MODE             who may use the relay: open, keys or github. Required
+                            unless the relay listens only on this machine
+                            without --trust-forwarded-for
+  --allowed-keys FILE       with --access keys: the file of allowed keys
+  --allowed-users FILE      with --access github: the file of allowed GitHub users
+  --github-client-id ID     with --access github: the GitHub OAuth App's client id
+  --max-keys-per-user N     with --access github: computers each user may sign
+                            in from (default {DEFAULT_MAX_KEYS_PER_USER})
+  --help, -h                show this text
+
+The relay checks the allowed keys or users file every {_CHECK_S} seconds.
+People added can connect after the next check; people removed are cut off
+once two checks in a row agree (within about {2 * _CHECK_S} seconds). SIGHUP
+rereads the file and applies both at once.
+"""
+
+
 async def _serve(args: list[str], io: CliIo) -> int:
     values, _ = parse_args(
         args,
         {
+            "help": Opt("boolean", "h"),
             "host": Opt("string"),
             "port": Opt("string", "p"),
             "data": Opt("string"),
@@ -78,6 +110,9 @@ async def _serve(args: list[str], io: CliIo) -> int:
             "max-keys-per-user": Opt("string"),
         },
     )
+    if values.get("help") is True:
+        io.stdout(SERVE_USAGE)
+        return 0
     port_text = string_value(values, "port")
     port = DEFAULT_PORT
     if port_text is not None:

@@ -19,7 +19,7 @@ also need a relay server that both of you can reach: see step 7.
 
 ```bash
 uv tool install git+https://github.com/ewasserman/squawk
-squawk --version     # prints 0.3.0
+squawk --version     # prints the version, such as 0.5.0
 ```
 
 If the shell says `command not found: squawk`, uv's folder for commands is
@@ -160,6 +160,10 @@ described in [Running a relay](running-a-relay.md), and you both use it.
 squawk relay set wss://relay.example.com
 squawk relay status        # "Connected: yes"
 ```
+
+Relays that limit who may use them need squawk 0.5.0 or later on both
+sides; check with `squawk --version`, and upgrade with `uv tool upgrade
+squawk`. An older version reports only "the relay did not accept our key".
 
 If `squawk relay status` says the relay **needs sign-in**, the relay admits
 people by their GitHub account: run `squawk relay login`, open the address
