@@ -2,6 +2,26 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-11-24)
+
+### Bug Fixes
+
+- End a sign-in when the relay client stops, check the sign-in address is on GitHub, and let removed
+  keys reconnect at once
+  ([`e01bcf8`](https://github.com/ewasserman/squawk/commit/e01bcf83e66f1be7acec0f65c2d5eb826b05336e))
+
+- **relay**: Say '1 user' rather than '1 users' at startup
+  ([`e49694f`](https://github.com/ewasserman/squawk/commit/e49694f0ad03c83b16fbafac873023410e22bc8d))
+
+### Features
+
+- Add squawk relay login, signing this computer in to a relay in github mode
+  ([`af91602`](https://github.com/ewasserman/squawk/commit/af91602aa98d0aa1cc66c4eb429cafc7cb3f08e3))
+
+- **relay**: Add squawk relay admin to list users and remove keys
+  ([`dfed4db`](https://github.com/ewasserman/squawk/commit/dfed4db42dbf5f6731d6573a36847577bcf9d6bd))
+
+
 ## v0.4.0 (2026-11-23)
 
 ### Bug Fixes
