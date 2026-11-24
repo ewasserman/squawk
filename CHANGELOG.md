@@ -2,6 +2,49 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-11-24)
+
+### Bug Fixes
+
+- **relay**: Review fixes for the guide's IPv6 firewall rule and backup script, and relay serve
+  --help
+  ([`c9d0040`](https://github.com/ewasserman/squawk/commit/c9d0040fa49f37c6e21bdd419aaeb3b04177b61a))
+
+### Documentation
+
+- First results of the relay access trial, and corrections to the guide
+  ([`3cbf317`](https://github.com/ewasserman/squawk/commit/3cbf317bc3d17cf87b0b9abe959ea572107a1b3c))
+
+- Record where the relay trial's corrections went
+  ([`4c66042`](https://github.com/ewasserman/squawk/commit/4c66042591ac416deff9443ceedc953ab6581804))
+
+- Relay access trial step 1 passed
+  ([`854bcc7`](https://github.com/ewasserman/squawk/commit/854bcc7eec920d29061f369ef7932bc9685b2458))
+
+- Relay access trial step 11 passed; the guide needs a backup method
+  ([`6984e8f`](https://github.com/ewasserman/squawk/commit/6984e8f61c975ef1f7b986dbb71594336cec4c3f))
+
+- Relay access trial step 6 passed; home access fixed; correction 12
+  ([`7da4d76`](https://github.com/ewasserman/squawk/commit/7da4d76f95f2506e91d32193701c31c52a8dab09))
+
+- Relay access trial steps 4, 5, 7, 8 and 10 passed; two more corrections
+  ([`5a57770`](https://github.com/ewasserman/squawk/commit/5a5777049a2cb6f2bcc2d70c8f8813beaac40662))
+
+- Steps for the trial of a relay in github mode over the internet
+  ([`475f593`](https://github.com/ewasserman/squawk/commit/475f59339be17355c7374aa9643d88f3bdfa3dc2))
+
+- **relay**: Apply the corrections from the internet trial to the guide
+  ([`bbce0d6`](https://github.com/ewasserman/squawk/commit/bbce0d640ee47062f8169287f423c6fdf3481869))
+
+- **relay**: How to install squawk for the relay's user, and run admin commands as that user
+  ([`d99d0a3`](https://github.com/ewasserman/squawk/commit/d99d0a3eaf8566f01714285ea6e87bfd8a5178ba))
+
+### Features
+
+- **relay**: Squawk relay serve --help lists its options
+  ([`b27ac87`](https://github.com/ewasserman/squawk/commit/b27ac87c9cfcbee9a52db72cc4969131750cdfdc))
+
+
 ## v0.5.0 (2026-11-24)
 
 ### Bug Fixes
